@@ -1,0 +1,33 @@
+# .github/workflows/run-tests.yml
+
+name: Run QA Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out your code onto the runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Install Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'  # caches dependencies for speed
+
+      # 3. Install your test dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Run your tests
+      - name: Run tests
+        run: pytest tests/ -v
