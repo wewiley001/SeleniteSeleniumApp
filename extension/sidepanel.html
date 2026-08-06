@@ -442,6 +442,10 @@
           <button class="btn ghost" id="btn-group-cancel" style="display:none">Cancel</button>
           <button class="btn danger" id="btn-clear-steps" title="Remove all steps from the queue">Clear All</button>
         </div>
+        <div class="row" style="gap:6px;margin:2px 0 4px">
+          <button class="btn" id="btn-queue-fill-ticket" type="button" disabled title="Seed the locked Open URL step's URL and variant parameter from the active ticket context (Initialize tab)">Fill from ticket</button>
+          <span id="queue-fill-hint" style="font-size:10px;color:var(--fg3)">No active ticket context — use the Initialize tab</span>
+        </div>
         <div id="step-list">
           <div id="empty-msg">No steps yet — click + Add Step to begin</div>
         </div>
@@ -514,6 +518,10 @@
       </div>
       <div class="acc-body">
         <div style="font-size:10px;color:var(--fg3)">Paste full URLs (one per line), CSV rows (<code>url,group</code>), or a Base + Pages template — formats can be mixed in the same box.</div>
+        <div class="row" style="gap:6px;margin:6px 0">
+          <button class="btn" id="btn-mx-fill-ticket" type="button" disabled title="Paste each variant's full preview URL as one CSV row (url,variant id) from the active ticket context (Initialize tab)">Fill from ticket</button>
+          <span id="mx-fill-hint" style="font-size:10px;color:var(--fg3)">No active ticket context — use the Initialize tab</span>
+        </div>
         <textarea id="mx-links-input" rows="6" placeholder="https://example.com/page&#10;Base: https://example.com/learn/&#10;Pages: cyber-attack, cyber-security-threats"></textarea>
         <div>
           <label class="cap">Link Mode</label>
@@ -1010,14 +1018,20 @@
             <button class="btn danger sm" id="btn-init-delete">Delete</button>
           </div>
         </div>
-        <div style="font-size:10px;color:var(--fg3);margin-top:6px"><b>Set Active</b> makes this the context A/B Variant Comparison's "Fill from ticket" reads. Snapshots are point-in-time — check the extraction time before relying on one.</div>
+        <div style="font-size:10px;color:var(--fg3);margin-top:6px"><b>Set Active</b> makes this the context every mode's "Fill from ticket" button — and this card's "Apply to all modes" — reads. Snapshots are point-in-time — check the extraction time before relying on one.</div>
       </div>
     </div>
 
     <div class="card" id="init-active-card" style="display:none">
       <div class="card-title">Active Test Context</div>
       <div id="init-active-body" style="font-size:11px;color:var(--fg2);line-height:1.6"></div>
-      <button class="btn danger sm" id="btn-init-clear" style="margin-top:8px">Clear Active</button>
+      <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap">
+        <button class="btn primary sm" id="btn-init-apply-all" disabled
+          title="Fill every mode's URL inputs from this context — shows exactly what will be written, before it writes">Apply to all modes…</button>
+        <button class="btn danger sm" id="btn-init-clear">Clear Active</button>
+      </div>
+      <div id="init-apply-preview" style="display:none;margin-top:8px;font-size:11px;line-height:1.6;border:1px solid var(--stroke);border-radius:var(--radius);padding:8px"></div>
+      <div id="init-apply-status" style="font-size:11px;margin-top:6px"></div>
     </div>
 
   </div>

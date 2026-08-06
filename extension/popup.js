@@ -180,6 +180,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (anthropicApiKey) document.getElementById('ta-api-key').value = anthropicApiKey;
   const { funnelState: savedFunnel } = await sessionNS.get('funnelState');
   if (savedFunnel) funnelState = { start: '', middles: [], end: '', supplementalPrompt: '', ...savedFunnel };
+
+  // Fill-target registry: binds every mode's "Fill from ticket" button and
+  // the Initialize card's "Apply to all modes". Must come after every state
+  // object it writes to is hydrated — abState/cvaState/tmModes (above),
+  // mxState (172), steps (DOMContentLoaded start), funnelState (just above).
+  // Isolated in its own try/catch so a registry fault can't take the Test
+  // Agent bindings below with it.
+  try {
+    await initFillTargets();
+  } catch (e) {
+    console.error('Selenite: fill targets failed to initialize —', e);
+  }
+
   document.getElementById('btn-ta-save-key').addEventListener('click', () => {
     chrome.storage.sync.set({ anthropicApiKey: document.getElementById('ta-api-key').value.trim() });
   });
@@ -354,7 +367,11 @@ function taRenderFunnel() {
       <div class="card-title">Funnel Waypoints</div>
       <div style="font-size:10px;color:var(--fg3);margin-bottom:8px">An AI agent (Sonnet) clicks through the live UI to navigate Start → each Middle (in order) → End, verifying the funnel actually connects. Requires an API key; Agentic Testing + Analysis are forced on for this mode.</div>
       <label class="cap">Start (required)</label>
-      <input type="text" id="fn-start" value="${esc(funnelState.start)}" placeholder="https://example.com/landing" style="width:100%;margin-bottom:8px">
+      <input type="text" id="fn-start" value="${esc(funnelState.start)}" placeholder="https://example.com/landing" style="width:100%;margin-bottom:6px">
+      <div class="row" style="gap:6px;margin-bottom:8px">
+        <button class="btn sm" id="fn-fill-ticket" type="button" disabled title="Set Start to the control variant's full preview URL from the active ticket context (Initialize tab)">Fill from ticket</button>
+        <span id="fn-fill-hint" style="font-size:10px;color:var(--fg3)">No active ticket context — use the Initialize tab</span>
+      </div>
       <label class="cap">Middle waypoints (optional, in order)</label>
       <div id="fn-mid-list">${midRows}</div>
       <button class="btn sm" id="fn-add-mid" style="margin:2px 0 8px">+ Add Waypoint</button>
@@ -377,6 +394,12 @@ function taRenderFunnel() {
   slot.querySelector('#fn-add-mid').addEventListener('click', () => {
     funnelState.middles.push(''); persistFunnel(); taRenderFunnel();
   });
+  slot.querySelector('#fn-fill-ticket').addEventListener('click', () => fillOneFromTicket('funnel'));
+  // The form was just rebuilt with the button disabled; getActiveContext()
+  // is async so this resolves a moment later — same fire-and-forget pattern
+  // as every other refreshXFillButton() call, just triggered from a render
+  // instead of from init.
+  refreshAllFillButtons();
 }
 
 function renderFunnelResults(el, run) {
@@ -574,20 +597,11 @@ async function initTestModePages() {
       persistTmPages();
     });
 
-    document.querySelector(`.tm-fill-ticket[data-mode="${n}"]`)?.addEventListener('click', () => fillPagesFromTicket(n));
-
     renderTmPages(n);
   });
-
-  // Initialize-tab hook: user-initiated only — never fires on tab load.
-  // Isolated in its own try/catch, same as A/B's — a failure reading the
-  // active ticket context must never block whatever inits after this one
-  // (initVrMode/initCvaMode/initPerfMode/initInitializeTab all follow it).
-  try {
-    await refreshTmFillButtons();
-  } catch (e) {
-    console.error('Selenite: could not read ticket context for the Visual Regression/Performance "Fill from ticket" buttons —', e);
-  }
+  // "Fill from ticket" binding + refresh for these buttons now lives in the
+  // fill-target registry (initFillTargets), which runs later in the init
+  // chain after abState/cvaState/mxState/funnelState are all hydrated too.
 }
 
 function renderTmPages(n) {
@@ -2363,15 +2377,8 @@ async function initAbCompare() {
   document.getElementById('btn-ab-save-set').addEventListener('click', saveAbSet);
   document.getElementById('btn-ab-load-set').addEventListener('click', loadAbSet);
   document.getElementById('btn-ab-delete-set').addEventListener('click', deleteAbSet);
-  // Initialize-tab hook: user-initiated only — never fires on tab load.
-  // Isolated in its own try/catch: a failure reading the committed ticket
-  // context must never block the Run/Stop bindings right after it.
-  document.getElementById('btn-ab-fill-ticket')?.addEventListener('click', abFillFromTicket);
-  try {
-    await refreshAbFillButton();
-  } catch (e) {
-    console.error('Selenite: could not read ticket context for the A/B "Fill from ticket" button —', e);
-  }
+  // "Fill from ticket" binding + refresh now lives in the fill-target
+  // registry (initFillTargets), which runs later in the init chain.
   document.getElementById('btn-run-abcompare').addEventListener('click', runAbComparison);
   document.getElementById('btn-stop-abcompare').addEventListener('click', () =>
     chrome.runtime.sendMessage({ action: 'stop' }));
@@ -3501,10 +3508,8 @@ async function initCvaMode() {
   document.getElementById('btn-cva-save-set').addEventListener('click', saveCvaSet);
   document.getElementById('btn-cva-load-set').addEventListener('click', loadCvaSet);
   document.getElementById('btn-cva-delete-set').addEventListener('click', deleteCvaSet);
-  // Initialize-tab hook: user-initiated only — never fires on tab load.
-  // Isolated in its own try/catch, same as A/B's — a failure reading the
-  // active ticket context must never block the Run/Stop bindings right after it.
-  document.getElementById('btn-cva-fill-ticket')?.addEventListener('click', cvaFillFromTicket);
+  // "Fill from ticket" binding + refresh now lives in the fill-target
+  // registry (initFillTargets), which runs later in the init chain.
   document.getElementById('btn-run-cva').addEventListener('click', runCvaAudit);
   document.getElementById('btn-cva-stop').addEventListener('click', () =>
     chrome.runtime.sendMessage({ action: 'stop' }));
@@ -3512,11 +3517,6 @@ async function initCvaMode() {
   renderCvaTargets();
   renderCvaChecks();
   await refreshCvaSets();
-  try {
-    await refreshCvaFillButton();
-  } catch (e) {
-    console.error('Selenite: could not read ticket context for the CVA "Fill from ticket" button —', e);
-  }
 }
 
 function applyCvaStateToInputs() {
@@ -4470,8 +4470,15 @@ async function openReportTab(sections) {
 // text. The parsed result is held in _initDraft until the user reviews and
 // saves it; only named entries under chrome.storage.local `initContexts`
 // (each reviewed:true) are ever readable by other modes, and only the one
-// named by `activeInitContext` — read solely via their own explicit
-// "Fill from ticket" action. Nothing is pushed to them.
+// named by `activeInitContext`.
+//
+// Every mode that consumes it does so through the fill-target registry
+// (FILL_TARGETS, further below) — either that surface's own "Fill from
+// ticket" button, or the "Apply to all modes" fan-out on this tab's Active
+// Test Context card. Both are strictly user-initiated: nothing is ever
+// pushed automatically. refreshAllFillButtons() (called from tab load, from
+// storage.onChanged in another window, and after every fill) may only touch
+// button/hint state — it must never call a target's apply().
 // ═══════════════════════════════════════════════════════════════════════════
 
 let _initDraft = null;    // extracted-but-uncommitted context; reviewed stays false until Save
@@ -4499,15 +4506,13 @@ async function initInitializeTab() {
   await renderActiveContext();
 
   // Save/clear/activate from another window: keep the saved list, the
-  // active-context card, and every consuming mode's fill button in step.
-  // (Never fills anything — display only.)
+  // active-context card, and every registered fill target's button in step.
+  // (Never fills anything — display only. See the registry invariant below.)
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && (changes.initContexts || changes.activeInitContext)) {
       refreshInitContextSelect();
       renderActiveContext();
-      refreshAbFillButton();
-      refreshCvaFillButton();
-      refreshTmFillButtons();
+      refreshAllFillButtons();
     }
   });
 }
@@ -5056,7 +5061,7 @@ async function activateSelectedContext() {
   await chrome.storage.local.set({ activeInitContext: name });
   await refreshInitContextSelect();
   await renderActiveContext();
-  await refreshAbFillButton();
+  await refreshAllFillButtons();
 }
 
 async function deleteSelectedContext() {
@@ -5071,7 +5076,7 @@ async function deleteSelectedContext() {
   if (activeInitContext === name) await chrome.storage.local.remove('activeInitContext');
   await refreshInitContextSelect();
   await renderActiveContext();
-  await refreshAbFillButton();
+  await refreshAllFillButtons();
 }
 
 // Save is the only path that writes into initContexts — and the only context
@@ -5114,7 +5119,7 @@ async function commitInitContext() {
   statusEl.style.color = 'var(--ok)';
   await refreshInitContextSelect();
   await renderActiveContext();
-  await refreshAbFillButton();
+  await refreshAllFillButtons();
 }
 
 async function clearActiveContext() {
@@ -5122,7 +5127,7 @@ async function clearActiveContext() {
   await chrome.storage.local.remove('activeInitContext');
   await refreshInitContextSelect();
   await renderActiveContext();
-  await refreshAbFillButton();
+  await refreshAllFillButtons();
 }
 
 async function renderActiveContext() {
@@ -5130,6 +5135,12 @@ async function renderActiveContext() {
   if (!card) return;
   const body = document.getElementById('init-active-body');
   const ctx = await getActiveContext();
+  // The active context changed (or was cleared) — a stale "Applied ✓" or
+  // undo from a previous ticket must not linger next to a different one.
+  closeApplyPreview();
+  const statusEl = document.getElementById('init-apply-status');
+  if (statusEl) statusEl.innerHTML = '';
+  _fillUndo = null;
   if (!ctx?.reviewed) { card.style.display = 'none'; body.innerHTML = ''; return; }
   card.style.display = '';
   const q = s => esc(s || '').replace(/"/g, '&quot;');
@@ -5158,108 +5169,510 @@ async function renderActiveContext() {
   }));
 }
 
-// ── Consumption: A/B Variant Comparison "Fill from ticket" ───────────────────
-async function refreshAbFillButton() {
-  const btn = document.getElementById('btn-ab-fill-ticket');
-  if (!btn) return;
-  const hint = document.getElementById('ab-fill-hint');
-  const ctx = await getActiveContext();
-  const ready = !!(ctx?.reviewed && ctx.previewLinks?.length);
-  btn.disabled = !ready;
-  if (hint) hint.textContent = ready
-    ? `From ${ctx.ticketKey} — ${ctx.previewLinks.length} preview link(s)`
-    : 'No active ticket context — use the Initialize tab';
+// ── Context → derived values (shared by several fill targets) ──────────────
+// Pure — no state, no DOM. The single-URL surfaces (Queue, Funnel) can only
+// seed one variant, so they need a deterministic pick: the control, by
+// isControl or the 'v0' convention commitInitContext enforces (popup.js:5084),
+// else the first preview link.
+function ctxControlLink(ctx) {
+  const links = ctx.previewLinks || [];
+  const controlIds = new Set((ctx.variants || []).filter(v => v.isControl).map(v => v.id));
+  return links.find(l => controlIds.has(l.id)) || links.find(l => l.id === 'v0') || links[0] || null;
 }
 
-// User-initiated only — never fires on tab load. Base URL + per-variant
-// override come from the active context's derived preview-link pattern; when
-// derivation failed (no common base), each variant gets its full preview URL
-// instead so nothing is lost.
-async function abFillFromTicket() {
-  const ctx = await getActiveContext();
-  if (!ctx?.reviewed || !ctx.previewLinks?.length) { await refreshAbFillButton(); return; }
+// {baseUrl, targets:[{label,url,override}]} from the derived preview-link
+// pattern. When derivation failed (no common base), each variant keeps its
+// full preview URL so nothing is lost. Shared by the A/B and CVA targets,
+// which hold the identical {label,url,override} shape.
+function ctxVariantTargets(ctx) {
   const base  = ctx.previewLinkBaseUrl || '';
   const param = ctx.previewLinkParam || null;
-  abState.baseUrl = base;
-  abState.targets = ctx.previewLinks.map(l => {
-    let override = '';
-    if (base && param) {
-      try {
-        const v = new URL(l.url).searchParams.get(param);
-        if (v != null) override = `${param}=${v}`;
-      } catch (_) {}
+  return {
+    baseUrl: base,
+    targets: ctx.previewLinks.map(l => {
+      let override = '';
+      if (base && param) {
+        try {
+          const v = new URL(l.url).searchParams.get(param);
+          if (v != null) override = `${param}=${v}`;
+        } catch (_) {}
+      }
+      return { label: l.id, url: base ? '' : l.url, override };
+    }),
+  };
+}
+
+// Write the derived variant targets into whichever variant-mode state object
+// owns them (abState or cvaState — identical shape). State is persisted
+// before rendering so a throwing renderer can't lose the write.
+function fillVariantState(ctx, state, { applyInputs, render, persist }) {
+  if (!state) return;
+  const { baseUrl, targets } = ctxVariantTargets(ctx);
+  state.baseUrl = baseUrl;
+  state.targets = targets;
+  persist();
+  applyInputs();
+  render();
+}
+
+// Push tmModes[modeId].scope back onto its radio pair. Extracted out of
+// fillPagesFromTicket's old body so restore() can reuse it for undo.
+function syncTmScopeRadios(modeId) {
+  const m = tmModes[modeId];
+  if (!m) return;
+  document.querySelectorAll(`input[name="tm-scope-${modeId}"]`)
+    .forEach(r => { r.checked = r.value === m.scope; });
+}
+
+// The queue's locked first step. ensureOpenUrlFirst (popup.js:1271) guarantees
+// it exists and is steps[0] — re-found rather than cached because loadScript
+// reassigns `steps` wholesale.
+function queueOpenUrlStep() {
+  return (steps[0] && steps[0].func === OPEN_URL_FUNC) ? steps[0] : null;
+}
+
+function rerenderStepEl(step) {
+  const el = document.getElementById('step-' + step.id);
+  if (el) rerenderStepArgs(el, step);   // rebuilds args, rewires, persistQueue()s
+}
+
+// The funnel card exists only while Funnel is the selected Test Agent mode —
+// taRenderFunnel() rebuilds #ta-settings-slot wholesale, and taShowPrimary
+// blanks it on the way out (popup.js:410-445). When it isn't on screen there
+// is nothing to sync: taRenderFunnel() always reads funnelState fresh, so the
+// write is already visible the moment the user switches to Funnel.
+function refreshFunnelDom() {
+  if (_taActiveBody !== 'funnel') return;
+  taRenderFunnel();
+  syncFunnelRunEnabled();
+}
+
+// DOM ← mxState. Shared by initMatrixAuditor's initial hydration and the "mx"
+// fill target's apply()/restore(), so both stay in lockstep with mxState.
+function mxSyncFromState() {
+  if (!mxState) return;
+  const raw = document.getElementById('mx-links-input');
+  if (!raw) return;
+  raw.value = mxState.linksRaw || '';
+  document.getElementById('mx-audit-name').value   = mxState.name || '';
+  document.getElementById('mx-variation-id').value = mxState.variationId || '';
+  document.getElementById('mx-advance-mode').value = mxState.advanceMode || 'auto';
+  mxGroupFilter = null;
+  mxSetLinkMode(mxState.linkMode || 'none');
+  mxRenderLinkGroups();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fill-target registry
+//
+// One declarative entry per input surface derivable from the active Test
+// Context. Everything context-driven goes through this list: each surface's
+// own "Fill from ticket" button, the storage.onChanged refresh, and the
+// Initialize card's "Apply to all modes" fan-out. Adding a consumer means
+// adding one entry here plus its button markup to BOTH popup.html and
+// sidepanel.html — nothing else.
+//
+// INVARIANT (see the header comment above initInitializeTab): nothing is ever
+// pushed to a mode. refreshAllFillButtons() may only touch button/hint state;
+// only a user click reaches apply(). The storage.onChanged listener calls the
+// former and must never call the latter.
+//
+// Entry contract:
+//   id        stable key — error reporting, undo keys, fillOneFromTicket()
+//   label     human name, shown in the Apply-to-all summary
+//   btnSel    selector for this surface's own button; matching NOTHING is a
+//             valid state (the markup may be absent) — hence querySelectorAll
+//   hintSel   selector for the hint text beside that button
+//   ready     (ctx) => bool. ctx.reviewed is already guaranteed by the
+//             caller. MUST also check its state object exists, so an
+//             unloaded mode reports as a skip instead of throwing in apply().
+//   describe  (ctx) => string. Doubles as the button hint and the summary row.
+//   apply     (ctx) => void, SYNCHRONOUS. State → persist → render. Must
+//             tolerate its DOM being absent (see refreshFunnelDom).
+//   snapshot  () => any. Deep copy of exactly the slice apply() overwrites.
+//   restore   (snap) => void. Put that slice back and re-render. Undo.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Visual Regression ('3') and Performance ('6') hold the same flat page list
+// (tmModes[n].pages) with no label/override fields — one factory, two
+// entries, so the Apply-to-all summary can name each mode individually.
+function tmFillTarget(modeId, label) {
+  return {
+    id: 'tm' + modeId,
+    label,
+    btnSel:  `.tm-fill-ticket[data-mode="${modeId}"]`,
+    hintSel: `.tm-fill-hint[data-mode="${modeId}"]`,
+    ready:    ctx => !!tmModes[modeId] && !!ctx.previewLinks?.length,
+    describe: ctx => `${ctx.previewLinks.length} page(s) — one per variant preview URL`,
+    snapshot: () => {
+      const m = tmModes[modeId];
+      return m ? { scope: m.scope, pages: structuredClone(m.pages) } : undefined;
+    },
+    restore: snap => {
+      const m = tmModes[modeId];
+      if (!snap || !m) return;
+      m.scope = snap.scope;
+      m.pages = snap.pages.map(tmNewPage);
+      persistTmPages();
+      syncTmScopeRadios(modeId);
+      renderTmPages(modeId);
+    },
+    apply: ctx => {
+      const m = tmModes[modeId];
+      if (!m) return;
+      m.scope = ctx.previewLinks.length > 1 ? 'multi' : 'single';
+      m.pages = ctx.previewLinks.map(l => tmNewPage({ inputs: { url: l.url } }));
+      persistTmPages();
+      syncTmScopeRadios(modeId);
+      renderTmPages(modeId);
+    },
+  };
+}
+
+const FILL_TARGETS = [
+  {
+    id: 'ab',
+    label: 'A/B Variant Comparison',
+    btnSel: '#btn-ab-fill-ticket',
+    hintSel: '#ab-fill-hint',
+    ready:    ctx => !!abState && !!ctx.previewLinks?.length,
+    describe: ctx => `Base URL + ${ctx.previewLinks.length} variant target(s)`,
+    snapshot: () => abState ? { baseUrl: abState.baseUrl, targets: structuredClone(abState.targets) } : undefined,
+    restore: snap => {
+      if (!snap || !abState) return;
+      abState.baseUrl = snap.baseUrl; abState.targets = snap.targets;
+      persistAbState(); applyAbStateToInputs(); renderAbTargets();
+    },
+    apply: ctx => {
+      fillVariantState(ctx, abState, {
+        applyInputs: applyAbStateToInputs, render: renderAbTargets, persist: persistAbState,
+      });
+      const nameEl = document.getElementById('ab-set-name');
+      if (nameEl && !nameEl.value.trim()) nameEl.value = ctx.ticketKey;
+    },
+  },
+  {
+    id: 'cva',
+    label: 'Cross-Variant Accessibility',
+    btnSel: '#btn-cva-fill-ticket',
+    hintSel: '#cva-fill-hint',
+    ready:    ctx => !!cvaState && !!ctx.previewLinks?.length,
+    describe: ctx => `Base URL + ${ctx.previewLinks.length} variant target(s)`,
+    snapshot: () => cvaState ? { baseUrl: cvaState.baseUrl, targets: structuredClone(cvaState.targets) } : undefined,
+    restore: snap => {
+      if (!snap || !cvaState) return;
+      cvaState.baseUrl = snap.baseUrl; cvaState.targets = snap.targets;
+      persistCvaState(); applyCvaStateToInputs(); renderCvaTargets();
+    },
+    apply: ctx => {
+      fillVariantState(ctx, cvaState, {
+        applyInputs: applyCvaStateToInputs, render: renderCvaTargets, persist: persistCvaState,
+      });
+      const nameEl = document.getElementById('cva-set-name');
+      if (nameEl && !nameEl.value.trim()) nameEl.value = ctx.ticketKey;
+    },
+  },
+  tmFillTarget('3', 'Visual Regression'),
+  tmFillTarget('6', 'Performance / Load'),
+  {
+    id: 'mx',
+    label: 'Matrix Auditor',
+    btnSel: '#btn-mx-fill-ticket',
+    hintSel: '#mx-fill-hint',
+    ready:    ctx => !!mxState && !!ctx.previewLinks?.length,
+    describe: ctx => `${ctx.previewLinks.length} link(s) grouped by variant id`
+                   + (mxState?.name?.trim() ? '' : ` · audit name "${ctx.ticketKey}"`),
+    snapshot: () => mxState ? {
+      linksRaw: mxState.linksRaw, links: structuredClone(mxState.links),
+      linkMode: mxState.linkMode, name: mxState.name,
+    } : undefined,
+    restore: snap => {
+      if (!snap || !mxState) return;
+      Object.assign(mxState, snap);
+      persistMxState();
+      mxSyncFromState();
+    },
+    apply: ctx => {
+      if (!mxState) return;
+      // Preview URLs already carry their own forcing params, so link mode
+      // goes to 'none'. 'forced' would send every link through mxComposeUrl
+      // (popup.js:5314), which strips optimizely_x and re-stamps ONE shared
+      // variation id — collapsing every variant onto the same one.
+      // parseMatrixLinks treats ANY comma in ANY line as a CSV url,group
+      // split (5374), regardless of where it came from — emitting a URL
+      // "bare" doesn't protect a comma that's already inside it, since the
+      // parser still finds and splits on it. The only correct guard is to
+      // percent-encode literal commas (and stray spaces) in the URL itself
+      // before building the row, so the one comma the parser finds is
+      // exactly the one this code placed before the group id. %2C/%20 decode
+      // back to the original characters wherever the URL is consumed, so
+      // this changes nothing about where the link actually goes.
+      const csvEncode = u => u.replace(/,/g, '%2C').replace(/\s/g, '%20');
+      mxState.linksRaw = ctx.previewLinks
+        .map(l => `${csvEncode(l.url)},${l.id || 'ungrouped'}`)
+        .join('\n');
+      mxState.links    = parseMatrixLinks(mxState.linksRaw);
+      mxState.linkMode = 'none';
+      if (!mxState.name?.trim()) mxState.name = ctx.ticketKey;
+      persistMxState();
+      mxSyncFromState();
+    },
+  },
+  {
+    id: 'queue',
+    label: 'Build → Queue (Open URL step)',
+    btnSel: '#btn-queue-fill-ticket',
+    hintSel: '#queue-fill-hint',
+    // The queue runs one URL, so only the control variant is meaningful here.
+    ready:    ctx => !!queueOpenUrlStep() && !!ctxControlLink(ctx),
+    describe: ctx => `Open URL step → ${shortUrl(ctxControlLink(ctx).url)}`,
+    snapshot: () => { const s = queueOpenUrlStep(); return s ? structuredClone(s.inputs) : undefined; },
+    restore: snap => {
+      const s = queueOpenUrlStep();
+      if (!snap || !s) return;
+      s.inputs = snap;
+      persistQueue();
+      rerenderStepEl(s);
+    },
+    apply: ctx => {
+      const step = queueOpenUrlStep();
+      const link = ctxControlLink(ctx);
+      if (!step || !link) return;
+      const base  = ctx.previewLinkBaseUrl || '';
+      const param = ctx.previewLinkParam || null;
+      if (!Array.isArray(step.inputs.params)) step.inputs.params = [];
+
+      if (base && param) {
+        let val = null;
+        try { val = new URL(link.url).searchParams.get(param); } catch (_) {}
+        step.inputs.url = base;
+        const row = `${param}=${val ?? ''}`;
+        const i = step.inputs.params.findIndex(p => (p || '').split('=')[0].trim() === param);
+        if (i >= 0) step.inputs.params[i] = row; else step.inputs.params.push(row);
+      } else {
+        // No common base derived — the full preview URL carries its own params.
+        step.inputs.url = link.url;
+      }
+
+      const nameEl = document.getElementById('save-name');
+      if (nameEl && !nameEl.value.trim()) nameEl.value = ctx.ticketKey;
+
+      rerenderStepArgs(document.getElementById('step-' + step.id), step);
+    },
+  },
+  {
+    id: 'funnel',
+    label: 'Funnel Crawl (Start waypoint)',
+    btnSel: '#fn-fill-ticket',
+    hintSel: '#fn-fill-hint',
+    ready:    ctx => !!ctxControlLink(ctx),
+    // Partial by nature — the ticket has no "end of funnel" concept. Say so
+    // rather than silently half-filling.
+    describe: ctx => `Start = ${shortUrl(ctxControlLink(ctx).url)} · End left blank (not in the ticket)`,
+    snapshot: () => structuredClone(funnelState),
+    restore: snap => {
+      if (!snap) return;
+      funnelState = snap;
+      persistFunnel();
+      refreshFunnelDom();
+    },
+    apply: ctx => {
+      const link = ctxControlLink(ctx);
+      if (!link) return;
+      // Full preview URL, not the base: funnelWaypoints() (popup.js:335) hands
+      // waypoints straight to the background agent with no base/param
+      // composition anywhere in the funnel path.
+      funnelState.start = link.url;
+      persistFunnel();
+      refreshFunnelDom();
+    },
+  },
+];
+
+// One storage read, then every registered surface's own button/hint.
+// querySelectorAll (not getElementById) throughout: a surface whose markup is
+// absent is a silent no-op, which is what lets one registry serve both
+// popup.html and sidepanel.html and any future partial host page.
+async function refreshAllFillButtons() {
+  let ctx = null;
+  try { ctx = await getActiveContext(); }
+  catch (e) { console.error('Selenite: could not read the active Test Context —', e); }
+  const usable = ctx?.reviewed ? ctx : null;
+
+  for (const t of FILL_TARGETS) {
+    try {
+      const ok = !!usable && !!t.ready(usable);
+      document.querySelectorAll(t.btnSel).forEach(b => { b.disabled = !ok; });
+      const hint = ok
+        ? `From ${usable.ticketKey} — ${t.describe(usable)}`
+        : 'No active ticket context — use the Initialize tab';
+      document.querySelectorAll(t.hintSel).forEach(h => { h.textContent = hint; });
+    } catch (e) {
+      console.error(`Selenite: fill target "${t.id}" failed to refresh —`, e);
     }
-    return { label: l.id, url: base ? '' : l.url, override };
-  });
-  applyAbStateToInputs();
-  renderAbTargets();
-  persistAbState();
-}
+  }
 
-// ── Consumption: Cross-Variant Accessibility "Fill from ticket" ─────────────
-// Same {label,url,override} target shape as A/B, so this mirrors
-// abFillFromTicket/refreshAbFillButton exactly, against cvaState instead.
-async function refreshCvaFillButton() {
-  const btn = document.getElementById('btn-cva-fill-ticket');
-  if (!btn) return;
-  const hint = document.getElementById('cva-fill-hint');
-  const ctx = await getActiveContext();
-  const ready = !!(ctx?.reviewed && ctx.previewLinks?.length);
-  btn.disabled = !ready;
-  if (hint) hint.textContent = ready
-    ? `From ${ctx.ticketKey} — ${ctx.previewLinks.length} preview link(s)`
-    : 'No active ticket context — use the Initialize tab';
-}
-
-async function cvaFillFromTicket() {
-  const ctx = await getActiveContext();
-  if (!ctx?.reviewed || !ctx.previewLinks?.length) { await refreshCvaFillButton(); return; }
-  const base  = ctx.previewLinkBaseUrl || '';
-  const param = ctx.previewLinkParam || null;
-  cvaState.baseUrl = base;
-  cvaState.targets = ctx.previewLinks.map(l => {
-    let override = '';
-    if (base && param) {
-      try {
-        const v = new URL(l.url).searchParams.get(param);
-        if (v != null) override = `${param}=${v}`;
-      } catch (_) {}
+  const applyBtn = document.getElementById('btn-init-apply-all');
+  if (applyBtn) {
+    let any = false;
+    for (const t of FILL_TARGETS) {
+      try { if (usable && t.ready(usable)) { any = true; break; } } catch (_) {}
     }
-    return { label: l.id, url: base ? '' : l.url, override };
-  });
-  applyCvaStateToInputs();
-  renderCvaTargets();
-  persistCvaState();
+    applyBtn.disabled = !any;
+  }
+  return usable;
 }
 
-// ── Consumption: Visual Regression / Performance "Fill from ticket" ─────────
-// Unlike A/B/CVA, these modes hold a flat Open-URL-step list (tmModes[n].pages)
-// with no label/override fields — each variant's preview URL becomes one page,
-// tested independently (Performance's own UI hint already recommends this
-// pattern for comparing variants; Visual Regression diffs each page slot
-// against its own stored baseline the same way). Shared by both modes' buttons
-// via the .tm-fill-ticket/.tm-fill-hint classes, one refresh for both.
-async function refreshTmFillButtons() {
-  const ctx = await getActiveContext();
-  const ready = !!(ctx?.reviewed && ctx.previewLinks?.length);
-  document.querySelectorAll('.tm-fill-ticket').forEach(btn => { btn.disabled = !ready; });
-  document.querySelectorAll('.tm-fill-hint').forEach(hint => {
-    hint.textContent = ready
-      ? `From ${ctx.ticketKey} — ${ctx.previewLinks.length} preview link(s)`
-      : 'No active ticket context — use the Initialize tab';
-  });
+function safeSnapshot(t) {
+  try { return t.snapshot(); }
+  catch (e) {
+    console.error(`Selenite: could not snapshot "${t.id}" for undo —`, e);
+    return undefined;   // undo skips this one rather than restoring garbage
+  }
 }
 
-async function fillPagesFromTicket(modeId) {
+let _fillUndo = null;   // { ticketKey, at, snaps: { [targetId]: any } } — one-shot, in-memory
+
+// One surface, user-initiated — never fires on tab load. Shares the fan-out's
+// snapshot/apply path so the two can never drift.
+async function fillOneFromTicket(id) {
+  const t = FILL_TARGETS.find(x => x.id === id);
+  if (!t) return;
   const ctx = await getActiveContext();
-  if (!ctx?.reviewed || !ctx.previewLinks?.length) { await refreshTmFillButtons(); return; }
-  const mode = tmModes[modeId];
-  if (!mode) return;
-  mode.scope = ctx.previewLinks.length > 1 ? 'multi' : 'single';
-  document.querySelectorAll(`input[name="tm-scope-${modeId}"]`).forEach(r => { r.checked = r.value === mode.scope; });
-  mode.pages = ctx.previewLinks.map(l => tmNewPage({ inputs: { url: l.url } }));
-  renderTmPages(modeId);
-  persistTmPages();
+  let ready = false;
+  try { ready = !!ctx?.reviewed && !!t.ready(ctx); } catch (_) {}
+  if (!ready) { await refreshAllFillButtons(); return; }
+
+  const snap = safeSnapshot(t);
+  try {
+    t.apply(ctx);
+    _fillUndo = snap === undefined ? null : { ticketKey: ctx.ticketKey, at: Date.now(), snaps: { [id]: snap } };
+    renderApplyStatus({ applied: [t.label], skipped: [], failed: [] });
+  } catch (e) {
+    console.error(`Selenite: "${t.label}" fill failed —`, e);
+    _fillUndo = null;
+    renderApplyStatus({ applied: [], skipped: [], failed: [`${t.label} (${e.message})`] });
+  }
+  await refreshAllFillButtons();
+}
+
+// Stage 1 of the two-stage confirm: expand an itemized list of exactly what
+// will be written, and where. Nothing is mutated by this function.
+function renderApplyAllPreview(ctx) {
+  const host = document.getElementById('init-apply-preview');
+  if (!host) return;
+  const rows = FILL_TARGETS.map(t => {
+    try {
+      const ok = !!t.ready(ctx);
+      return { t, ok, detail: ok ? t.describe(ctx) : 'skipped — nothing in this context fills it' };
+    } catch (e) {
+      return { t, ok: false, detail: 'skipped — ' + e.message };
+    }
+  });
+  const n = rows.filter(r => r.ok).length;
+
+  host.innerHTML = `
+    <div style="font-weight:600;margin-bottom:6px">Will write to ${n} of ${rows.length} surfaces from ${esc(ctx.ticketKey)}:</div>
+    ${rows.map(r => `<div style="display:flex;gap:6px${r.ok ? '' : ';color:var(--fg3)'}">
+      <span style="flex:0 0 45%">${r.ok ? '•' : '○'} ${esc(r.t.label)}</span>
+      <span style="flex:1">${esc(r.detail)}</span></div>`).join('')}
+    <div style="color:var(--warn);margin-top:6px">Replaces whatever those fields hold now, including in modes you aren't looking at. Goals are never written to the Functional Testing metrics list.</div>
+    <div class="row" style="gap:6px;margin-top:8px">
+      <button class="btn primary sm" id="btn-init-apply-confirm"${n ? '' : ' disabled'}>Write these ${n} change${n === 1 ? '' : 's'}</button>
+      <button class="btn ghost sm" id="btn-init-apply-cancel">Cancel</button>
+    </div>`;
+  host.style.display = '';
+  host.querySelector('#btn-init-apply-confirm').addEventListener('click', () => applyAllFromTicket(ctx));
+  host.querySelector('#btn-init-apply-cancel').addEventListener('click', closeApplyPreview);
+}
+
+function closeApplyPreview() {
+  const host = document.getElementById('init-apply-preview');
+  if (host) { host.style.display = 'none'; host.innerHTML = ''; }
+}
+
+async function onApplyAllClick() {
+  const ctx = await getActiveContext();
+  if (!ctx?.reviewed) { await refreshAllFillButtons(); return; }
+  renderApplyAllPreview(ctx);
+}
+
+// Stage 2: the fan-out. Each target is snapshotted immediately before its own
+// apply() so a mid-loop failure never loses more than the target that threw.
+async function applyAllFromTicket(ctxIn) {
+  const ctx = ctxIn || await getActiveContext();
+  if (!ctx?.reviewed) return;
+
+  const snaps = {}, applied = [], skipped = [], failed = [];
+  for (const t of FILL_TARGETS) {
+    let ready = false;
+    try { ready = !!t.ready(ctx); }
+    catch (e) { failed.push(`${t.label} (readiness check: ${e.message})`); continue; }
+    if (!ready) { skipped.push(t.label); continue; }
+
+    const snap = safeSnapshot(t);
+    try {
+      t.apply(ctx);
+      applied.push(t.label);
+      if (snap !== undefined) snaps[t.id] = snap;
+    } catch (e) {
+      failed.push(`${t.label} (${e.message})`);
+      console.error(`Selenite: "Apply to all" failed on target "${t.id}" —`, e);
+    }
+  }
+  _fillUndo = Object.keys(snaps).length ? { ticketKey: ctx.ticketKey, at: Date.now(), snaps } : null;
+
+  closeApplyPreview();
+  renderApplyStatus({ applied, skipped, failed });
+  await refreshAllFillButtons();
+}
+
+function renderApplyStatus({ applied, skipped, failed }) {
+  const el = document.getElementById('init-apply-status');
+  if (!el) return;
+  const bits = [`<span style="color:var(--ok)">Applied to ${applied.length} mode${applied.length === 1 ? '' : 's'} ✓</span>`];
+  if (skipped.length) bits.push(`<span style="color:var(--fg3)">${skipped.length} skipped (${esc(skipped.join(', '))})</span>`);
+  if (failed.length)  bits.push(`<span style="color:var(--err)">${failed.length} failed — ${esc(failed.join('; '))}</span>`);
+  el.innerHTML = bits.join(' · ')
+    + (_fillUndo ? ` · <button class="btn ghost sm" id="btn-init-apply-undo" title="Restore what these modes held before the fill. Lost when this window closes.">Undo</button>` : '');
+  el.querySelector('#btn-init-apply-undo')?.addEventListener('click', undoLastFill);
+}
+
+// Each restore is isolated for the same reason each apply is: one mode whose
+// render throws must not strand the other targets in the filled state.
+function undoLastFill() {
+  if (!_fillUndo) return;
+  let n = 0;
+  for (const [id, snap] of Object.entries(_fillUndo.snaps)) {
+    const t = FILL_TARGETS.find(x => x.id === id);
+    if (!t) continue;
+    try { t.restore(snap); n++; }
+    catch (e) { console.error(`Selenite: undo failed for "${id}" —`, e); }
+  }
+  _fillUndo = null;
+  const el = document.getElementById('init-apply-status');
+  if (el) el.textContent = `Reverted ${n} mode${n === 1 ? '' : 's'} to their previous values.`;
+  refreshAllFillButtons();
+}
+
+// Bind every registered surface's own "Fill from ticket" button, then the
+// Initialize card's Apply-to-all, then set every button's initial state in
+// one pass. Called once, late in the init chain — after every state object
+// it touches is hydrated (abState/cvaState/tmModes/mxState/steps/funnelState)
+// — and wrapped in its own try/catch by the caller, same as
+// initInitializeTab/initMatrixAuditor. Per-target try/catch inside the loop
+// means one bad selector costs exactly one button, not the whole registry.
+async function initFillTargets() {
+  for (const t of FILL_TARGETS) {
+    try {
+      document.querySelectorAll(t.btnSel).forEach(btn =>
+        btn.addEventListener('click', () => fillOneFromTicket(t.id)));
+    } catch (e) {
+      console.error(`Selenite: could not bind the "Fill from ticket" button for "${t.id}" —`, e);
+    }
+  }
+  document.getElementById('btn-init-apply-all')?.addEventListener('click', onApplyAllClick);
+  await refreshAllFillButtons();
 }
 
 // ── Matrix Auditor ───────────────────────────────────────────────────────────
@@ -6053,16 +6466,9 @@ async function initMatrixAuditor() {
     mxBumpSelectorCounter();
   }
 
-  document.getElementById('mx-links-input').value = mxState.linksRaw || '';
-  document.getElementById('mx-audit-name').value = mxState.name || '';
-  document.getElementById('mx-variation-id').value = mxState.variationId || '';
-  document.getElementById('mx-advance-mode').value = mxState.advanceMode || 'auto';
-  mxSetLinkMode(mxState.linkMode || 'none');
+  mxSyncFromState();   // mx-links-input, mx-audit-name, mx-variation-id, mx-advance-mode, link mode + list/groups
   mxApplyGlobalSettingsToInputs();
   mxRenderSelectors();
-  mxRenderLinkGroups();
-  mxRenderLinkList();
-  mxUpdateLinkCount();
   mxSetUiState('idle');
   await mxRefreshAuditDropdown();
 
