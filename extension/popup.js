@@ -4566,15 +4566,27 @@ async function initPageExtractorFn(overrideKey) {
 
     // Best-effort scrape of the rendered "Preview Links" section — the popup
     // falls back to the ADF description if this finds nothing, since Jira's
-    // issue-view markup varies by version/theme.
+    // issue-view markup varies by version/theme. Bounded by heading rank, not
+    // exact tag, so a differently-leveled next heading (Preview Links as h3,
+    // Goals as h2 right after) still ends the section instead of bleeding
+    // into it. Each link's nearest block ancestor is kept as `label` so the
+    // popup can try to read a "v<N>:" marker off it before falling back to
+    // DOM order for the id.
     const previewLinksDom = [];
-    const headingLike = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'));
+    const headingSel = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
+    const headingRank = h => /^H[1-6]$/.test(h.tagName) ? +h.tagName[1] : (parseInt(h.getAttribute('aria-level'), 10) || 2);
+    const headingLike = Array.from(document.querySelectorAll(headingSel));
     const heading = headingLike.find(h => (h.textContent || '').trim().toLowerCase() === 'preview links');
     if (heading) {
-      const stopTag = heading.tagName;
+      const startRank = headingRank(heading);
       let node = heading.nextElementSibling;
-      while (node && node.tagName !== stopTag) {
-        node.querySelectorAll?.('a[href]').forEach(a => previewLinksDom.push({ text: (a.textContent || '').trim(), url: a.href }));
+      while (node) {
+        if (node.matches?.(headingSel) && headingRank(node) <= startRank) break;
+        node.querySelectorAll?.('a[href]').forEach(a => previewLinksDom.push({
+          text: (a.textContent || '').trim(),
+          url: a.href,
+          label: a.closest('li,p,tr,td,div')?.textContent?.trim() || '',
+        }));
         node = node.nextElementSibling;
       }
     }
@@ -4640,6 +4652,59 @@ function jiraFieldString(v) {
   return null;
 }
 
+// Try to read a "v<N>:" marker (same convention as splitVariantBlocks) off
+// each link's nearby label text before falling back to DOM/list encounter
+// order. A marker that collides with another link's is treated as unreliable
+// for both — they fall back to positional too, skipping any index already
+// claimed by a confirmed marker.
+function assignPreviewLinkIds(rawLinks) {
+  const markerRe = /^v(\d+)\b/i;
+  const markerCounts = new Map();
+  const parsed = rawLinks.map(l => {
+    const m = (l.label || '').trim().match(markerRe);
+    const id = m ? 'v' + m[1] : null;
+    if (id) markerCounts.set(id, (markerCounts.get(id) || 0) + 1);
+    return { url: l.url, id };
+  });
+  const usedIds = new Set(parsed.filter(l => l.id && markerCounts.get(l.id) === 1).map(l => l.id));
+  let anyPositional = false;
+  let next = 0;
+  const links = parsed.map(l => {
+    if (l.id && markerCounts.get(l.id) === 1) return { id: l.id, url: l.url };
+    anyPositional = true;
+    while (usedIds.has('v' + next)) next++;
+    const id = 'v' + next;
+    next++; usedIds.add(id);
+    return { id, url: l.url };
+  });
+  return {
+    links,
+    warning: anyPositional
+      ? 'Preview links: some links had no "v<N>:" label nearby — those were assigned ids positionally, which may not match the actual variant.'
+      : null,
+  };
+}
+
+// Convert metric ids are long numeric tokens, but a goal's prose can easily
+// contain an unrelated 6+ digit number (a date, another ticket ref, a
+// threshold). Only accept a digit run anchored by a label ("metric id"/
+// "metric"/"id", a leading #, or enclosure in parens/brackets) — unanchored
+// numbers are never guessed at.
+function extractConvertMetricId(text) {
+  if (/\bTBD\b/i.test(text)) return { id: null, candidates: [] };
+  const anchorRes = [
+    /\b(?:metric\s*id|metric|id)\s*[:#]?\s*#?\s*(\d{6,})\b/ig,
+    /#\s*(\d{6,})\b/g,
+    /[([]\s*(\d{6,})\s*[)\]]/g,
+  ];
+  const candidates = new Set();
+  for (const re of anchorRes) {
+    let m;
+    while ((m = re.exec(text))) candidates.add(m[1]);
+  }
+  return { id: candidates.size === 1 ? [...candidates][0] : null, candidates: [...candidates] };
+}
+
 function extractTestContext(issue, previewLinksDom, origin, ticketKeyFromPage) {
   const f = issue.fields || {};
   const names = issue.names || {};
@@ -4680,19 +4745,48 @@ function extractTestContext(issue, previewLinksDom, origin, ticketKeyFromPage) {
   // (the content script is already on the page) rather than walked out of
   // the ADF tree. Falls back to the ADF "Preview Links" section only if the
   // DOM scrape finds nothing.
-  let previewLinks = (previewLinksDom || [])
-    .map((l, i) => ({ id: `v${i}`, url: (l.url || '').trim() }))
+  let previewLinks = [];
+  const rawDomLinks = (previewLinksDom || [])
+    .map(l => ({ url: (l.url || '').trim(), label: l.label || '' }))
     .filter(l => l.url);
+  if (rawDomLinks.length) {
+    const assigned = assignPreviewLinkIds(rawDomLinks);
+    previewLinks = assigned.links;
+    if (assigned.warning) warnings.push(assigned.warning);
+  }
   if (!previewLinks.length) {
     const linkNodes = adf ? adfSectionNodes(adf, 'Preview Links') : null;
     if (adf && linkNodes === null) warnings.push('"Preview Links" heading not found in the rendered ticket or its description.');
-    previewLinks = splitVariantBlocks(adfSectionLines(linkNodes || [])).map(b => ({
+    const sectionLines = adfSectionLines(linkNodes || []);
+    previewLinks = splitVariantBlocks(sectionLines).map(b => ({
       id: b.id,
       url: (b.urls[0] || (b.texts.join(' ').match(/https?:\/\/\S+/) || [])[0] || '').trim(),
     })).filter(l => l.url);
-    if (linkNodes && !previewLinks.length) warnings.push('"Preview Links" section found, but no v#-marked URLs inside it.');
+    if (linkNodes && !previewLinks.length) {
+      // No v<N> markers anywhere in the section — fall back to whatever URLs
+      // it does contain, in encounter order, rather than reporting nothing.
+      previewLinks = sectionLines.filter(l => l.urls.length).map((l, i) => ({ id: `v${i}`, url: l.urls[0] }));
+      warnings.push(previewLinks.length
+        ? 'Preview links: recovered from the ADF description positionally (no "v<N>:" markers found) — ids reflect row/bullet order, not variant identity; verify against Test Specifications.'
+        : '"Preview Links" section found, but no v#-marked URLs inside it.');
+    }
     if (previewLinks.length) warnings.push('Preview links recovered from the ADF description — the rendered-page scrape found none there; double-check them.');
   }
+
+  // Cross-check against the variants already parsed from Test Specifications
+  // — a reordered or skipped preview link otherwise silently mislabels which
+  // variant it belongs to.
+  if (previewLinks.length && variants.length) {
+    if (previewLinks.length !== variants.length) {
+      warnings.push(`Preview links: found ${previewLinks.length} preview link(s) but ${variants.length} variant(s) in Test Specifications — check for a missing/extra link.`);
+    } else {
+      const linkIds = [...new Set(previewLinks.map(l => l.id))];
+      const variantIds = [...new Set(variants.map(v => v.id))];
+      const idsMatch = linkIds.length === variantIds.length && linkIds.every(id => variantIds.includes(id));
+      if (!idsMatch) warnings.push(`Preview links: ids (${linkIds.join(', ')}) don't match Test Specifications variant ids (${variantIds.join(', ')}) — the link-to-variant mapping may be off.`);
+    }
+  }
+
   const derived = derivePreviewPattern(previewLinks);
   if (derived.warning) warnings.push(derived.warning);
 
@@ -4707,11 +4801,13 @@ function extractTestContext(issue, previewLinksDom, origin, ticketKeyFromPage) {
     if (isNew) text = text.replace('[NEW]', '').replace(/\s{2,}/g, ' ').trim();
     let convertMetricId = null, resolutionNeeded = false;
     if (platform === 'Convert') {
-      // Convert metric ids are long numeric tokens; "TBD" (or no id at all)
-      // means it must be looked up in the QA Test Plan sheet, not guessed.
-      const idTok = text.match(/\b(\d{6,})\b/);
-      if (idTok && !/\bTBD\b/i.test(text)) convertMetricId = idTok[1];
-      else resolutionNeeded = true;
+      const { id, candidates } = extractConvertMetricId(text);
+      if (id) {
+        convertMetricId = id;
+      } else {
+        resolutionNeeded = true;
+        if (candidates.length > 1) warnings.push(`Goals: "${text}" has multiple candidate Convert metric ids (${candidates.join(', ')}) — left unresolved, pick the correct one manually.`);
+      }
     }
     return { text, isNew, convertMetricId, resolutionNeeded };
   });
@@ -4844,15 +4940,35 @@ function derivePreviewPattern(links) {
   try { parsed = links.map(l => new URL(l.url)); }
   catch (_) { out.warning = 'One or more preview links are not valid URLs — base URL / override param not derived.'; return out; }
 
-  const common  = [...parsed[0].searchParams.keys()].filter(k => parsed.every(u => u.searchParams.has(k)));
-  const varying = common.filter(k => new Set(parsed.map(u => u.searchParams.get(k))).size > 1);
-  if (varying.length !== 1) {
-    out.warning = varying.length === 0
-      ? 'Preview links: no query param that appears on every link varies across variants — base URL / override param not derived.'
-      : `Preview links: multiple query params vary across variants (${varying.join(', ')}) — override param is ambiguous, not derived.`;
+  // Three candidate dimensions: a query param present on every link, the
+  // path, or the hash fragment. Only a query param can actually be wired
+  // into previewLinkBaseUrl/previewLinkParam (ctxVariantTargets only knows
+  // how to read a named query param) — path/hash variation is detected and
+  // reported, but left undetermined rather than populating fields the fill
+  // targets can't act on.
+  const common = [...parsed[0].searchParams.keys()].filter(k => parsed.every(u => u.searchParams.has(k)));
+  const varyingParams = common.filter(k => new Set(parsed.map(u => u.searchParams.get(k))).size > 1);
+  const pathVaries = new Set(parsed.map(u => u.pathname)).size > 1;
+  const hashVaries  = new Set(parsed.map(u => u.hash)).size > 1;
+  const dimensions = [...varyingParams, ...(pathVaries ? ['path'] : []), ...(hashVaries ? ['hash'] : [])];
+
+  if (dimensions.length !== 1) {
+    out.warning = dimensions.length === 0
+      ? 'Preview links: no query param, path segment, or hash fragment that varies across all variants — base URL / override param not derived.'
+      : `Preview links: multiple dimensions vary across variants (${dimensions.join(', ')}) — override param is ambiguous, not derived.`;
     return out;
   }
-  const param = varying[0];
+
+  const dim = dimensions[0];
+  if (dim === 'path' || dim === 'hash') {
+    const rest = dim === 'path' ? parsed.map(u => u.origin + u.search + u.hash) : parsed.map(u => u.origin + u.pathname + u.search);
+    out.warning = new Set(rest).size > 1
+      ? `Preview links: ${dim === 'path' ? 'path segment' : 'hash fragment'} varies, but the rest of the URLs don't match — no common base URL derived. Full per-variant links are kept.`
+      : `Preview links: links vary by ${dim === 'path' ? 'path segment' : 'hash fragment'}, not by query param — this field only derives query-param overrides, so base URL/override aren't populated; per-variant links are kept as-is.`;
+    return out;
+  }
+
+  const param = dim;
   const stripped = parsed.map(u => {
     const c = new URL(u.href);
     c.searchParams.delete(param);
