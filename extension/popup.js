@@ -131,6 +131,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(syncBcStatus, 800);
   setInterval(syncRunState, 800);
   setInterval(syncCaptureStatus, 800);
+  setInterval(mtSync, 600);          // Metric Tracker counts + recent-fires feed
+  setInterval(mtSyncStatus, 800);    // Metric Tracker capture-health line + tracking dot
 
   await loadUniversalDelay();
   await loadBcTagFilter();
@@ -175,6 +177,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.error('Selenite: Matrix Auditor tab failed to load —', e);
   }
 
+  // Metric Tracker tab. Isolated in its own try/catch for the same reason as
+  // Matrix Auditor above. Must run after loadMetrics() (line 125-ish) so
+  // `metrics` is hydrated before mtRenderRows() reads it.
+  try {
+    await initMetricTracker();
+  } catch (e) {
+    console.error('Selenite: Metric Tracker tab failed to load —', e);
+  }
+
   // Test Agent tab
   const { anthropicApiKey } = await chrome.storage.sync.get('anthropicApiKey');
   if (anthropicApiKey) document.getElementById('ta-api-key').value = anthropicApiKey;
@@ -209,6 +220,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-add-metric')?.addEventListener('click', () => addMetricRow());
   const metricList = document.getElementById('metric-list');
   metricList?.addEventListener('input', onMetricInput);
+  metricList?.addEventListener('change', onMetricModeChange);
   metricList?.addEventListener('click', onMetricRemove);
 
   // Queue buttons
@@ -283,8 +295,13 @@ function showTab(name) {
   }
 
   // Visual Regression's baseline list reflects the Pages list above it, which
-  // may have been edited since the last visit — refresh on entry.
-  if (name === 'build') renderVrBaselines();
+  // may have been edited since the last visit — refresh on entry. The
+  // Metrics section can likewise have been edited from the Tracker tab.
+  if (name === 'build') { renderVrBaselines(); renderMetrics(); }
+
+  // The Tracker's rows mirror the Build tab's metric list, which may have
+  // been edited there since the last visit — re-render on entry.
+  if (name === 'tracker') { mtRenderRows(); mtRenderCounts(); mtSyncStatus(); }
 }
 
 // ── Test Agent ───────────────────────────────────────────────────────────────
@@ -730,7 +747,11 @@ function renderLog() {
 }
 
 function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // String(s ?? '') guards against non-string input (e.g. a migrated metric
+  // entry's field going missing) — a throw here happens inside loadMetrics(),
+  // which boots outside a try/catch, and would silently kill every listener
+  // binding still to come in DOMContentLoaded.
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function setFilter(lv, btn) {
@@ -864,22 +885,48 @@ async function clearBcLog() {
   document.getElementById('bc-log-out').innerHTML = '';
 }
 
-// ── Metrics (Build tab) ─────────────────────────────────────────────────────
+// ── Metrics (Build tab, shared with the Metric Tracker tab) ─────────────────
 // User-entered metric values — the strings that fire in the browser output,
 // typically prefixed [PJS] or [cro] (the same values the Console tab's CRO
-// toggle surfaces). Stored in storage.local as `metricsList`; a tracking
-// mechanism consuming these is planned as follow-up work.
+// toggle surfaces). Stored in storage.local as `metricsList`. This array is
+// consumed by three surfaces: this Build-tab list, the Metric Tracker tab
+// (live fire counting), and Track Metric queue steps (post-hoc assertion) —
+// so every entry is now an object, not a bare string. See
+// normalizeMetricsList in metric-match.js for the shape and the migration
+// from the old string[] shape.
 async function loadMetrics() {
   const { metricsList = [] } = await chrome.storage.local.get('metricsList');
-  metrics = metricsList;
+  const normalized = normalizeMetricsList(metricsList);
+  metrics = normalized;
+  // One-time upgrade only — writing back unconditionally would have every
+  // open panel ping-pong the write through storage.onChanged forever.
+  if (JSON.stringify(metricsList) !== JSON.stringify(normalized)) persistMetrics();
   renderMetrics();
+  mtRenderRows();
   // The queue is restored before this runs — give any restored Track Metric
   // steps their dropdown options now that the list is in memory.
   refreshTrackMetricSteps();
 }
 
+// Deliberately fire-and-forget (no await on the storage.local.set) — that is
+// what lets a synchronous caller (e.g. the Initialize fill target's apply(),
+// which the registry contract requires to stay synchronous) call this and
+// return without ever becoming async itself.
 function persistMetrics() {
   chrome.storage.local.set({ metricsList: metrics });
+}
+
+// Two editors share `metrics` — this Build-tab list and the Metric Tracker
+// tab's list. Every mutation must fan out to both renderers plus the queue's
+// Track Metric dropdowns, or one surface goes stale until reload. `skip`
+// names the surface whose DOM was just interacted with directly (typing
+// mid-keystroke), so its own rebuild is skipped to avoid stealing focus —
+// the other surface still gets a full re-render.
+function mtSyncAfterListChange(skip) {
+  persistMetrics();
+  if (skip !== 'build') renderMetrics();
+  refreshTrackMetricSteps();
+  if (skip !== 'mt') mtRenderRows();
 }
 
 function renderMetrics() {
@@ -892,39 +939,79 @@ function renderMetrics() {
     list.innerHTML = '<div id="metrics-empty">No metrics yet — click + Add Metric to track a value</div>';
     return;
   }
-  list.innerHTML = metrics.map((m, i) => `
+  list.innerHTML = metrics.map((m) => {
+    const needsReview = m.source === 'goal' && m.reviewed === false;
+    return `
     <div class="metric-row">
-      <input type="text" data-metric-idx="${i}" placeholder="Metric value, e.g. Tagging: hero_cta_click" value="${esc(m).replace(/"/g, '&quot;')}">
-      <button class="btn-icon" data-metric-remove="${i}" title="Remove metric">✕</button>
-    </div>`).join('');
+      <input type="text" data-metric-id="${esc(m.id)}" placeholder="Metric value, e.g. Tagging: hero_cta_click" value="${esc(m.pattern || '').replace(/"/g, '&quot;')}">
+      <select data-metric-mode="${esc(m.id)}" style="flex:0 0 82px;font-size:11px;padding:3px 4px">
+        <option value="contains"${m.mode === 'contains' ? ' selected' : ''}>Contains</option>
+        <option value="smart"${m.mode === 'smart' ? ' selected' : ''}>Smart</option>
+        <option value="exact"${m.mode === 'exact' ? ' selected' : ''}>Exact</option>
+        <option value="regex"${m.mode === 'regex' ? ' selected' : ''}>Regex</option>
+      </select>
+      ${needsReview ? `<span class="btn-icon" data-metric-confirm="${esc(m.id)}" title="From a ticket Goal — needs review before Track Metric can assert on it. Click to confirm.">⚠</span>` : ''}
+      <button class="btn-icon" data-metric-remove="${esc(m.id)}" title="Remove metric">✕</button>
+    </div>`;
+  }).join('');
 }
 
 function addMetricRow() {
-  metrics.push('');
-  persistMetrics();
-  renderMetrics();
-  document.querySelector(`#metric-list input[data-metric-idx="${metrics.length - 1}"]`)?.focus();
+  const id = mtNewId();
+  metrics.push({ id, label: '', pattern: '', mode: 'smart', convertMetricId: null, enabled: true, source: 'manual', reviewed: true, createdAt: Date.now() });
+  mtSyncAfterListChange();
+  document.querySelector(`#metric-list input[data-metric-id="${id}"]`)?.focus();
 }
 
 // Delegated on #metric-list: typing updates in place (no re-render, so focus
-// is preserved); the ✕ button removes the row. Track Metric steps in the
-// queue mirror this list, so their dropdowns refresh on every change.
+// is preserved); the ✕ button removes the row, the mode select and the
+// "needs review" confirm badge are handled by their own delegated listeners
+// below. Track Metric steps in the queue mirror this list, so their
+// dropdowns refresh on every change.
 function onMetricInput(e) {
-  const idx = e.target?.dataset?.metricIdx;
-  if (idx === undefined) return;
-  metrics[+idx] = e.target.value;
-  persistMetrics();
-  refreshTrackMetricSteps();
+  const id = e.target?.dataset?.metricId;
+  if (id === undefined) return;
+  const m = metrics.find((x) => x.id === id);
+  if (!m) return;
+  m.pattern = e.target.value;
+  mtSyncAfterListChange('build');
+}
+
+function onMetricModeChange(e) {
+  const id = e.target?.dataset?.metricMode;
+  if (id === undefined) return;
+  const m = metrics.find((x) => x.id === id);
+  if (!m) return;
+  m.mode = e.target.value;
+  mtSyncAfterListChange();
 }
 
 function onMetricRemove(e) {
+  const confirmBtn = e.target.closest('[data-metric-confirm]');
+  if (confirmBtn) {
+    const m = metrics.find((x) => x.id === confirmBtn.dataset.metricConfirm);
+    if (m) { m.reviewed = true; mtSyncAfterListChange(); }
+    return;
+  }
   const btn = e.target.closest('[data-metric-remove]');
   if (!btn) return;
-  metrics.splice(+btn.dataset.metricRemove, 1);
-  persistMetrics();
-  renderMetrics();
-  refreshTrackMetricSteps();
+  const i = metrics.findIndex((x) => x.id === btn.dataset.metricRemove);
+  if (i < 0) return;
+  metrics.splice(i, 1);
+  mtSyncAfterListChange();
 }
+
+// Edited (or migrated) in another window — refresh both renderers and the
+// queue dropdowns, but never write back from here. Mirrors the fill-target
+// registry's invariant: a storage event may only update what's shown, never
+// trigger a write of its own.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.metricsList) return;
+  metrics = normalizeMetricsList(changes.metricsList.newValue || []);
+  renderMetrics();
+  mtRenderRows();
+  refreshTrackMetricSteps();
+});
 
 async function syncBcStatus() {
   const { debuggerStatus } = await sessionNS.get('debuggerStatus');
@@ -1469,21 +1556,54 @@ function buildOpenUrlArgsHTML(step) {
 // saved on the step but since removed from the list is kept selectable so the
 // step still shows (and runs with) what it was configured to track.
 function buildTrackMetricArgsHTML(step) {
-  const values  = metrics.map(m => m.trim()).filter(Boolean);
-  const current = (step.inputs.metric || '').trim();
-  if (current && !values.includes(current)) values.unshift(current);
-  if (!values.length) {
-    return '<div class="no-args">No metrics defined — add one in the Metrics section first</div>';
+  // Goal-derived entries nobody has reviewed are NOT offered here — the
+  // Metric Tracker still counts them (observation is safe), but asserting on
+  // one is a claim only a human confirming it as a real console signal
+  // should be able to make.
+  const usable = metrics.filter(m =>
+    m.enabled !== false &&
+    (m.pattern || '').trim() &&
+    !(m.source === 'goal' && m.reviewed === false));
+  const pendingGoals = metrics.filter(m =>
+    m.source === 'goal' && m.reviewed === false && (m.pattern || '').trim()).length;
+
+  // Silent upgrade: a step saved before the Tracker carries only the legacy
+  // `metric` string. Resolve it to an id once, here, on first render.
+  const raw = (step.inputs.metric || '').trim();
+  if (!step.inputs.metricId && raw) {
+    const hit = metrics.find(m => (m.pattern || '').trim() === raw);
+    if (hit) step.inputs.metricId = hit.id;
   }
-  if (!current) step.inputs.metric = values[0];
-  const opts = values.map(v =>
-    `<option value="${esc(v).replace(/"/g, '&quot;')}"${v === step.inputs.metric ? ' selected' : ''}>${esc(v)}</option>`
-  ).join('');
+
+  // An id (or raw string) no longer in the list stays selectable, so the
+  // step still shows — and still runs — what it was configured to track.
+  const orphan = step.inputs.metricId && !usable.some(m => m.id === step.inputs.metricId);
+
+  if (!usable.length && !orphan && !raw) {
+    return '<div class="no-args">No metrics defined — add one in the Metrics section first</div>'
+      + (pendingGoals ? `<div class="no-args">${pendingGoals} goal-derived metric(s) are awaiting review.</div>` : '');
+  }
+  if (!step.inputs.metricId && usable.length) {
+    step.inputs.metricId = usable[0].id;
+    step.inputs.metric   = usable[0].pattern;
+  }
+
+  const opts = [
+    ...((orphan || (raw && !step.inputs.metricId))
+      ? [`<option value="${esc(step.inputs.metricId || '')}" selected>${esc(raw || '(removed metric)')} — not in the list</option>`]
+      : []),
+    ...usable.map(m => {
+      const name = esc(m.label || m.pattern).replace(/"/g, '&quot;');
+      return `<option value="${esc(m.id)}"${m.id === step.inputs.metricId ? ' selected' : ''}>${name} · ${m.mode}</option>`;
+    }),
+  ].join('');
+
   return `
     <div class="arg-row">
       <span class="arg-lbl">Metric</span>
-      <select data-arg="metric" class="method-select">${opts}</select>
-    </div>`;
+      <select data-arg="metricId" class="method-select">${opts}</select>
+    </div>`
+    + (pendingGoals ? `<div class="no-args">${pendingGoals} goal-derived metric(s) hidden until reviewed — confirm them in the Metrics list.</div>` : '');
 }
 
 // Rebuild every Track Metric step's dropdown so it reflects the current
@@ -1534,6 +1654,15 @@ function wireArgs(el, step) {
     const isSelect = inp.tagName === 'SELECT';
     inp.addEventListener(isSelect ? 'change' : 'input', e => {
       step.inputs[inp.dataset.arg] = e.target.value;
+
+      // Keep the legacy `metric` string in step alongside the id, so a
+      // script saved by this build still runs on a build that predates
+      // metricId — and so a step whose metric is later deleted still knows
+      // what it was pointed at.
+      if (step.func === 'track_metric' && inp.dataset.arg === 'metricId') {
+        const ent = metrics.find(m => m.id === e.target.value);
+        step.inputs.metric = ent ? ent.pattern : (step.inputs.metric || '');
+      }
 
       // Update sub-tooltip when a method/target/action select changes
       const subOpts = SUB_OPTION_MAP[step.func]?.[inp.dataset.arg];
@@ -2556,7 +2685,7 @@ async function runAbComparison(opts = {}) {
     return;
   }
 
-  const metricsList = metrics.map(m => m.trim()).filter(Boolean);
+  const metricsList = metrics.filter(m => m.enabled !== false && (m.pattern || '').trim());
   const selectors   = abState.selectors.map(s => s.trim()).filter(Boolean);
 
   // A new run invalidates any in-memory heatmap recordings from the last one
@@ -2600,6 +2729,9 @@ async function runAbComparison(opts = {}) {
 // All comparison logic lives here; captures[0] is the baseline. Returns a
 // structure the renderer walks — no DOM concerns in this function.
 function diffAbCaptures(captures, metricsList, selectors) {
+  // Defensive: an in-memory _abLastRun captured before this build's migration
+  // (report replay, popup.js:4393) may still hold the old string[] shape.
+  const metricEntries = normalizeMetricsList(metricsList);
   const texts = c => (c.console || []).map(l => l.text);
   const stripUrl = (u) => {
     try { const p = new URL(u); return p.origin + p.pathname; } catch (_) { return u || ''; }
@@ -2633,14 +2765,16 @@ function diffAbCaptures(captures, metricsList, selectors) {
     return { selector: sel, rows, diffs, missing, allSame };
   });
 
-  // Metrics — case-insensitive substring fire counts against tagged lines,
-  // the same matching rule as the Build tab's Track Metric step.
-  const metricRows = metricsList.map(m => {
-    const needle = m.toLowerCase();
-    const counts = captures.map(c => texts(c).filter(t => t.toLowerCase().includes(needle)).length);
+  // Metrics — fire counts against tagged lines, via each entry's own match
+  // mode (mtMatch, shared with the Metric Tracker and Track Metric). This
+  // function is synchronous and called from a render path, so it always
+  // scores at 'balanced' sensitivity rather than plumbing the async global
+  // setting through — the global only governs the Tracker and Track Metric.
+  const metricRows = metricEntries.map(m => {
+    const counts = captures.map(c => texts(c).filter(t => mtMatch(m, t, { sensitivity: 'balanced' }).hit).length);
     const fired    = counts.map(c => c > 0);
     return {
-      metric: m, counts,
+      metric: m.label || m.pattern, counts,
       allSame: counts.every(c => c === counts[0]),
       mixedFiring: fired.some(Boolean) && !fired.every(Boolean),   // fired somewhere but not everywhere
     };
@@ -4459,26 +4593,33 @@ async function openReportTab(sections) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Initialize tab — Jira ticket → reviewable Test Context
 //
-// Context provider, not a test mode. Extraction is fully deterministic — no
-// LLM call anywhere in this pipeline (deliberate v1 scope). No API token:
-// authentication rides the user's existing Jira session via a same-origin
-// fetch from a content script injected into the open ticket tab (see
-// initPageExtractorFn below) — a service-worker cross-origin fetch would
-// 401 silently on SameSite cookies. Custom fields resolve per-extraction from
-// the issue response's own `names` map (expand=names) — nothing is cached.
-// Direct Jira field values always win over anything parsed from description
-// text. The parsed result is held in _initDraft until the user reviews and
-// saves it; only named entries under chrome.storage.local `initContexts`
-// (each reviewed:true) are ever readable by other modes, and only the one
-// named by `activeInitContext`.
+// Context provider, not a test mode. Extraction is a hybrid: Variants,
+// Experiment ID, QA Test Plan, and Summary are fully deterministic — no LLM
+// call, sourced from direct Jira fields or a clean v0/v1/… marker convention.
+// Platform, Preview Links, ITW Link, and Goals are AI-only (see
+// runAiFieldExtraction/mergeAiFieldsIntoDraft, further below) — real tickets
+// format these loosely enough that regex/heading parsing routinely missed
+// them entirely, so there is no deterministic computation for these four at
+// all anymore; Extract waits for the AI call before rendering the review
+// form. No API token for the Jira fetch itself: authentication rides the user's existing
+// Jira session via a same-origin fetch from a content script injected into
+// the open ticket tab (see initPageExtractorFn below) — a service-worker
+// cross-origin fetch would 401 silently on SameSite cookies. Custom fields
+// resolve per-extraction from the issue response's own `names` map
+// (expand=names) — nothing is cached. Direct Jira field values always win
+// over anything parsed from description text. The merged result is held in
+// _initDraft until the user reviews and saves it — nothing here writes to
+// chrome.storage.local automatically; only named entries under
+// `initContexts` (each reviewed:true) are ever readable by other modes, and
+// only the one named by `activeInitContext`.
 //
-// Every mode that consumes it does so through the fill-target registry
-// (FILL_TARGETS, further below) — either that surface's own "Fill from
-// ticket" button, or the "Apply to all modes" fan-out on this tab's Active
-// Test Context card. Both are strictly user-initiated: nothing is ever
-// pushed automatically. refreshAllFillButtons() (called from tab load, from
-// storage.onChanged in another window, and after every fill) may only touch
-// button/hint state — it must never call a target's apply().
+// Every mode that consumes the Test Context does so through the fill-target
+// registry (FILL_TARGETS, further below) — either that surface's own "Fill
+// from ticket" button, or the "Apply to all modes" fan-out on this tab's
+// Active Test Context card. Both are strictly user-initiated: nothing is
+// ever pushed automatically. refreshAllFillButtons() (called from tab load,
+// from storage.onChanged in another window, and after every fill) may only
+// touch button/hint state — it must never call a target's apply().
 // ═══════════════════════════════════════════════════════════════════════════
 
 let _initDraft = null;    // extracted-but-uncommitted context; reviewed stays false until Save
@@ -4564,40 +4705,52 @@ async function initPageExtractorFn(overrideKey) {
       return { ok: false, error: 'FETCH_FAILED', status: res.status, detail: detail || res.statusText };
     }
 
-    // Best-effort scrape of the rendered "Preview Links" section — the popup
-    // falls back to the ADF description if this finds nothing, since Jira's
-    // issue-view markup varies by version/theme. Bounded by heading rank, not
-    // exact tag, so a differently-leveled next heading (Preview Links as h3,
-    // Goals as h2 right after) still ends the section instead of bleeding
-    // into it. Each link's nearest block ancestor is kept as `label` so the
-    // popup can try to read a "v<N>:" marker off it before falling back to
-    // DOM order for the id.
-    const previewLinksDom = [];
-    const headingSel = 'h1,h2,h3,h4,h5,h6,[role="heading"]';
-    const headingRank = h => /^H[1-6]$/.test(h.tagName) ? +h.tagName[1] : (parseInt(h.getAttribute('aria-level'), 10) || 2);
-    const headingLike = Array.from(document.querySelectorAll(headingSel));
-    const heading = headingLike.find(h => (h.textContent || '').trim().toLowerCase() === 'preview links');
-    if (heading) {
-      const startRank = headingRank(heading);
-      let node = heading.nextElementSibling;
-      while (node) {
-        if (node.matches?.(headingSel) && headingRank(node) <= startRank) break;
-        node.querySelectorAll?.('a[href]').forEach(a => previewLinksDom.push({
-          text: (a.textContent || '').trim(),
-          url: a.href,
-          label: a.closest('li,p,tr,td,div')?.textContent?.trim() || '',
-        }));
-        node = node.nextElementSibling;
-      }
-    }
+    // Bounded full-text capture of the rendered issue view — feeds the AI
+    // field-extraction call, not the deterministic parse below. Covers
+    // content that only ever renders client-side (Jira Forms/app panels) and
+    // so never appears in the ADF description, e.g. a "Pages" section or the
+    // "Key details" tab set. Prefers the issue-view container so it isn't
+    // diluted by the rest of the Jira chrome (nav, sidebar). Comments/
+    // activity/history are cloned out on purpose — they're the densest
+    // source of other people's names and remarks on the page, and none of it
+    // is spec content the extraction needs.
+    const PAGE_TEXT_BUDGET = 60000;
+    const PAGE_TEXT_DROP = '[data-testid*="comment"],[data-testid*="activity"],[data-testid*="history"],[id*="comment"],[id*="activitymodule"],nav,script,style,noscript';
+    const container = document.querySelector('[data-testid*="issue"]') || document.querySelector('main') || document.body;
+    const containerClone = container ? container.cloneNode(true) : null;
+    containerClone?.querySelectorAll?.(PAGE_TEXT_DROP).forEach(n => n.remove());
+    const rawPageText = (containerClone?.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+    const pageTextTruncated = rawPageText.length > PAGE_TEXT_BUDGET;
+    const pageText = pageTextTruncated ? rawPageText.slice(0, PAGE_TEXT_BUDGET) : rawPageText;
 
-    return { ok: true, issue, previewLinksDom, origin: location.origin, ticketKey: key };
+    // General link inventory — every <a href> left in the same clone
+    // pageText was captured from (so comments/activity/history are already
+    // excluded), each with its visible text, full href, and nearest block
+    // ancestor's text as a label. This is the only place actual preview/ITW
+    // URLs are captured at all: pageText is plain innerText, which loses
+    // every href — links usually show human text ("v0: Control") rather than
+    // the URL itself. Not scoped to any particular heading (tickets phrase
+    // section names inconsistently); the AI field-extraction call sorts out
+    // which links are preview links, ITW, editor/results, etc.
+    const links = [];
+    containerClone?.querySelectorAll?.('a[href]').forEach(a => {
+      if (links.length >= 300) return;
+      const url = a.href;
+      if (!/^https?:/i.test(url)) return;
+      links.push({
+        text: (a.textContent || '').trim().slice(0, 200),
+        url: url.slice(0, 500),
+        label: (a.closest('li,p,tr,td,div,h1,h2,h3,h4,h5,h6')?.textContent || '').trim().slice(0, 300),
+      });
+    });
+
+    return { ok: true, issue, pageText, pageTextTruncated, links, origin: location.origin, ticketKey: key };
   } catch (e) {
     return { ok: false, error: 'EXCEPTION', detail: e?.message || String(e) };
   }
 }
 
-// ── Extraction pipeline (v1 — fully deterministic, no LLM, no token) ────────
+// ── Extraction pipeline (deterministic fetch/parse, then AI field merge) ────
 async function extractFromActiveTab() {
   const statusEl = document.getElementById('init-fetch-status');
   const setStatus = (t, color) => { statusEl.textContent = t; statusEl.style.color = color || 'var(--fg3)'; };
@@ -4627,7 +4780,10 @@ async function extractFromActiveTab() {
       if (r.error === 'SESSION_EXPIRED') throw new Error('Your Jira session looks expired — open/refresh the ticket tab, log in, and try again.');
       throw new Error(r.detail || `Fetch failed (${r.status || 'error'})`);
     }
-    extractTestContext(r.issue, r.previewLinksDom, r.origin, r.ticketKey);
+    extractTestContext(r.issue, r.origin, r.ticketKey);
+    setStatus('Extracting… asking AI to fill in Platform, Preview Links, ITW Link, and Goals…');
+    const aiRes = await runAiFieldExtraction(r, _initDraft).catch(e => ({ ok: false, error: e?.message || String(e) }));
+    mergeAiFieldsIntoDraft(aiRes);
     renderInitReview();
     setStatus(`Extracted from ${_initDraft.ticketKey} — review below, then save.`, 'var(--ok)');
   } catch (e) {
@@ -4652,39 +4808,6 @@ function jiraFieldString(v) {
   return null;
 }
 
-// Try to read a "v<N>:" marker (same convention as splitVariantBlocks) off
-// each link's nearby label text before falling back to DOM/list encounter
-// order. A marker that collides with another link's is treated as unreliable
-// for both — they fall back to positional too, skipping any index already
-// claimed by a confirmed marker.
-function assignPreviewLinkIds(rawLinks) {
-  const markerRe = /^v(\d+)\b/i;
-  const markerCounts = new Map();
-  const parsed = rawLinks.map(l => {
-    const m = (l.label || '').trim().match(markerRe);
-    const id = m ? 'v' + m[1] : null;
-    if (id) markerCounts.set(id, (markerCounts.get(id) || 0) + 1);
-    return { url: l.url, id };
-  });
-  const usedIds = new Set(parsed.filter(l => l.id && markerCounts.get(l.id) === 1).map(l => l.id));
-  let anyPositional = false;
-  let next = 0;
-  const links = parsed.map(l => {
-    if (l.id && markerCounts.get(l.id) === 1) return { id: l.id, url: l.url };
-    anyPositional = true;
-    while (usedIds.has('v' + next)) next++;
-    const id = 'v' + next;
-    next++; usedIds.add(id);
-    return { id, url: l.url };
-  });
-  return {
-    links,
-    warning: anyPositional
-      ? 'Preview links: some links had no "v<N>:" label nearby — those were assigned ids positionally, which may not match the actual variant.'
-      : null,
-  };
-}
-
 // Convert metric ids are long numeric tokens, but a goal's prose can easily
 // contain an unrelated 6+ digit number (a date, another ticket ref, a
 // threshold). Only accept a digit run anchored by a label ("metric id"/
@@ -4705,19 +4828,20 @@ function extractConvertMetricId(text) {
   return { id: candidates.size === 1 ? [...candidates][0] : null, candidates: [...candidates] };
 }
 
-function extractTestContext(issue, previewLinksDom, origin, ticketKeyFromPage) {
+function extractTestContext(issue, origin, ticketKeyFromPage) {
   const f = issue.fields || {};
   const names = issue.names || {};
   const warnings = [];
 
-  // Step 1 — direct fields (always win over anything parsed from text)
+  // Step 1 — direct fields (always win over anything parsed from text).
+  // Platform, Preview Links, ITW Link, and Goals are AI-only (see
+  // runAiFieldExtraction/mergeAiFieldsIntoDraft, further below) — real
+  // tickets format them loosely enough that deterministic Labels-matching
+  // and ADF-heading parsing routinely missed them entirely. Only Variants,
+  // Experiment ID, QA Test Plan, and Summary stay deterministic here.
   const ticketKey = issue.key || ticketKeyFromPage;
   const ticketUrl = `${origin}/browse/${ticketKey}`;
   const summary = f.summary || '';
-  const labels = Array.isArray(f.labels) ? f.labels : [];
-  const platform = labels.includes('Optimizely') ? 'Optimizely'
-                 : labels.includes('Convert')    ? 'Convert' : null;
-  if (!platform) warnings.push('Neither "Optimizely" nor "Convert" is in the ticket\'s Labels — platform is unset.');
 
   const experimentIdKey = resolveJiraFieldKey(names, 'Platform Experiment ID');
   const qaTestPlanKey   = resolveJiraFieldKey(names, 'QA Test Plan');
@@ -4741,84 +4865,14 @@ function extractTestContext(issue, previewLinksDom, origin, ticketKeyFromPage) {
   }));
   if (specNodes && !variants.length) warnings.push('"Test Specifications" section found, but no v0/v1/… markers inside it.');
 
-  // Step 4 — preview links, pulled as rendered <a> tags from the ticket DOM
-  // (the content script is already on the page) rather than walked out of
-  // the ADF tree. Falls back to the ADF "Preview Links" section only if the
-  // DOM scrape finds nothing.
-  let previewLinks = [];
-  const rawDomLinks = (previewLinksDom || [])
-    .map(l => ({ url: (l.url || '').trim(), label: l.label || '' }))
-    .filter(l => l.url);
-  if (rawDomLinks.length) {
-    const assigned = assignPreviewLinkIds(rawDomLinks);
-    previewLinks = assigned.links;
-    if (assigned.warning) warnings.push(assigned.warning);
-  }
-  if (!previewLinks.length) {
-    const linkNodes = adf ? adfSectionNodes(adf, 'Preview Links') : null;
-    if (adf && linkNodes === null) warnings.push('"Preview Links" heading not found in the rendered ticket or its description.');
-    const sectionLines = adfSectionLines(linkNodes || []);
-    previewLinks = splitVariantBlocks(sectionLines).map(b => ({
-      id: b.id,
-      url: (b.urls[0] || (b.texts.join(' ').match(/https?:\/\/\S+/) || [])[0] || '').trim(),
-    })).filter(l => l.url);
-    if (linkNodes && !previewLinks.length) {
-      // No v<N> markers anywhere in the section — fall back to whatever URLs
-      // it does contain, in encounter order, rather than reporting nothing.
-      previewLinks = sectionLines.filter(l => l.urls.length).map((l, i) => ({ id: `v${i}`, url: l.urls[0] }));
-      warnings.push(previewLinks.length
-        ? 'Preview links: recovered from the ADF description positionally (no "v<N>:" markers found) — ids reflect row/bullet order, not variant identity; verify against Test Specifications.'
-        : '"Preview Links" section found, but no v#-marked URLs inside it.');
-    }
-    if (previewLinks.length) warnings.push('Preview links recovered from the ADF description — the rendered-page scrape found none there; double-check them.');
-  }
-
-  // Cross-check against the variants already parsed from Test Specifications
-  // — a reordered or skipped preview link otherwise silently mislabels which
-  // variant it belongs to.
-  if (previewLinks.length && variants.length) {
-    if (previewLinks.length !== variants.length) {
-      warnings.push(`Preview links: found ${previewLinks.length} preview link(s) but ${variants.length} variant(s) in Test Specifications — check for a missing/extra link.`);
-    } else {
-      const linkIds = [...new Set(previewLinks.map(l => l.id))];
-      const variantIds = [...new Set(variants.map(v => v.id))];
-      const idsMatch = linkIds.length === variantIds.length && linkIds.every(id => variantIds.includes(id));
-      if (!idsMatch) warnings.push(`Preview links: ids (${linkIds.join(', ')}) don't match Test Specifications variant ids (${variantIds.join(', ')}) — the link-to-variant mapping may be off.`);
-    }
-  }
-
-  const derived = derivePreviewPattern(previewLinks);
-  if (derived.warning) warnings.push(derived.warning);
-
-  // Step 5 — goals. These are business-level KPIs, NOT [PJS]-tagged console
-  // strings — they must never be auto-written into the Functional Testing
-  // metrics list (a QA run would silently pass/fail against the wrong signal).
-  const goalNodes = adf ? adfSectionNodes(adf, 'Goals') : null;
-  if (adf && goalNodes === null) warnings.push('"Goals" heading not found in the ticket description.');
-  const goals = adfSectionLines(goalNodes || []).filter(l => l.text).map(l => {
-    let text = l.text;
-    const isNew = text.includes('[NEW]');
-    if (isNew) text = text.replace('[NEW]', '').replace(/\s{2,}/g, ' ').trim();
-    let convertMetricId = null, resolutionNeeded = false;
-    if (platform === 'Convert') {
-      const { id, candidates } = extractConvertMetricId(text);
-      if (id) {
-        convertMetricId = id;
-      } else {
-        resolutionNeeded = true;
-        if (candidates.length > 1) warnings.push(`Goals: "${text}" has multiple candidate Convert metric ids (${candidates.join(', ')}) — left unresolved, pick the correct one manually.`);
-      }
-    }
-    return { text, isNew, convertMetricId, resolutionNeeded };
-  });
-
-  // Step 6 — assemble and hold for review. Nothing touches storage yet.
+  // Step 4 — assemble and hold for review. Nothing touches storage yet.
+  // platform/previewLinks/itwLink/goals start empty and are filled entirely
+  // by mergeAiFieldsIntoDraft — the cross-check between the final
+  // previewLinks and these (always deterministic) variants also runs there,
+  // once, on final state.
   _initDraft = {
-    ticketKey, ticketUrl, summary, platform, experimentId,
-    variants, previewLinks,
-    previewLinkBaseUrl: derived.previewLinkBaseUrl,
-    previewLinkParam:   derived.previewLinkParam,
-    goals, qaTestPlanUrl,
+    ticketKey, ticketUrl, summary, platform: null, experimentId,
+    variants, previewLinks: [], itwLink: null, goals: [], qaTestPlanUrl,
     extractedAt: new Date().toISOString(),
     reviewed: false,
   };
@@ -4928,60 +4982,31 @@ function splitVariantBlocks(lines) {
   return blocks;
 }
 
-// Diff the preview-link URLs: exactly one query param whose value varies while
-// every other part of the URL stays identical → that's the override param, and
-// the URL with it stripped is the shared base. Anything else is flagged in the
-// review UI rather than silently guessed; the raw per-variant links are always
-// kept either way.
-function derivePreviewPattern(links) {
-  const out = { previewLinkBaseUrl: null, previewLinkParam: null, warning: null };
-  if (links.length < 2) return out;
-  let parsed;
-  try { parsed = links.map(l => new URL(l.url)); }
-  catch (_) { out.warning = 'One or more preview links are not valid URLs — base URL / override param not derived.'; return out; }
-
-  // Three candidate dimensions: a query param present on every link, the
-  // path, or the hash fragment. Only a query param can actually be wired
-  // into previewLinkBaseUrl/previewLinkParam (ctxVariantTargets only knows
-  // how to read a named query param) — path/hash variation is detected and
-  // reported, but left undetermined rather than populating fields the fill
-  // targets can't act on.
-  const common = [...parsed[0].searchParams.keys()].filter(k => parsed.every(u => u.searchParams.has(k)));
-  const varyingParams = common.filter(k => new Set(parsed.map(u => u.searchParams.get(k))).size > 1);
-  const pathVaries = new Set(parsed.map(u => u.pathname)).size > 1;
-  const hashVaries  = new Set(parsed.map(u => u.hash)).size > 1;
-  const dimensions = [...varyingParams, ...(pathVaries ? ['path'] : []), ...(hashVaries ? ['hash'] : [])];
-
-  if (dimensions.length !== 1) {
-    out.warning = dimensions.length === 0
-      ? 'Preview links: no query param, path segment, or hash fragment that varies across all variants — base URL / override param not derived.'
-      : `Preview links: multiple dimensions vary across variants (${dimensions.join(', ')}) — override param is ambiguous, not derived.`;
-    return out;
-  }
-
-  const dim = dimensions[0];
-  if (dim === 'path' || dim === 'hash') {
-    const rest = dim === 'path' ? parsed.map(u => u.origin + u.search + u.hash) : parsed.map(u => u.origin + u.pathname + u.search);
-    out.warning = new Set(rest).size > 1
-      ? `Preview links: ${dim === 'path' ? 'path segment' : 'hash fragment'} varies, but the rest of the URLs don't match — no common base URL derived. Full per-variant links are kept.`
-      : `Preview links: links vary by ${dim === 'path' ? 'path segment' : 'hash fragment'}, not by query param — this field only derives query-param overrides, so base URL/override aren't populated; per-variant links are kept as-is.`;
-    return out;
-  }
-
-  const param = dim;
-  const stripped = parsed.map(u => {
-    const c = new URL(u.href);
-    c.searchParams.delete(param);
-    const qs = c.searchParams.toString();
-    return c.origin + c.pathname + (qs ? '?' + qs : '');
-  });
-  if (new Set(stripped).size > 1) {
-    out.warning = `Preview links: "${param}" varies, but the rest of the URLs don't match — no common base URL derived. Full per-variant links are kept.`;
-    return out;
-  }
-  out.previewLinkParam = param;
-  out.previewLinkBaseUrl = stripped[0];
-  return out;
+// Flattens the whole ADF description into text with heading structure kept
+// (as `## <heading>` markers) — feeds the AI field-extraction call further
+// below, where knowing "the Goals heading exists but has one line under it"
+// matters as much as that line's own text. adfText() intentionally discards
+// structure for the deterministic parse above; this is its structure-
+// preserving sibling, reusing adfBlockLines() for each block's own text.
+function adfDocToHeadedText(doc) {
+  const lines = [];
+  (function walk(nodes) {
+    for (const n of nodes || []) {
+      if (!n) continue;
+      if (n.type === 'heading') {
+        const level = n.attrs?.level ?? 1;
+        const text = adfText(n).trim();
+        if (text) lines.push(`${'#'.repeat(Math.min(Math.max(level, 1), 6))} ${text}`);
+        continue;
+      }
+      if (n.type === 'paragraph' || n.type === 'listItem' || n.type === 'tableRow') {
+        adfBlockLines(n).forEach(l => { if (l.text) lines.push(l.text); });
+        continue;
+      }
+      if (n.content) walk(n.content);
+    }
+  })(doc?.content);
+  return lines.join('\n');
 }
 
 // ── Review / Commit UI ───────────────────────────────────────────────────────
@@ -5038,7 +5063,8 @@ function renderInitReview() {
   host.innerHTML = `
   <div class="card">
     <div class="card-title" style="margin-bottom:1px">Review — ${esc(d.ticketKey)}</div>
-    <div style="font-size:10px;color:var(--fg3);margin-bottom:8px">Nothing is saved until you commit. <a href="${q(d.ticketUrl)}" target="_blank" style="color:var(--info)">Open ticket ↗</a></div>
+    <div style="font-size:10px;color:var(--fg3);margin-bottom:2px">Nothing is saved until you commit. <a href="${q(d.ticketUrl)}" target="_blank" style="color:var(--info)">Open ticket ↗</a></div>
+    <div style="font-size:10px;color:var(--fg3);margin-bottom:8px">Platform, Preview Links, ITW Link, and Goals below are AI-populated from the ticket — double-check before saving.</div>
     ${warnHtml}
     <div class="arg-row" style="margin-bottom:5px">
       <span class="arg-lbl">Summary</span>
@@ -5067,18 +5093,15 @@ function renderInitReview() {
     <button class="btn sm" data-init-add="variants" style="margin:5px 0 10px">+ Add Variant</button>
 
     <label class="cap">Preview Links</label>
-    <div class="arg-row" style="margin-bottom:4px">
-      <span class="arg-lbl">Base URL</span>
-      <input type="text" data-init="previewLinkBaseUrl" value="${q(d.previewLinkBaseUrl || '')}" placeholder="not derived — see warnings">
-    </div>
     <div class="arg-row" style="margin-bottom:6px">
-      <span class="arg-lbl">Override param</span>
-      <input type="text" data-init="previewLinkParam" value="${q(d.previewLinkParam || '')}" placeholder="not derived — see warnings">
+      <span class="arg-lbl">ITW Link</span>
+      <input type="text" data-init="itwLink" value="${q(d.itwLink || '')}" placeholder="In-the-wild production URL — AI-detected">
+      ${d.itwLink ? `<a href="${q(d.itwLink)}" target="_blank" style="font-size:11px;color:var(--info);flex-shrink:0">open ↗</a>` : ''}
     </div>
     <div style="display:flex;flex-direction:column;gap:4px">${linkRows}</div>
     <button class="btn sm" data-init-add="previewLinks" style="margin:5px 0 10px">+ Add Preview Link</button>
 
-    <label class="cap">Goals — reference only, never auto-added to the Metrics list</label>
+    <label class="cap">Goals — adding one tracks it immediately but flags it "needs review"; it stays out of Track Metric until you confirm it</label>
     <div style="display:flex;flex-direction:column;gap:4px">${goalRows}</div>
     <button class="btn sm" data-init-add="goals" style="margin:5px 0 10px">+ Add Goal</button>
 
@@ -5138,6 +5161,96 @@ function onInitReviewClick(e) {
     if (list === 'previewLinks') _initDraft.previewLinks.push({ id: 'v' + _initDraft.previewLinks.length, url: '' });
     if (list === 'goals')        _initDraft.goals.push({ text: '', isNew: false, convertMetricId: null, resolutionNeeded: false });
     renderInitReview();
+  }
+}
+
+// ── Initialize tab — AI field extraction ────────────────────────────────────
+// Fires synchronously as part of Extract (see extractFromActiveTab above),
+// with the ticket content already fetched — it never re-fetches. AI-only for
+// Platform, Preview Links, ITW Link, and Goals — there is no deterministic
+// computation for these anymore (extractTestContext leaves them empty; real
+// tickets format them loosely enough that regex/heading parsing routinely
+// missed them entirely). Deterministic parsing stays authoritative for
+// Variants, Experiment ID, QA Test Plan, and Summary. Runs once, before
+// renderInitReview() — there is no separate panel and no progressive
+// re-render, so an in-progress edit can never be clobbered by a late result.
+async function runAiFieldExtraction(extractorResult, draft) {
+  const payload = {
+    ticketKey: draft.ticketKey,
+    ticketUrl: draft.ticketUrl,
+    summary: draft.summary,
+    labels: Array.isArray(extractorResult?.issue?.fields?.labels) ? extractorResult.issue.fields.labels : [],
+    experimentId: draft.experimentId,
+    qaTestPlanUrl: draft.qaTestPlanUrl,
+    descriptionText: adfDocToHeadedText(extractorResult?.issue?.fields?.description),
+    descriptionMissing: !extractorResult?.issue?.fields?.description,
+    pageText: extractorResult?.pageText || '',
+    pageTextTruncated: !!extractorResult?.pageTextTruncated,
+    // Every <a href> captured on the rendered page — the only place real
+    // URLs live, since pageText above is plain innerText (no hrefs).
+    links: extractorResult?.links || [],
+    // Reference only — the ticket's own variant ids from Test Specifications
+    // (still deterministic), so the model can assign preview-link ids
+    // consistently. Never an instruction to agree with anything else.
+    parsed: { variantIds: draft.variants.map(v => v.id) },
+    warnings: _initWarnings.slice(),
+  };
+  return chrome.runtime.sendMessage({ action: 'aiExtractInitFields', payload });
+}
+
+// Merges the AI extraction result into _initDraft and _initWarnings. AI-only
+// for platform/itwLink/previewLinks/goals — there is no deterministic value
+// to fall back to (extractTestContext leaves them empty), so on failure these
+// simply stay empty with a warning explaining why. Convert metric IDs are
+// still resolved by the existing extractConvertMetricId() regex, run over the
+// AI-provided goal text — the model is not asked to invent one.
+function mergeAiFieldsIntoDraft(aiRes) {
+  if (!_initDraft) return;
+  if (aiRes?.ok) {
+    const f = aiRes.fields || {};
+    _initDraft.platform = f.platform ?? null;
+    _initDraft.itwLink = f.itwLink ?? null;
+    _initDraft.previewLinks = Array.isArray(f.previewLinks)
+      ? f.previewLinks.map(l => ({ id: l.id, url: l.url }))
+      : [];
+    _initDraft.goals = Array.isArray(f.goals) ? f.goals.map(g => {
+      const text = g.text || '';
+      let convertMetricId = null, resolutionNeeded = false;
+      if (_initDraft.platform === 'Convert') {
+        const { id, candidates } = extractConvertMetricId(text);
+        if (id) {
+          convertMetricId = id;
+        } else {
+          resolutionNeeded = true;
+          if (candidates.length > 1) _initWarnings.push(`Goals: "${text}" has multiple candidate Convert metric ids (${candidates.join(', ')}) — left unresolved, pick the correct one manually.`);
+        }
+      }
+      return { text, isNew: !!g.isNew, convertMetricId, resolutionNeeded };
+    }) : [];
+    (f.flags || []).forEach(flag => _initWarnings.push(flag));
+    if (aiRes.truncated) _initWarnings.push('AI field extraction was cut off at the output limit — Preview Links/Goals may be incomplete.');
+  } else {
+    const reason = aiRes?.error === 'No API key configured'
+      ? 'No Anthropic API key configured — Platform/Preview Links/ITW Link/Goals could not be extracted.'
+      : `AI field extraction failed (${aiRes?.error || 'unknown error'}) — Platform/Preview Links/ITW Link/Goals could not be extracted.`;
+    _initWarnings.push(reason);
+  }
+
+  // Cross-check the FINAL previewLinks (whichever source) against the
+  // (always deterministic) variants — relocated here from extractTestContext
+  // so it runs once, on final state, instead of on a deterministic preview-
+  // links list that AI extraction usually replaces anyway.
+  const previewLinks = _initDraft.previewLinks;
+  const variants = _initDraft.variants;
+  if (previewLinks.length && variants.length) {
+    if (previewLinks.length !== variants.length) {
+      _initWarnings.push(`Preview links: found ${previewLinks.length} preview link(s) but ${variants.length} variant(s) in Test Specifications — check for a missing/extra link.`);
+    } else {
+      const linkIds = [...new Set(previewLinks.map(l => l.id))];
+      const variantIds = [...new Set(variants.map(v => v.id))];
+      const idsMatch = linkIds.length === variantIds.length && linkIds.every(id => variantIds.includes(id));
+      if (!idsMatch) _initWarnings.push(`Preview links: ids (${linkIds.join(', ')}) don't match Test Specifications variant ids (${variantIds.join(', ')}) — the link-to-variant mapping may be off.`);
+    }
   }
 }
 
@@ -5207,8 +5320,7 @@ async function commitInitContext() {
   d.previewLinks = d.previewLinks
     .map(l => ({ id: (l.id || '').trim(), url: (l.url || '').trim() }))
     .filter(l => l.url);
-  d.previewLinkBaseUrl = (d.previewLinkBaseUrl || '').trim() || null;
-  d.previewLinkParam   = (d.previewLinkParam || '').trim() || null;
+  d.itwLink = (d.itwLink || '').trim() || null;
   d.goals = d.goals.map(g => {
     const text = (g.text || '').trim();
     const rawId = (g.convertMetricId || '').toString().trim();
@@ -5261,25 +5373,32 @@ async function renderActiveContext() {
   card.style.display = '';
   const q = s => esc(s || '').replace(/"/g, '&quot;');
 
-  const goalsHtml = (ctx.goals || []).map((g, i) => `
+  const goalsHtml = (ctx.goals || []).map((g, i) => {
+    const already = metrics.some(m => m.id === mtGoalId(ctx.ticketKey, g.text));
+    return `
     <div class="ab-line" style="display:flex;align-items:center;gap:6px">
       <span style="flex:1">${esc(g.text)}${g.isNew ? ' <span style="color:var(--info);font-size:9px;font-weight:700">NEW</span>' : ''}${g.convertMetricId ? ` <span style="color:var(--fg3)">· Convert ${esc(g.convertMetricId)}</span>` : ''}${g.resolutionNeeded ? ` <span style="color:var(--warn)">· ID TBD${ctx.qaTestPlanUrl ? ` — <a href="${q(ctx.qaTestPlanUrl)}" target="_blank" style="color:var(--info)">test plan</a>` : ''}</span>` : ''}</span>
-      <button class="btn sm" data-goal-metric="${i}" title="Add this goal's text to the Functional Testing Metrics list — manual, never automatic">+ Metric</button>
-    </div>`).join('');
+      <button class="btn sm" data-goal-metric="${i}" ${already ? 'disabled' : ''} title="Add this goal to the shared Metrics list. It is tracked right away and flagged &quot;needs review&quot; — Track Metric will not offer it until you confirm it as a console signal.">${already ? 'Added ✓' : '+ Metric'}</button>
+    </div>`;
+  }).join('');
 
   body.innerHTML = `
     <div><b><a href="${q(ctx.ticketUrl)}" target="_blank" style="color:var(--info)">${esc(ctx.ticketKey)}</a></b> — ${esc(ctx.summary || '')}</div>
     <div>Platform: <b>${esc(ctx.platform || '—')}</b> · Experiment ID: <b>${esc(ctx.experimentId || '—')}</b></div>
-    <div>${(ctx.variants || []).length} variant(s) · ${(ctx.previewLinks || []).length} preview link(s) · committed ${esc(new Date(ctx.extractedAt).toLocaleString())}</div>
-    ${goalsHtml ? `<label class="cap" style="margin-top:8px">Goals (reference only)</label>${goalsHtml}` : ''}`;
+    <div>${(ctx.variants || []).length} variant(s) · ${(ctx.previewLinks || []).length} preview link(s)${ctx.itwLink ? ` · <a href="${q(ctx.itwLink)}" target="_blank" style="color:var(--info)">ITW ↗</a>` : ''} · committed ${esc(new Date(ctx.extractedAt).toLocaleString())}</div>
+    ${goalsHtml ? `<label class="cap" style="margin-top:8px">Goals (tracked once added; not assertable until reviewed)</label>${goalsHtml}` : ''}`;
 
   body.querySelectorAll('[data-goal-metric]').forEach(btn => btn.addEventListener('click', () => {
     const g = (ctx.goals || [])[+btn.dataset.goalMetric];
     if (!g?.text) return;
-    metrics.push(g.text);
-    persistMetrics();
-    renderMetrics();
-    refreshTrackMetricSteps();
+    const id = mtGoalId(ctx.ticketKey, g.text);
+    if (metrics.some(m => m.id === id)) { btn.textContent = 'Added ✓'; btn.disabled = true; return; }
+    metrics.push({
+      id, label: g.text, pattern: g.text, mode: 'smart',
+      convertMetricId: g.convertMetricId || null,
+      enabled: true, source: 'goal', reviewed: false, createdAt: Date.now(),
+    });
+    mtSyncAfterListChange();
     btn.textContent = 'Added ✓';
     btn.disabled = true;
   }));
@@ -5296,25 +5415,18 @@ function ctxControlLink(ctx) {
   return links.find(l => controlIds.has(l.id)) || links.find(l => l.id === 'v0') || links[0] || null;
 }
 
-// {baseUrl, targets:[{label,url,override}]} from the derived preview-link
-// pattern. When derivation failed (no common base), each variant keeps its
-// full preview URL so nothing is lost. Shared by the A/B and CVA targets,
-// which hold the identical {label,url,override} shape.
+// {baseUrl, targets:[{label,url,override}]} — one target per preview link,
+// each carrying its own full URL verbatim. Shared by the A/B and CVA targets,
+// which hold the identical {label,url,override} shape. Previously derived a
+// common base URL + override query param by diffing the preview links
+// (previewLinkBaseUrl/previewLinkParam, now retired in favor of the
+// AI-detected single itwLink field) — baseUrl/override are kept in the
+// return shape for structural compatibility with composeVariantUrl(), but
+// are now always empty since every target already carries its full URL.
 function ctxVariantTargets(ctx) {
-  const base  = ctx.previewLinkBaseUrl || '';
-  const param = ctx.previewLinkParam || null;
   return {
-    baseUrl: base,
-    targets: ctx.previewLinks.map(l => {
-      let override = '';
-      if (base && param) {
-        try {
-          const v = new URL(l.url).searchParams.get(param);
-          if (v != null) override = `${param}=${v}`;
-        } catch (_) {}
-      }
-      return { label: l.id, url: base ? '' : l.url, override };
-    }),
+    baseUrl: '',
+    targets: ctx.previewLinks.map(l => ({ label: l.id, url: l.url, override: '' })),
   };
 }
 
@@ -5392,6 +5504,11 @@ function mxSyncFromState() {
 // pushed to a mode. refreshAllFillButtons() may only touch button/hint state;
 // only a user click reaches apply(). The storage.onChanged listener calls the
 // former and must never call the latter.
+//
+// Every target but 'tracker' replaces its slice wholesale. 'tracker' appends
+// to a list shared with hand-authored Track Metric assertions, so it merges
+// by deterministic id (mtGoalId) and never clobbers an entry the user wrote
+// or edited — see its own comments below for why.
 //
 // Entry contract:
 //   id        stable key — error reporting, undo keys, fillOneFromTicket()
@@ -5554,21 +5671,10 @@ const FILL_TARGETS = [
       const step = queueOpenUrlStep();
       const link = ctxControlLink(ctx);
       if (!step || !link) return;
-      const base  = ctx.previewLinkBaseUrl || '';
-      const param = ctx.previewLinkParam || null;
-      if (!Array.isArray(step.inputs.params)) step.inputs.params = [];
-
-      if (base && param) {
-        let val = null;
-        try { val = new URL(link.url).searchParams.get(param); } catch (_) {}
-        step.inputs.url = base;
-        const row = `${param}=${val ?? ''}`;
-        const i = step.inputs.params.findIndex(p => (p || '').split('=')[0].trim() === param);
-        if (i >= 0) step.inputs.params[i] = row; else step.inputs.params.push(row);
-      } else {
-        // No common base derived — the full preview URL carries its own params.
-        step.inputs.url = link.url;
-      }
+      // The full preview URL carries its own params — previewLinkBaseUrl/
+      // previewLinkParam (a derived common-base+override-param shortcut) are
+      // retired in favor of the AI-detected itwLink field.
+      step.inputs.url = link.url;
 
       const nameEl = document.getElementById('save-name');
       if (nameEl && !nameEl.value.trim()) nameEl.value = ctx.ticketKey;
@@ -5603,6 +5709,71 @@ const FILL_TARGETS = [
       refreshFunnelDom();
     },
   },
+  {
+    id: 'tracker',
+    label: 'Metric Tracker (shared Metrics list)',
+    btnSel: '#btn-mt-fill-ticket',
+    hintSel: '#mt-fill-hint',
+
+    // `metrics` is a module-level array that always exists (popup.js:12), so
+    // unlike every other target there is no "state object missing" case —
+    // the only readiness question is whether the ticket has usable goal text.
+    ready: ctx => (ctx.goals || []).some(g => (g.text || '').trim()),
+
+    describe: ctx => {
+      const gs = (ctx.goals || []).filter(g => (g.text || '').trim());
+      const withId = gs.filter(g => g.convertMetricId).length;
+      const tbd    = gs.filter(g => g.resolutionNeeded).length;
+      return `${gs.length} goal(s) → tracked, flagged "needs review"`
+        + (withId ? ` · ${withId} with a Convert metric id` : '')
+        + (tbd    ? ` · ${tbd} with an unresolved id`       : '')
+        + ' · not assertable by Track Metric until confirmed';
+    },
+
+    // The only ADDITIVE target in this registry (see the INVARIANT note
+    // above) — the metrics list is shared with hand-authored Functional
+    // Testing assertions, so its slice is only the goal-derived entries,
+    // never the whole list. Snapshotting all of `metrics` would let an undo
+    // delete an assertion the user typed after the fill.
+    snapshot: () => structuredClone(metrics.filter(m => m.source === 'goal')),
+
+    restore: snap => {
+      if (!Array.isArray(snap)) return;
+      metrics = metrics.filter(m => m.source !== 'goal').concat(snap);
+      mtSyncAfterListChange();
+    },
+
+    apply: ctx => {
+      // Additive and idempotent. Goal entries are keyed by a deterministic
+      // id (ticketKey + text), so re-applying the same ticket refreshes them
+      // in place instead of duplicating, and preserves any reviewed/enabled/
+      // mode edits the user already made.
+      //
+      // reviewed:false is not optional here — it is what keeps this fill
+      // honest against the rule at extractTestContext's Step 5 comment: the
+      // Metric Tracker counts these, and buildTrackMetricArgsHTML refuses to
+      // offer them to Track Metric until a human confirms each one is a real
+      // console signal.
+      for (const g of (ctx.goals || [])) {
+        const text = (g.text || '').trim();
+        if (!text) continue;
+        const id = mtGoalId(ctx.ticketKey, text);
+        const existing = metrics.find(m => m.id === id);
+        if (existing) {
+          existing.label           = text;
+          existing.pattern         = text;
+          existing.convertMetricId = g.convertMetricId || null;
+          continue; // user's reviewed / enabled / mode edits survive
+        }
+        metrics.push({
+          id, label: text, pattern: text, mode: 'smart',
+          convertMetricId: g.convertMetricId || null,
+          enabled: true, source: 'goal', reviewed: false, createdAt: Date.now(),
+        });
+      }
+      mtSyncAfterListChange();
+    },
+  },
 ];
 
 // One storage read, then every registered surface's own button/hint.
@@ -5619,9 +5790,16 @@ async function refreshAllFillButtons() {
     try {
       const ok = !!usable && !!t.ready(usable);
       document.querySelectorAll(t.btnSel).forEach(b => { b.disabled = !ok; });
+      // Distinguish "no active ticket" from "ticket active, nothing here to
+      // fill" — the same generic message for both reads as broken when a
+      // real, reviewed ticket is active but e.g. has no Goals section (the
+      // Tracker target's readiness condition), which is a common, legitimate
+      // ticket shape, not an error.
       const hint = ok
         ? `From ${usable.ticketKey} — ${t.describe(usable)}`
-        : 'No active ticket context — use the Initialize tab';
+        : usable
+          ? `${usable.ticketKey} is active, but nothing in it fills this`
+          : 'No active ticket context — use the Initialize tab';
       document.querySelectorAll(t.hintSel).forEach(h => { h.textContent = hint; });
     } catch (e) {
       console.error(`Selenite: fill target "${t.id}" failed to refresh —`, e);
@@ -5692,7 +5870,7 @@ function renderApplyAllPreview(ctx) {
     ${rows.map(r => `<div style="display:flex;gap:6px${r.ok ? '' : ';color:var(--fg3)'}">
       <span style="flex:0 0 45%">${r.ok ? '•' : '○'} ${esc(r.t.label)}</span>
       <span style="flex:1">${esc(r.detail)}</span></div>`).join('')}
-    <div style="color:var(--warn);margin-top:6px">Replaces whatever those fields hold now, including in modes you aren't looking at. Goals are never written to the Functional Testing metrics list.</div>
+    <div style="color:var(--warn);margin-top:6px">Replaces whatever those fields hold now, including in modes you aren't looking at. Goals are added to the shared Metrics list flagged "needs review": the Metric Tracker counts them, Track Metric won't assert on them until each is confirmed.</div>
     <div class="row" style="gap:6px;margin-top:8px">
       <button class="btn primary sm" id="btn-init-apply-confirm"${n ? '' : ' disabled'}>Write these ${n} change${n === 1 ? '' : 's'}</button>
       <button class="btn ghost sm" id="btn-init-apply-cancel">Cancel</button>
@@ -6625,4 +6803,369 @@ async function initMatrixAuditor() {
   document.getElementById('btn-mx-view-report').addEventListener('click', mxOpenReport);
   document.getElementById('btn-mx-export-csv').addEventListener('click', exportMatrixResultsCsv);
   document.getElementById('btn-mx-rerun').addEventListener('click', runMatrixAuditStart);
+}
+
+// ── Metric Tracker ───────────────────────────────────────────────────────────
+// Live per-metric fire counting. The list itself IS the Build tab's list
+// (storage.local.metricsList, the `metrics` global) — this tab is a second
+// editor over the same data, never a copy. Matching, counting, and the
+// on-page notice all run in the worker (see mtObserve in background.js);
+// this panel is a 600ms-poll reader plus a config editor, exactly like every
+// other feed here. Match sensitivity is a GLOBAL setting
+// (storage.local.metricMatchSensitivity) shared with the Track Metric queue
+// step — the Settings accordion's selector edits that same key, not a
+// per-window one.
+let mtSettings    = { enabled: false, noticeFreq: 'every', notice: true };
+let mtCounts      = {};
+let _mtCountsKey  = '';   // dirty-check for the 600ms counts poll
+let _mtLogLen     = -1;   // dirty-check for the recent-fires poll (mirrors syncBcLogs)
+let _mtFiresFloor = 0;    // view-only "Clear" on the fires feed — never writes metricsLog
+
+async function initMetricTracker() {
+  if (!document.getElementById('panel-tracker')) return;
+
+  const { mtSettings: saved } = await sessionNS.get('mtSettings');
+  if (saved) mtSettings = { enabled: false, noticeFreq: 'every', notice: true, ...saved };
+  mtApplySettingsToInputs();
+
+  const { metricMatchSensitivity = 'balanced' } = await chrome.storage.local.get('metricMatchSensitivity');
+  const sensSel = document.getElementById('mt-sensitivity');
+  if (sensSel) sensSel.value = metricMatchSensitivity;
+
+  await mtSync();        // hydrate counts + fires before first paint
+  mtRenderRows();         // structural — reads `metrics`, loaded by loadMetrics() earlier in this chain
+  await mtSyncStatus();
+
+  document.getElementById('mt-enabled').addEventListener('change', onMtSettingsChange);
+  document.getElementById('mt-notice-enabled').addEventListener('change', onMtSettingsChange);
+  document.getElementById('mt-notice-freq').addEventListener('change', onMtSettingsChange);
+  document.getElementById('mt-sensitivity').addEventListener('change', onMtSensitivityChange);
+  document.getElementById('btn-mt-add').addEventListener('click', mtAddRow);
+  document.getElementById('btn-mt-reset').addEventListener('click', mtResetCounts);
+  document.getElementById('btn-mt-remove-all').addEventListener('click', mtRemoveAll);
+  document.getElementById('btn-mt-clear-fires').addEventListener('click', mtClearFires);
+  document.getElementById('btn-mt-fix-capture').addEventListener('click', mtFixCapture);
+
+  // Delegated on #mt-list — pattern typing must NOT rebuild the list (focus
+  // loss), so it updates in place; enabled/mode/remove do rebuild. Same split
+  // the Build tab's onMetricInput/onMetricRemove use.
+  const list = document.getElementById('mt-list');
+  list.addEventListener('input',  onMtRowInput);
+  list.addEventListener('change', onMtRowChange);
+  list.addEventListener('click',  onMtRowClick);
+
+  // Another window changed the global sensitivity — keep this select honest.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.metricMatchSensitivity) return;
+    const sel = document.getElementById('mt-sensitivity');
+    if (sel) sel.value = changes.metricMatchSensitivity.newValue || 'balanced';
+  });
+}
+
+function mtApplySettingsToInputs() {
+  const en = document.getElementById('mt-enabled');
+  if (en) en.checked = !!mtSettings.enabled;
+  const no = document.getElementById('mt-notice-enabled');
+  if (no) no.checked = mtSettings.notice !== false;
+  const freq = document.getElementById('mt-notice-freq');
+  if (freq) freq.value = mtSettings.noticeFreq || 'every';
+}
+
+function persistMtSettings() {
+  sessionNS.set({ mtSettings });
+}
+
+function onMtSettingsChange() {
+  mtSettings.enabled    = document.getElementById('mt-enabled').checked;
+  mtSettings.notice     = document.getElementById('mt-notice-enabled').checked;
+  mtSettings.noticeFreq = document.getElementById('mt-notice-freq').value;
+  persistMtSettings();
+  mtSyncStatus();
+}
+
+async function onMtSensitivityChange(e) {
+  await chrome.storage.local.set({ metricMatchSensitivity: e.target.value });
+  mtRenderFires();   // re-annotate the feed under the new threshold immediately
+}
+
+// ── Rendering — a hard split so the 600ms poll never rebuilds focused inputs ─
+// mtRenderRows(): rebuilds #mt-list from `metrics` — init, add/remove, showTab
+// entry, and the shared-list fan-out (mtSyncAfterListChange).
+// mtRenderCounts(): writes textContent into existing [data-mt-count] spans
+// only — safe to call from the poll every 600ms.
+// mtRenderFires(): rebuilds #mt-fires only, and only when metricsLog changed.
+function mtRenderRows() {
+  const list = document.getElementById('mt-list');
+  if (!list) return;
+  const countEl = document.getElementById('mt-count');
+  if (countEl) countEl.textContent = `${metrics.length} metric${metrics.length === 1 ? '' : 's'}`;
+
+  if (!metrics.length) {
+    list.innerHTML = '<div id="mt-empty">No metrics yet — click + Add Metric to start tracking</div>';
+    return;
+  }
+
+  list.innerHTML = metrics.map((m) => {
+    const needsReview = m.source === 'goal' && m.reviewed === false;
+    const c = mtCounts[m.id];
+    const n = c ? c.n : 0;
+    return `
+    <div class="mt-item${m.enabled === false ? ' mt-off' : ''}" data-mt-item="${esc(m.id)}">
+      <div class="mt-row">
+        <input type="checkbox" data-mt-toggle="${esc(m.id)}" ${m.enabled !== false ? 'checked' : ''} title="Include in tracking">
+        <input type="text" data-mt-pattern="${esc(m.id)}" placeholder="Metric value, e.g. Tagging: hero_cta_click" value="${esc(m.pattern || '').replace(/"/g, '&quot;')}">
+        <span class="mt-count${n > 0 ? ' mt-hit' : ''}" data-mt-count="${esc(m.id)}" title="Fires this browser session">${n}</span>
+        <button class="btn-icon" data-mt-remove="${esc(m.id)}" title="Remove metric">✕</button>
+      </div>
+      <div class="mt-sub">
+        <select data-mt-mode="${esc(m.id)}" style="flex:0 0 82px;font-size:11px;padding:3px 4px">
+          <option value="contains"${m.mode === 'contains' ? ' selected' : ''}>Contains</option>
+          <option value="smart"${m.mode === 'smart' ? ' selected' : ''}>Smart</option>
+          <option value="exact"${m.mode === 'exact' ? ' selected' : ''}>Exact</option>
+          <option value="regex"${m.mode === 'regex' ? ' selected' : ''}>Regex</option>
+        </select>
+        ${needsReview ? '<span style="font-size:10px;color:var(--warn)">⚠ needs review — confirm below</span>' : ''}
+        <span data-mt-err="${esc(m.id)}" style="font-size:10px;color:var(--err)"></span>
+      </div>
+    </div>`;
+  }).join('');
+
+  metrics.forEach((m) => mtValidateRow(m.id));
+}
+
+function mtRenderCounts() {
+  for (const m of metrics) {
+    const el = document.querySelector(`[data-mt-count="${m.id}"]`);
+    if (!el) continue;
+    const c = mtCounts[m.id];
+    const n = c ? c.n : 0;
+    el.textContent = n;
+    el.classList.toggle('mt-hit', n > 0);
+  }
+}
+
+// A typo'd regex is otherwise an invisible silent no-match — surface it
+// inline right where it was typed.
+function mtValidateRow(id) {
+  const errEl = document.querySelector(`[data-mt-err="${id}"]`);
+  if (!errEl) return;
+  const m = metrics.find((x) => x.id === id);
+  if (!m || m.mode !== 'regex' || !(m.pattern || '').trim()) { errEl.textContent = ''; return; }
+  try { new RegExp(m.pattern); errEl.textContent = ''; }
+  catch (e) { errEl.textContent = 'Invalid regex: ' + e.message; }
+}
+
+// The recent-fires feed needs no new storage — metricsLog already holds
+// every tagged line. This is display-only re-matching (client-side, no
+// correctness stake — the worker's own mtObserve is the source of truth for
+// counts), capped to the 40 most recent so the panel stays light.
+async function mtRenderFires() {
+  const host = document.getElementById('mt-fires');
+  if (!host) return;
+  const { metricsLog = [] } = await sessionNS.get('metricsLog');
+  if (metricsLog.length === _mtLogLen) return;
+  _mtLogLen = metricsLog.length;
+
+  const sensitivity = document.getElementById('mt-sensitivity')?.value || 'balanced';
+  const enabledMetrics = metrics.filter((m) => m.enabled !== false && (m.pattern || '').trim());
+  const rows = metricsLog.filter((e) => (e.t || 0) > _mtFiresFloor).slice(-40).reverse();
+
+  if (!rows.length) {
+    host.innerHTML = '<div id="mt-empty">No tagged console lines seen yet.</div>';
+    return;
+  }
+
+  host.innerHTML = rows.map((e) => {
+    let bestLabel = null;
+    for (const m of enabledMetrics) {
+      if (mtMatch(m, e.text, { sensitivity }).hit) { bestLabel = m.label || m.pattern; break; }
+    }
+    const cls = bestLabel ? 'mt-fire mt-fire-hit' : 'mt-fire mt-fire-miss';
+    return `<div class="${cls}">
+      <span class="mt-fire-t">${esc(e.ts)}</span>
+      <span class="mt-fire-lbl">${bestLabel ? esc(bestLabel) : '—'}</span>
+      <span class="mt-fire-txt">${esc(e.text)}</span>
+    </div>`;
+  }).join('');
+}
+
+// View-only — deliberately does NOT touch metricsLog. Clearing that would
+// destroy track_metric's evidence mid-run (it filters e.t >= _runStartedAt)
+// and report "did not fire" for a metric that did. Same idea as logOffset.
+function mtClearFires() {
+  _mtFiresFloor = Date.now();
+  _mtLogLen = -1;   // force a re-render even though metricsLog's length didn't change
+  mtRenderFires();
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────
+async function mtSync() {
+  if (!document.getElementById('panel-tracker')) return;
+  const { mtCounts: counts = {} } = await sessionNS.get('mtCounts');
+  const key = JSON.stringify(counts);
+  if (key !== _mtCountsKey) {
+    _mtCountsKey = key;
+    mtCounts = counts;
+    mtRenderCounts();
+  }
+  await mtRenderFires();
+}
+
+// Tracking silently does nothing when console capture is off or detached —
+// surface that dependency and offer the fix, rather than letting "0 fires"
+// be mistaken for "nothing fired" when nothing was ever being watched.
+async function mtSyncStatus() {
+  if (!document.getElementById('panel-tracker')) return;
+  const statusEl = document.getElementById('mt-status');
+  if (!statusEl) return;
+  const dot    = document.getElementById('mt-tracking-dot');
+  const fixBtn = document.getElementById('btn-mt-fix-capture');
+
+  const { captureStatus, debuggerStatus, captureEnabled } =
+    await sessionNS.get(['captureStatus', 'debuggerStatus', 'captureEnabled']);
+
+  const setFix = (show, label, kind) => {
+    if (!fixBtn) return;
+    fixBtn.style.display = show ? '' : 'none';
+    if (show) { fixBtn.textContent = label; fixBtn.dataset.mtFix = kind; }
+  };
+
+  if (!mtSettings.enabled) {
+    statusEl.textContent = 'Tracking is off — flip the switch to start counting.';
+    statusEl.style.color = 'var(--fg3)';
+    if (dot) dot.style.display = 'none';
+    setFix(false);
+    return;
+  }
+  if (captureEnabled === false) {
+    statusEl.textContent = 'Console capture is paused — nothing can be tracked.';
+    statusEl.style.color = 'var(--warn)';
+    if (dot) dot.style.display = 'none';
+    setFix(true, 'Enable Capture', 'enable');
+    return;
+  }
+  if (captureStatus?.capturable === false) {
+    statusEl.textContent = "This tab can't be captured (chrome:// or extension page). Switch to a normal page.";
+    statusEl.style.color = 'var(--fg3)';
+    if (dot) dot.style.display = 'none';
+    setFix(false);
+    return;
+  }
+  if (debuggerStatus?.error) {
+    statusEl.textContent = `Capture disconnected — ${debuggerStatus.error}`;
+    statusEl.style.color = 'var(--err)';
+    if (dot) dot.style.display = 'none';
+    setFix(true, 'Reconnect', 'reconnect');
+    return;
+  }
+  if (debuggerStatus?.attached) {
+    const label = captureStatus?.title || captureStatus?.url || 'this tab';
+    statusEl.textContent = `● Tracking ${label}`;
+    statusEl.style.color = 'var(--brand)';
+    if (dot) dot.style.display = '';
+    setFix(false);
+    return;
+  }
+  statusEl.textContent = 'Waiting for a capturable tab…';
+  statusEl.style.color = 'var(--fg3)';
+  if (dot) dot.style.display = 'none';
+  setFix(false);
+}
+
+async function mtFixCapture() {
+  const btn = document.getElementById('btn-mt-fix-capture');
+  const action = btn?.dataset.mtFix === 'reconnect' ? 'reconnectCapture' : 'startCapture';
+  if (btn) btn.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ action, winId: WIN_ID });
+    // Two toggles for one piece of state is a bug waiting to happen — keep
+    // the Console tab's #capture-enabled checkbox honest too.
+    await restoreCaptureState();
+    await syncBcStatus();
+    await syncCaptureStatus();
+    await mtSyncStatus();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ── Row mutations ────────────────────────────────────────────────────────
+function mtAddRow() {
+  const id = mtNewId();
+  metrics.push({ id, label: '', pattern: '', mode: 'smart', convertMetricId: null, enabled: true, source: 'manual', reviewed: true, createdAt: Date.now() });
+  mtSyncAfterListChange();
+  document.querySelector(`#mt-list input[data-mt-pattern="${id}"]`)?.focus();
+}
+
+function onMtRowInput(e) {
+  const id = e.target?.dataset?.mtPattern;
+  if (id === undefined) return;
+  const m = metrics.find((x) => x.id === id);
+  if (!m) return;
+  m.pattern = e.target.value;
+  mtValidateRow(id);
+  mtSyncAfterListChange('mt');
+}
+
+function onMtRowChange(e) {
+  const toggleId = e.target?.dataset?.mtToggle;
+  if (toggleId !== undefined) {
+    const m = metrics.find((x) => x.id === toggleId);
+    if (m) { m.enabled = e.target.checked; mtSyncAfterListChange(); }
+    return;
+  }
+  const modeId = e.target?.dataset?.mtMode;
+  if (modeId !== undefined) {
+    const m = metrics.find((x) => x.id === modeId);
+    if (m) { m.mode = e.target.value; mtValidateRow(modeId); mtSyncAfterListChange(); }
+  }
+}
+
+function onMtRowClick(e) {
+  const btn = e.target.closest('[data-mt-remove]');
+  if (!btn) return;
+  const i = metrics.findIndex((x) => x.id === btn.dataset.mtRemove);
+  if (i < 0) return;
+  metrics.splice(i, 1);
+  mtSyncAfterListChange();
+}
+
+// ── Reset / Remove All ───────────────────────────────────────────────────
+// No confirm: session-scoped, non-destructive, regenerates immediately — a
+// confirm on a button pressed repeatedly during a QA pass is pure friction.
+async function mtResetCounts() {
+  const btn = document.getElementById('btn-mt-reset');
+  if (btn) btn.disabled = true;
+  try {
+    await chrome.runtime.sendMessage({ action: 'mtReset', winId: WIN_ID });
+    _mtCountsKey = '';
+    mtCounts = {};
+    mtRenderCounts();
+    if (btn) {
+      btn.textContent = 'Counts reset';
+      setTimeout(() => { btn.textContent = 'Reset Counts'; }, 1200);
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Confirm naming the blast radius — this empties the Functional Testing
+// tab's Metrics section too, and every Track Metric step loses its
+// selection. Matches the clearSteps confirm precedent.
+function mtRemoveAll() {
+  if (!metrics.length) return;
+  if (!confirm(
+    `Remove all ${metrics.length} metric${metrics.length === 1 ? '' : 's'}?\n\n` +
+    `This is the same list the Functional Testing tab's Metrics section uses — ` +
+    `it will be emptied there too, and any "Track Metric" queue steps will lose ` +
+    `their selection.\n\nCounts are cleared as well.`
+  )) return;
+  metrics = [];
+  mtSyncAfterListChange();
+  chrome.runtime.sendMessage({ action: 'mtReset', winId: WIN_ID }).then(() => {
+    _mtCountsKey = '';
+    mtCounts = {};
+    mtRenderCounts();
+  });
 }

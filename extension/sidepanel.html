@@ -267,6 +267,30 @@
   .metric-row{display:flex;align-items:center;gap:5px}
   .metric-row input{flex:1;font-family:'Cascadia Code','Menlo',monospace;font-size:11px}
 
+  /* Metric Tracker */
+  #mt-list{display:flex;flex-direction:column;gap:6px}
+  #mt-empty{color:var(--fg3);text-align:center;padding:12px 0;font-size:12px}
+  .mt-row{display:flex;align-items:center;gap:5px}
+  .mt-row input[type=text]{flex:1;font-family:'Cascadia Code','Menlo',monospace;font-size:11px}
+  .mt-row input[type=checkbox]{width:13px;height:13px;cursor:pointer;
+    accent-color:var(--brand);flex-shrink:0}
+  .mt-item.mt-off{opacity:.5}
+  .mt-count{flex-shrink:0;min-width:28px;text-align:center;font-size:10px;font-weight:700;
+    padding:2px 5px;border-radius:3px;background:var(--overlay);color:var(--fg3);
+    font-variant-numeric:tabular-nums}
+  .mt-count.mt-hit{background:rgba(0,120,212,.2);color:var(--brand)}
+  .mt-sub{display:flex;align-items:center;gap:5px;padding:2px 0 0 18px}
+  #mt-fires{max-height:170px;overflow-y:auto;background:var(--card);
+    border:1px solid var(--stroke);border-radius:4px}
+  .mt-fire{display:flex;align-items:flex-start;gap:6px;padding:4px 8px;
+    border-bottom:1px solid var(--stroke);line-height:1.5;font-size:11px}
+  .mt-fire:last-child{border-bottom:none}
+  .mt-fire-t{color:var(--fg3);font-size:10px;flex-shrink:0;font-variant-numeric:tabular-nums}
+  .mt-fire-lbl{flex-shrink:0;font-size:10px;font-weight:600;color:var(--brand)}
+  .mt-fire-miss .mt-fire-lbl{color:var(--fg3)}
+  .mt-fire-txt{flex:1;min-width:0;word-break:break-word;color:var(--fg2);
+    font-family:'Cascadia Code','Menlo',monospace}
+  .mt-fire-hit .mt-fire-txt{color:var(--fg1)}
 
   /* A/B Variant Comparison */
   #ab-target-list{display:flex;flex-direction:column;gap:5px}
@@ -337,6 +361,7 @@
   <div class="tab" data-tab="testagent">Test Agent</div>
   <div class="tab active" data-tab="build">Functional Testing</div>
   <div class="tab" data-tab="matrixauditor">Matrix Auditor</div>
+  <div class="tab" data-tab="tracker" title="Metric Tracker">Tracker</div>
   <div class="tab" data-tab="console">
     Console
     <span id="run-indicator" style="display:none" class="run-dot"></span>
@@ -629,6 +654,110 @@
     </div>
 
   </div><!-- /panel-matrixauditor -->
+
+  <!-- Metric Tracker panel -->
+  <div class="panel" id="panel-tracker">
+
+    <!-- Status -->
+    <div class="card">
+      <div class="row-spread" style="margin-bottom:8px">
+        <div class="row">
+          <label class="toggle-wrap" title="Start/stop live metric tracking for this window">
+            <input type="checkbox" id="mt-enabled">
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+          <span style="font-size:12px;font-weight:600">Tracking</span>
+          <span id="mt-tracking-dot" class="run-dot" style="display:none"></span>
+        </div>
+        <button class="btn sm" id="btn-mt-fix-capture" style="display:none">Enable Capture</button>
+      </div>
+      <div id="mt-status" style="font-size:11px;color:var(--fg3);line-height:1.5">
+        Tracking is off — flip the switch to start counting.
+      </div>
+    </div>
+
+    <!-- Accordion 1: Metrics -->
+    <div class="accordion open" id="acc-mt-metrics">
+      <div class="acc-hdr" data-acc="acc-mt-metrics">
+        <span>Metrics <span id="mt-count" style="font-weight:400;color:var(--fg2);font-size:11px">0 metrics</span></span>
+        <span class="acc-chevron">›</span>
+      </div>
+      <div class="acc-body">
+        <div style="font-size:10px;color:var(--fg3)">
+          The same list as the Functional Testing tab's Metrics section — edits here appear there.
+        </div>
+        <div class="row" style="gap:6px;margin:2px 0">
+          <button class="btn sm" id="btn-mt-fill-ticket" type="button" disabled
+            title="Seed the metric list from the active ticket context (Initialize tab)">Fill from ticket</button>
+          <span id="mt-fill-hint" style="font-size:10px;color:var(--fg3)">No active ticket context — use the Initialize tab</span>
+        </div>
+        <div id="mt-list">
+          <div id="mt-empty">No metrics yet — click + Add Metric to start tracking</div>
+        </div>
+        <button class="btn sm" id="btn-mt-add" style="align-self:flex-start">+ Add Metric</button>
+      </div>
+    </div>
+
+    <!-- Accordion 2: Settings -->
+    <div class="accordion" id="acc-mt-settings">
+      <div class="acc-hdr" data-acc="acc-mt-settings">
+        <span>Settings</span>
+        <span class="acc-chevron">›</span>
+      </div>
+      <div class="acc-body">
+        <div class="row" style="gap:8px">
+          <label class="toggle-wrap" title="Draw a sticky notice on the page when a tracked metric fires">
+            <input type="checkbox" id="mt-notice-enabled" checked>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+          <span style="font-size:12px;color:var(--fg2)">Show on-page notices</span>
+        </div>
+        <div style="font-size:10px;color:var(--fg3);margin-top:-4px">
+          Notices stay until dismissed. They clear on page navigation — counts don't.
+        </div>
+        <div>
+          <label class="cap">Notice Frequency</label>
+          <select id="mt-notice-freq">
+            <option value="every">Every fire</option>
+            <option value="first">First fire per page load</option>
+            <option value="throttle">At most one every 2s</option>
+          </select>
+        </div>
+        <div>
+          <label class="cap">Match Sensitivity</label>
+          <select id="mt-sensitivity">
+            <option value="strict">Strict</option>
+            <option value="balanced">Balanced</option>
+            <option value="loose">Loose</option>
+          </select>
+          <div style="font-size:10px;color:var(--fg3);margin-top:4px">
+            Shared with Track Metric — affects both live tracking and queue assertions.
+          </div>
+        </div>
+        <div class="row-spread">
+          <button class="btn sm" id="btn-mt-reset">Reset Counts</button>
+          <button class="btn danger sm" id="btn-mt-remove-all">Remove All</button>
+        </div>
+        <div id="mt-danger-hint" style="font-size:10px;color:var(--warn);line-height:1.5">
+          <b>Remove All</b> empties the shared metric list — the Functional Testing tab's
+          Metrics section and every <b>Track Metric</b> queue step read the same list.
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent fires -->
+    <div class="card" id="mt-fires-card">
+      <div class="card-title">Recent Fires</div>
+      <div class="row-spread" style="margin-bottom:6px">
+        <span style="font-size:10px;color:var(--fg3);flex:1;min-width:0">
+          Every [PJS]/[cro] line seen — matched in blue, unmatched dimmed.
+        </span>
+        <button class="btn ghost sm" id="btn-mt-clear-fires">Clear</button>
+      </div>
+      <div id="mt-fires"></div>
+    </div>
+
+  </div><!-- /panel-tracker -->
 
   <!-- Console -->
   <div class="panel" id="panel-console">
@@ -995,6 +1124,7 @@
     <div class="card">
       <div class="card-title">Extract from Open Ticket</div>
       <div style="font-size:10px;color:var(--fg3);margin-bottom:6px">No token needed — open the Jira ticket in this window's active tab while logged in, then Extract. Custom fields resolve automatically from the ticket itself.</div>
+      <div style="font-size:10px;color:var(--fg3);margin-bottom:6px">Extract also asks Claude to fill in Platform, Preview Links, ITW Link, and Goals from the ticket's text (can take up to ~30s) — requires an API key configured in the Test Agent tab. Falls back to deterministic parsing only, with a warning, if no key is set or the call fails.</div>
       <div class="script-row">
         <input type="text" id="init-ticket-key" placeholder="Detected from the active tab — or enter a key, e.g. ABC-123">
         <button class="btn primary sm" id="btn-init-fetch">Extract</button>
@@ -1038,6 +1168,7 @@
 
 </div>
 
+<script src="metric-match.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>
