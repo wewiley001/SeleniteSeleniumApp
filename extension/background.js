@@ -1075,7 +1075,7 @@ let _running = false;
 let _stopRequested = false;
 let _runStartedAt = 0;  // track_metric only counts fires recorded after this
 
-async function runQueue({ queue, mode, targetTabId, universalDelay, winId }) {
+async function runQueue({ queue, mode, targetTabId, universalDelay, winId, trackMetricsForRun }) {
   _running = true;
   _stopRequested = false;
   // This run — and the capture it attaches to its test tab — belong to the
@@ -1099,6 +1099,19 @@ async function runQueue({ queue, mode, targetTabId, universalDelay, winId }) {
   _runStartedAt = Date.now();
   await ns(_runWin).set({ logs: [] });
   await followTab(_runWin, tabId, { force: true });
+
+  // "Metrics Tracking" (Function Queue checkbox): force the Tracker's on-page
+  // notice on for this window's duration, without touching the user's
+  // persisted Tracker-tab toggle (chrome.storage.session `mtSettings`) — that
+  // avoids a race if they flip the real toggle mid-run. Restored by deleting
+  // the in-memory override in the finally block below, which just forces the
+  // next mtGetSettings() read to come from real storage again.
+  let _mtOverrideWin = null;
+  if (trackMetricsForRun && _runWin != null) {
+    const cfg = await mtGetSettings(_runWin);
+    _mtSettings.set(_runWin, { ...cfg, enabled: true });
+    _mtOverrideWin = _runWin;
+  }
 
   await addLog(null, 'INFO', `Started on tab ${tabId}`);
 
@@ -1144,6 +1157,7 @@ async function runQueue({ queue, mode, targetTabId, universalDelay, winId }) {
     _running = false;
     _stopRequested = false;
     await ns(_runWin).set({ running: false });
+    if (_mtOverrideWin != null) _mtSettings.delete(_mtOverrideWin);
     // The run is over — hand the window back to passive follow-mode, resolved
     // against whatever tab the user is actually focused on right now (not
     // assumed to be the run's own tab; they may have switched away mid-run).
@@ -1898,7 +1912,7 @@ async function runCrossVariantAudit({ targets = [], settleSeconds, keepTabs, che
 // ── Matrix Auditor (Matrix Auditor tab) ─────────────────────────────────────
 // Batch element inspection across many URLs, one URL per call so the popup's
 // manual "Next URL" button maps directly onto one bounded message round trip
-// — no progress polling needed, unlike the unattended CVA/VR/Perf loops
+// — no progress polling needed, unlike the unattended CVA/Perf loops
 // above. Each call audits ONE url for a caller-resolved list of
 // {id, selector, checkSettings} entries — the popup already merged
 // global/per-selector settings before sending, so this stays a dumb executor,
@@ -1964,17 +1978,8 @@ async function runMatrixAuditStep({ url, entries = [], waitTime }) {
   return out;
 }
 
-// ── Visual Regression capture (Test Modes tab) ──────────────────────────────
-// Opens each page sequentially and takes a full-page screenshot over CDP
-// (Page.captureScreenshot + captureBeyondViewport — no scroll-and-stitch).
-// Ignore-region mask boxes are resolved in the live page at capture time,
-// because selectors can't be re-resolved against a static image later.
-// Diffing happens in popup.js, which has canvas access.
-const VR_MAX_CAPTURE_HEIGHT = 8000;   // CSS px — CDP hard-fails past 16384 device px
-
 // Agentic Testing: a plain viewport screenshot (no full-page stitching) for
-// vision commentary — short-lived attach/capture/detach, same lifecycle as
-// captureFullPage below, just without its scroll-height/ignore-region work.
+// vision commentary — short-lived attach/capture/detach.
 async function captureViewportScreenshot(tabId) {
   const target = { tabId };
   try {
@@ -2002,77 +2007,6 @@ async function captureClipped(target, width, height) {
     captureBeyondViewport: false,
   });
   return 'data:image/png;base64,' + shot.data;
-}
-
-async function captureFullPage(tabId, ignoreSelectors) {
-  const info = await exec(tabId, (sels) => {
-    const doc = document.documentElement;
-    const boxes = [];
-    for (const sel of sels) {
-      try {
-        [...document.querySelectorAll(sel)].slice(0, 20).forEach(el => {
-          const r = el.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0) return;
-          boxes.push({ x: r.left + window.scrollX, y: r.top + window.scrollY, w: r.width, h: r.height, selector: sel });
-        });
-      } catch (_) {}
-    }
-    return {
-      pageW: Math.max(doc.scrollWidth, doc.clientWidth),
-      pageH: Math.max(doc.scrollHeight, doc.clientHeight),
-      viewportW: window.innerWidth, viewportH: window.innerHeight,
-      dpr: window.devicePixelRatio || 1, boxes,
-    };
-  }, [ignoreSelectors]);
-
-  const target = { tabId };
-  try {
-    await chrome.debugger.attach(target, CDP_VERSION);
-  } catch (e) {
-    throw new Error(`Could not attach for capture (is DevTools open?): ${e.message}`);
-  }
-  try {
-    const captureH = Math.min(info.pageH, VR_MAX_CAPTURE_HEIGHT);
-    const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-      format: 'png',
-      clip: { x: 0, y: 0, width: info.pageW, height: captureH, scale: 1 },
-      captureBeyondViewport: true,
-    });
-    return { ...info, capturedH: captureH, truncated: info.pageH > VR_MAX_CAPTURE_HEIGHT, dataUrl: 'data:image/png;base64,' + shot.data };
-  } finally {
-    try { await chrome.debugger.detach(target); } catch (_) {}
-  }
-}
-
-async function runVisualCapture({ pages = [], settleSeconds, keepTabs, ignoreSelectors = [] }) {
-  _tmStopRequested = false;
-  const settleMs = Math.max(0, (parseFloat(settleSeconds) || 0) * 1000);
-  const sels = ignoreSelectors.map(s => String(s).trim()).filter(Boolean);
-  const results = [];
-  try {
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-      if (_tmStopRequested) { results.push({ url: p.url, skipped: true }); continue; }
-      await setTmProgress('vrProgress', { running: true, index: i, total: pages.length, label: p.url });
-      const out = { url: p.url, ts: Date.now(), error: null };
-      let tabId = null;
-      try {
-        tabId = await openSettledTab(p.url, settleMs);
-        Object.assign(out, await captureFullPage(tabId, sels));
-      } catch (e) {
-        out.error = e.message;
-      } finally {
-        if (tabId) {
-          if (keepTabs) out.tabId = tabId;
-          else { try { await chrome.tabs.remove(tabId); } catch (_) {} }
-        }
-      }
-      results.push(out);
-    }
-  } finally {
-    await setTmProgress('vrProgress', { running: false });
-  }
-  return results;
 }
 
 // ── Performance/Load measurement (Test Modes tab) ───────────────────────────
@@ -3041,21 +2975,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, results });
       } catch (e) {
         try { await setTmProgress('cvaProgress', { running: false }); } catch (_) {}
-        sendResponse({ ok: false, error: e.message });
-      } finally {
-        await endTmRun();
-      }
-    })();
-    return true;
-
-  } else if (msg.action === 'runVisualCapture') {
-    (async () => {
-      await beginTmRun(msg.payload);
-      try {
-        const results = await runVisualCapture(msg.payload || {});
-        sendResponse({ ok: true, results });
-      } catch (e) {
-        try { await setTmProgress('vrProgress', { running: false }); } catch (_) {}
         sendResponse({ ok: false, error: e.message });
       } finally {
         await endTmRun();

@@ -135,6 +135,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(mtSyncStatus, 800);    // Metric Tracker capture-health line + tracking dot
 
   await loadUniversalDelay();
+  await loadQueueMetricsTracking();
   await loadBcTagFilter();
   await restoreCaptureState();
   initAccordions();
@@ -152,9 +153,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await initAbCompare();
 
   await initTestModePages();
-  // Visual Regression / Cross-Variant Accessibility / Performance (each is a
-  // no-op if its host markup is absent).
-  await initVrMode();
+  // Cross-Variant Accessibility / Performance (each is a no-op if its host
+  // markup is absent).
   await initCvaMode();
   await initPerfMode();
 
@@ -216,13 +216,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('btn-ta-run').addEventListener('click', runTestAgent);
   document.getElementById('btn-ta-stop').addEventListener('click', stopTestAgent);
 
-  // Metrics section
-  document.getElementById('btn-add-metric')?.addEventListener('click', () => addMetricRow());
-  const metricList = document.getElementById('metric-list');
-  metricList?.addEventListener('input', onMetricInput);
-  metricList?.addEventListener('change', onMetricModeChange);
-  metricList?.addEventListener('click', onMetricRemove);
-
   // Queue buttons
   document.getElementById('btn-add-step').addEventListener('click', () => addStep());
   document.getElementById('btn-clear-steps')?.addEventListener('click', clearSteps);
@@ -241,6 +234,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Universal delay toggle + input
   document.getElementById('udel-enabled').addEventListener('change', saveUniversalDelay);
   document.getElementById('udel-seconds').addEventListener('input', saveUniversalDelay);
+
+  // Metrics Tracking toggle (Function Queue)
+  document.getElementById('qmt-enabled').addEventListener('change', saveQueueMetricsTracking);
 
   // Console filter input
   document.getElementById('filter-input').addEventListener('input', renderLog);
@@ -294,13 +290,8 @@ function showTab(name) {
     _taActiveBody = null;
   }
 
-  // Visual Regression's baseline list reflects the Pages list above it, which
-  // may have been edited since the last visit — refresh on entry. The
-  // Metrics section can likewise have been edited from the Tracker tab.
-  if (name === 'build') { renderVrBaselines(); renderMetrics(); }
-
-  // The Tracker's rows mirror the Build tab's metric list, which may have
-  // been edited there since the last visit — re-render on entry.
+  // The Tracker's rows may have been edited from another window since the
+  // last visit — re-render on entry.
   if (name === 'tracker') { mtRenderRows(); mtRenderCounts(); mtSyncStatus(); }
 }
 
@@ -885,15 +876,14 @@ async function clearBcLog() {
   document.getElementById('bc-log-out').innerHTML = '';
 }
 
-// ── Metrics (Build tab, shared with the Metric Tracker tab) ─────────────────
+// ── Metrics (Metric Tracker tab, read by Track Metric queue steps) ──────────
 // User-entered metric values — the strings that fire in the browser output,
 // typically prefixed [PJS] or [cro] (the same values the Console tab's CRO
 // toggle surfaces). Stored in storage.local as `metricsList`. This array is
-// consumed by three surfaces: this Build-tab list, the Metric Tracker tab
-// (live fire counting), and Track Metric queue steps (post-hoc assertion) —
-// so every entry is now an object, not a bare string. See
-// normalizeMetricsList in metric-match.js for the shape and the migration
-// from the old string[] shape.
+// consumed by two surfaces: the Metric Tracker tab (editing + live fire
+// counting) and Track Metric queue steps (post-hoc assertion) — so every
+// entry is now an object, not a bare string. See normalizeMetricsList in
+// metric-match.js for the shape and the migration from the old string[] shape.
 async function loadMetrics() {
   const { metricsList = [] } = await chrome.storage.local.get('metricsList');
   const normalized = normalizeMetricsList(metricsList);
@@ -901,7 +891,6 @@ async function loadMetrics() {
   // One-time upgrade only — writing back unconditionally would have every
   // open panel ping-pong the write through storage.onChanged forever.
   if (JSON.stringify(metricsList) !== JSON.stringify(normalized)) persistMetrics();
-  renderMetrics();
   mtRenderRows();
   // The queue is restored before this runs — give any restored Track Metric
   // steps their dropdown options now that the list is in memory.
@@ -916,99 +905,23 @@ function persistMetrics() {
   chrome.storage.local.set({ metricsList: metrics });
 }
 
-// Two editors share `metrics` — this Build-tab list and the Metric Tracker
-// tab's list. Every mutation must fan out to both renderers plus the queue's
-// Track Metric dropdowns, or one surface goes stale until reload. `skip`
-// names the surface whose DOM was just interacted with directly (typing
-// mid-keystroke), so its own rebuild is skipped to avoid stealing focus —
-// the other surface still gets a full re-render.
+// Every mutation to `metrics` must fan out to the Tracker tab's renderer plus
+// the queue's Track Metric dropdowns, or one surface goes stale until reload.
+// `skip` is 'mt' when the Tracker's own DOM was just interacted with directly
+// (typing mid-keystroke), so its rebuild is skipped to avoid stealing focus.
 function mtSyncAfterListChange(skip) {
   persistMetrics();
-  if (skip !== 'build') renderMetrics();
   refreshTrackMetricSteps();
   if (skip !== 'mt') mtRenderRows();
 }
 
-function renderMetrics() {
-  const list = document.getElementById('metric-list');
-  if (!list) return;
-  const countEl = document.getElementById('metric-count');
-  if (countEl) countEl.textContent = `${metrics.length} metric${metrics.length === 1 ? '' : 's'}`;
-
-  if (!metrics.length) {
-    list.innerHTML = '<div id="metrics-empty">No metrics yet — click + Add Metric to track a value</div>';
-    return;
-  }
-  list.innerHTML = metrics.map((m) => {
-    const needsReview = m.source === 'goal' && m.reviewed === false;
-    return `
-    <div class="metric-row">
-      <input type="text" data-metric-id="${esc(m.id)}" placeholder="Metric value, e.g. Tagging: hero_cta_click" value="${esc(m.pattern || '').replace(/"/g, '&quot;')}">
-      <select data-metric-mode="${esc(m.id)}" style="flex:0 0 82px;font-size:11px;padding:3px 4px">
-        <option value="contains"${m.mode === 'contains' ? ' selected' : ''}>Contains</option>
-        <option value="smart"${m.mode === 'smart' ? ' selected' : ''}>Smart</option>
-        <option value="exact"${m.mode === 'exact' ? ' selected' : ''}>Exact</option>
-        <option value="regex"${m.mode === 'regex' ? ' selected' : ''}>Regex</option>
-      </select>
-      ${needsReview ? `<span class="btn-icon" data-metric-confirm="${esc(m.id)}" title="From a ticket Goal — needs review before Track Metric can assert on it. Click to confirm.">⚠</span>` : ''}
-      <button class="btn-icon" data-metric-remove="${esc(m.id)}" title="Remove metric">✕</button>
-    </div>`;
-  }).join('');
-}
-
-function addMetricRow() {
-  const id = mtNewId();
-  metrics.push({ id, label: '', pattern: '', mode: 'smart', convertMetricId: null, enabled: true, source: 'manual', reviewed: true, createdAt: Date.now() });
-  mtSyncAfterListChange();
-  document.querySelector(`#metric-list input[data-metric-id="${id}"]`)?.focus();
-}
-
-// Delegated on #metric-list: typing updates in place (no re-render, so focus
-// is preserved); the ✕ button removes the row, the mode select and the
-// "needs review" confirm badge are handled by their own delegated listeners
-// below. Track Metric steps in the queue mirror this list, so their
-// dropdowns refresh on every change.
-function onMetricInput(e) {
-  const id = e.target?.dataset?.metricId;
-  if (id === undefined) return;
-  const m = metrics.find((x) => x.id === id);
-  if (!m) return;
-  m.pattern = e.target.value;
-  mtSyncAfterListChange('build');
-}
-
-function onMetricModeChange(e) {
-  const id = e.target?.dataset?.metricMode;
-  if (id === undefined) return;
-  const m = metrics.find((x) => x.id === id);
-  if (!m) return;
-  m.mode = e.target.value;
-  mtSyncAfterListChange();
-}
-
-function onMetricRemove(e) {
-  const confirmBtn = e.target.closest('[data-metric-confirm]');
-  if (confirmBtn) {
-    const m = metrics.find((x) => x.id === confirmBtn.dataset.metricConfirm);
-    if (m) { m.reviewed = true; mtSyncAfterListChange(); }
-    return;
-  }
-  const btn = e.target.closest('[data-metric-remove]');
-  if (!btn) return;
-  const i = metrics.findIndex((x) => x.id === btn.dataset.metricRemove);
-  if (i < 0) return;
-  metrics.splice(i, 1);
-  mtSyncAfterListChange();
-}
-
-// Edited (or migrated) in another window — refresh both renderers and the
+// Edited (or migrated) in another window — refresh the Tracker's rows and the
 // queue dropdowns, but never write back from here. Mirrors the fill-target
 // registry's invariant: a storage event may only update what's shown, never
 // trigger a write of its own.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes.metricsList) return;
   metrics = normalizeMetricsList(changes.metricsList.newValue || []);
-  renderMetrics();
   mtRenderRows();
   refreshTrackMetricSteps();
 });
@@ -1162,6 +1075,18 @@ async function saveUniversalDelay() {
   });
 }
 
+async function loadQueueMetricsTracking() {
+  const { queueMetricsTracking = false } = await chrome.storage.local.get('queueMetricsTracking');
+  const chk = document.getElementById('qmt-enabled');
+  if (chk) chk.checked = queueMetricsTracking;
+}
+
+async function saveQueueMetricsTracking() {
+  await chrome.storage.local.set({
+    queueMetricsTracking: document.getElementById('qmt-enabled').checked
+  });
+}
+
 // ── Target info (execution mode + tab target) ───────────────────────────────
 // The target URL and its parameters now live on the mandatory leading
 // "Open URL" queue step (see OPEN_URL_FUNC below) rather than here.
@@ -1215,10 +1140,12 @@ async function runQueue() {
 
   const { universalDelay = { enabled: false, seconds: '1' } } =
     await chrome.storage.local.get('universalDelay');
+  const { queueMetricsTracking = false } =
+    await chrome.storage.local.get('queueMetricsTracking');
 
   await chrome.runtime.sendMessage({
     action: 'run',
-    payload: { queue, mode, targetTabId, universalDelay, winId: WIN_ID }
+    payload: { queue, mode, targetTabId, universalDelay, winId: WIN_ID, trackMetricsForRun: queueMetricsTracking }
   });
 
   showTab('console');
@@ -1552,7 +1479,7 @@ function buildOpenUrlArgsHTML(step) {
     <button class="btn ghost sm add-open-url-param" type="button" style="align-self:flex-start;margin:4px 0 0;padding:3px 8px;font-size:12px">+ Add parameter</button>`;
 }
 
-// Dropdown of the user-defined metric values from the Metrics section. A value
+// Dropdown of the user-defined metric values from the Tracker tab. A value
 // saved on the step but since removed from the list is kept selectable so the
 // step still shows (and runs with) what it was configured to track.
 function buildTrackMetricArgsHTML(step) {
@@ -1580,7 +1507,7 @@ function buildTrackMetricArgsHTML(step) {
   const orphan = step.inputs.metricId && !usable.some(m => m.id === step.inputs.metricId);
 
   if (!usable.length && !orphan && !raw) {
-    return '<div class="no-args">No metrics defined — add one in the Metrics section first</div>'
+    return '<div class="no-args">No metrics defined — add one in the Tracker tab first</div>'
       + (pendingGoals ? `<div class="no-args">${pendingGoals} goal-derived metric(s) are awaiting review.</div>` : '');
   }
   if (!step.inputs.metricId && usable.length) {
@@ -1603,7 +1530,7 @@ function buildTrackMetricArgsHTML(step) {
       <span class="arg-lbl">Metric</span>
       <select data-arg="metricId" class="method-select">${opts}</select>
     </div>`
-    + (pendingGoals ? `<div class="no-args">${pendingGoals} goal-derived metric(s) hidden until reviewed — confirm them in the Metrics list.</div>` : '');
+    + (pendingGoals ? `<div class="no-args">${pendingGoals} goal-derived metric(s) hidden until reviewed — confirm them in the Tracker tab.</div>` : '');
 }
 
 // Rebuild every Track Metric step's dropdown so it reflects the current
@@ -3119,7 +3046,6 @@ function idb() {
     const req = indexedDB.open(IDB_NAME, 1);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains('vrImages')) db.createObjectStore('vrImages');
       if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
     };
     req.onsuccess = () => { _idb = req.result; resolve(_idb); };
@@ -3172,415 +3098,6 @@ async function openImageInTab(dataUrl) {
     await chrome.storage.session.set({ taImages });
     chrome.tabs.create({ url: chrome.runtime.getURL('image.html') + '?k=' + id });
   } catch (_) {}
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Functional Testing tab: Visual Regression (#acc-vr)
-// ═════════════════════════════════════════════════════════════════════════════
-// Capture-and-diff regression testing for a page over time. Background owns the
-// tab lifecycle and CDP full-page capture; this side owns config, IndexedDB
-// image storage, the canvas pixel diff, and rendering. Never touches the
-// Functional Testing tab's function queue.
-
-let vrState = null;       // { settleSec, threshold, keepTabs, ignoreSelectors: [] }
-let _vrLastRun = null;    // last comparison, for export (images stay in IndexedDB)
-let _vrProgressPoller = null;
-
-function vrDefaultState() {
-  return { settleSec: '3', threshold: '0.1', keepTabs: false, ignoreSelectors: [] };
-}
-
-async function initVrMode() {
-  if (!document.getElementById('btn-vr-run')) return;
-  const { vrConfig } = await chrome.storage.local.get('vrConfig');
-  vrState = { ...vrDefaultState(), ...(vrConfig || {}) };
-  if (!Array.isArray(vrState.ignoreSelectors)) vrState.ignoreSelectors = [];
-
-  document.getElementById('vr-settle').value      = vrState.settleSec;
-  document.getElementById('vr-threshold').value   = vrState.threshold;
-  document.getElementById('vr-keep-tabs').checked = !!vrState.keepTabs;
-
-  document.getElementById('vr-settle').addEventListener('input',      e => { vrState.settleSec = e.target.value;  persistVrState(); });
-  document.getElementById('vr-threshold').addEventListener('input',   e => { vrState.threshold = e.target.value;  persistVrState(); });
-  document.getElementById('vr-keep-tabs').addEventListener('change',  e => { vrState.keepTabs = e.target.checked; persistVrState(); });
-
-  document.getElementById('btn-vr-add-ignore').addEventListener('click', () => {
-    vrState.ignoreSelectors.push('');
-    renderVrIgnores();
-    persistVrState();
-    const inputs = document.querySelectorAll('#vr-ignore-list [data-vr-ignore-input]');
-    inputs[inputs.length - 1]?.focus();
-  });
-  document.getElementById('btn-vr-baseline').addEventListener('click', () => runVrCapture('baseline'));
-  document.getElementById('btn-vr-run').addEventListener('click', () => runVrCapture('compare'));
-  document.getElementById('btn-vr-stop').addEventListener('click', () =>
-    chrome.runtime.sendMessage({ action: 'stop' }));
-
-  renderVrIgnores();
-  await renderVrBaselines();
-}
-
-function persistVrState() {
-  chrome.storage.local.set({ vrConfig: vrState });
-}
-
-function renderVrIgnores() {
-  const list = document.getElementById('vr-ignore-list');
-  if (!list) return;
-  const q = s => esc(s || '').replace(/"/g, '&quot;');
-  if (!vrState.ignoreSelectors.length) {
-    list.innerHTML = '<div style="font-size:11px;color:var(--fg3)">None — use for carousels, timestamps, ads, and other legitimately dynamic content.</div>';
-    return;
-  }
-  list.innerHTML = vrState.ignoreSelectors.map((s, i) => `
-    <div class="ab-sel-row" data-vr-ignore="${i}">
-      <input type="text" data-vr-ignore-input value="${q(s)}" placeholder=".carousel, #ad-slot …">
-      <button class="btn-pick" data-pick-arg="vr-ignore" title="Pick element from page">&#x1F3AF;</button>
-      <button class="btn-icon" data-vr-rm-ignore title="Remove" style="color:var(--err)">✕</button>
-    </div>`).join('');
-
-  list.querySelectorAll('[data-vr-ignore]').forEach(row => {
-    const i = +row.dataset.vrIgnore;
-    row.querySelector('[data-vr-ignore-input]').addEventListener('input', e => {
-      vrState.ignoreSelectors[i] = e.target.value;
-      persistVrState();
-    });
-    row.querySelector('.btn-pick').addEventListener('click', () => {
-      startPicker(row, null, 'vr-ignore', (selector) => {
-        const val = selector.css || (selector.idValue ? '#' + selector.idValue : '');
-        vrState.ignoreSelectors[i] = val;
-        row.querySelector('[data-vr-ignore-input]').value = val;
-        persistVrState();
-      });
-    });
-    row.querySelector('[data-vr-rm-ignore]').addEventListener('click', () => {
-      vrState.ignoreSelectors.splice(i, 1);
-      renderVrIgnores();
-      persistVrState();
-    });
-  });
-}
-
-// Baseline status per configured page, with a per-page reset affordance.
-// Run Comparison stays disabled until at least one page has a baseline.
-async function renderVrBaselines() {
-  const el = document.getElementById('vr-baseline-list');
-  if (!el) return;
-  const pages = tmPagesFor('3');
-  const { vrMeta = {} } = await chrome.storage.local.get('vrMeta');
-  const runBtn = document.getElementById('btn-vr-run');
-  if (!pages.length) {
-    el.innerHTML = '<div style="font-size:11px;color:var(--fg3)">Add a page URL above first.</div>';
-    if (runBtn) runBtn.disabled = true;
-    return;
-  }
-  let anyBaseline = false;
-  el.innerHTML = pages.map(p => {
-    const b = vrMeta[p.url]?.baseline;
-    if (b) anyBaseline = true;
-    return `
-      <div class="ab-line">
-        <b>${esc(shortUrl(p.url))}</b>
-        <div class="ab-cline">${b
-          ? `baseline captured ${new Date(b.ts).toLocaleString()} · ${b.viewportW}px viewport${b.truncated ? ' · <span class="ab-warn">capture truncated at ' + b.capturedH + 'px</span>' : ''}
-             <button class="btn-icon" data-vr-reset="${esc(p.url).replace(/"/g, '&quot;')}" title="Reset baseline" style="color:var(--err)">✕ reset</button>`
-          : '<span style="color:var(--fg3)">no baseline yet — Run Comparison will skip this page</span>'}</div>
-      </div>`;
-  }).join('');
-  if (runBtn) runBtn.disabled = !anyBaseline;
-
-  el.querySelectorAll('[data-vr-reset]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const url = btn.dataset.vrReset;
-      if (!confirm('Reset the stored baseline for this page?')) return;
-      const { vrMeta = {} } = await chrome.storage.local.get('vrMeta');
-      delete vrMeta[url];
-      await chrome.storage.local.set({ vrMeta });
-      for (const k of ['baseline|', 'current|', 'diff|']) { try { await idbDelete('vrImages', k + url); } catch (_) {} }
-      await renderVrBaselines();
-    });
-  });
-}
-
-async function runVrCapture(kind) {
-  const resultsEl = document.getElementById('vr-results');
-  const baseBtn = document.getElementById('btn-vr-baseline');
-  const runBtn  = document.getElementById('btn-vr-run');
-  const stopBtn = document.getElementById('btn-vr-stop');
-
-  const pages = tmPagesFor('3');
-  if (!pages.length) {
-    resultsEl.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Add at least one page URL above.</div>';
-    return;
-  }
-  const { vrMeta = {} } = await chrome.storage.local.get('vrMeta');
-  let targets = pages;
-  if (kind === 'compare') {
-    targets = pages.filter(p => vrMeta[p.url]?.baseline);
-    if (!targets.length) {
-      resultsEl.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">No baselines stored yet — click Set Baseline first.</div>';
-      return;
-    }
-  }
-
-  baseBtn.disabled = true;
-  runBtn.disabled = true;
-  stopBtn.style.display = '';
-  resultsEl.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Capturing…</div>';
-  _vrProgressPoller = setInterval(async () => {
-    const { vrProgress } = await sessionNS.get('vrProgress');
-    if (vrProgress?.running) {
-      resultsEl.innerHTML = `<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Capturing ${esc(shortUrl(vrProgress.label || ''))} (${vrProgress.index + 1} of ${vrProgress.total})…</div>`;
-    }
-  }, 400);
-
-  try {
-    const res = await chrome.runtime.sendMessage({
-      action: 'runVisualCapture',
-      payload: {
-        pages: targets, settleSeconds: vrState.settleSec,
-        keepTabs: vrState.keepTabs, ignoreSelectors: vrState.ignoreSelectors,
-        winId: WIN_ID,
-      },
-    });
-    if (!res?.ok) throw new Error(res?.error || 'Capture failed');
-    if (kind === 'baseline') await vrStoreBaselines(res.results);
-    else await vrCompare(res.results);
-  } catch (e) {
-    resultsEl.innerHTML = '<div style="color:var(--err);font-size:12px;padding:6px 0">Error: ' + esc(e.message) + '</div>';
-  } finally {
-    clearInterval(_vrProgressPoller);
-    _vrProgressPoller = null;
-    baseBtn.disabled = false;
-    stopBtn.style.display = 'none';
-    await renderVrBaselines();   // also re-enables Run Comparison when applicable
-  }
-}
-
-async function vrStoreBaselines(captures) {
-  const resultsEl = document.getElementById('vr-results');
-  const { vrMeta = {} } = await chrome.storage.local.get('vrMeta');
-  const lines = [];
-  for (const c of captures) {
-    if (c.skipped) { lines.push(`<div class="ab-line ab-same-row">${esc(shortUrl(c.url))} — skipped (stopped)</div>`); continue; }
-    if (c.error)   { lines.push(`<div class="ab-line"><span class="ab-err">${esc(shortUrl(c.url))} — ${esc(c.error)}</span></div>`); continue; }
-    await idbPut('vrImages', c.dataUrl, 'baseline|' + c.url);
-    try { await idbDelete('vrImages', 'current|' + c.url); await idbDelete('vrImages', 'diff|' + c.url); } catch (_) {}
-    vrMeta[c.url] = {
-      baseline: {
-        ts: c.ts, viewportW: c.viewportW, viewportH: c.viewportH,
-        pageW: c.pageW, pageH: c.pageH, capturedH: c.capturedH,
-        truncated: !!c.truncated, boxes: c.boxes || [],
-      },
-    };
-    lines.push(`<div class="ab-line">${esc(shortUrl(c.url))} — <span style="color:var(--ok)">baseline stored</span>${c.truncated ? ' <span class="ab-warn">(page taller than ' + VR_MAX_H_NOTE + 'px — capture truncated)</span>' : ''}</div>`);
-  }
-  await chrome.storage.local.set({ vrMeta });
-  resultsEl.innerHTML = `
-    <div class="a11y-summary-bar"><span>Baseline capture</span></div>
-    <div style="display:flex;flex-direction:column;gap:2px">${lines.join('')}</div>`;
-}
-
-const VR_MAX_H_NOTE = 8000;   // mirrors background's VR_MAX_CAPTURE_HEIGHT, for copy only
-
-function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error('Could not decode image'));
-    img.src = src;
-  });
-}
-
-// Dependency-free pixel diff. Small per-channel tolerance absorbs
-// anti-aliasing; ignore-region boxes are blacked out of both images first;
-// a height difference is diffed over the shared region and the delta itself
-// counts toward the mismatch (tinted amber on the diff image).
-async function vrDiffImages(baseSrc, curSrc, baseMeta, curCap, threshold) {
-  const [bi, ci] = await Promise.all([loadImage(baseSrc), loadImage(curSrc)]);
-  const w = Math.min(bi.naturalWidth, ci.naturalWidth);
-  const sharedH = Math.min(bi.naturalHeight, ci.naturalHeight);
-  const maxH = Math.max(bi.naturalHeight, ci.naturalHeight);
-
-  const draw = (img, pageW) => {
-    const c = document.createElement('canvas');
-    c.width = img.naturalWidth; c.height = img.naturalHeight;
-    const x = c.getContext('2d', { willReadFrequently: true });
-    x.drawImage(img, 0, 0);
-    // Mask ignore regions from BOTH captures onto this image, scaled from
-    // page CSS px to image px.
-    const s = pageW ? img.naturalWidth / pageW : 1;
-    x.fillStyle = '#000';
-    for (const b of [...(baseMeta.boxes || []), ...(curCap.boxes || [])]) {
-      x.fillRect(Math.floor(b.x * s), Math.floor(b.y * s), Math.ceil(b.w * s), Math.ceil(b.h * s));
-    }
-    return x;
-  };
-  const bx = draw(bi, baseMeta.pageW);
-  const cx = draw(ci, curCap.pageW);
-  const bd = bx.getImageData(0, 0, w, sharedH).data;
-  const cd = cx.getImageData(0, 0, w, sharedH).data;
-
-  // Diff image: changed pixels in red over a dimmed copy of the baseline.
-  const out = document.createElement('canvas');
-  out.width = w; out.height = maxH;
-  const ox = out.getContext('2d');
-  ox.fillStyle = '#fff';
-  ox.fillRect(0, 0, w, maxH);
-  ox.globalAlpha = 0.25;
-  ox.drawImage(bi, 0, 0);
-  ox.globalAlpha = 1;
-  const od = ox.getImageData(0, 0, w, maxH);
-  const o = od.data;
-
-  const TOL = 25;
-  let changed = 0;
-  const px = w * sharedH;
-  for (let i = 0; i < px; i++) {
-    const j = i * 4;
-    if (Math.abs(bd[j] - cd[j]) > TOL || Math.abs(bd[j + 1] - cd[j + 1]) > TOL || Math.abs(bd[j + 2] - cd[j + 2]) > TOL) {
-      changed++;
-      o[j] = 229; o[j + 1] = 57; o[j + 2] = 53; o[j + 3] = 255;
-    }
-  }
-  ox.putImageData(od, 0, 0);
-  const deltaH = maxH - sharedH;
-  if (deltaH > 0) {
-    ox.fillStyle = 'rgba(255,170,0,.35)';
-    ox.fillRect(0, sharedH, w, deltaH);
-  }
-
-  const total = w * maxH;
-  const mismatchPct = total ? ((changed + w * deltaH) / total) * 100 : 0;
-  return {
-    mismatchPct: Math.round(mismatchPct * 1000) / 1000,
-    pass: mismatchPct <= threshold,
-    changedPixels: changed,
-    heightDeltaPx: deltaH,
-    baseH: bi.naturalHeight, curH: ci.naturalHeight, width: w,
-    diffDataUrl: out.toDataURL('image/png'),
-  };
-}
-
-async function vrCompare(captures) {
-  const { vrMeta = {} } = await chrome.storage.local.get('vrMeta');
-  const threshold = Math.max(0, parseFloat(vrState.threshold) || 0.1);
-  const pageResults = [];
-  for (const c of captures) {
-    if (c.skipped) { pageResults.push({ url: c.url, skipped: true }); continue; }
-    const meta = vrMeta[c.url] || {};
-    const entry = {
-      url: c.url, ts: c.ts, threshold,
-      error: c.error || null,
-      baselineTs: meta.baseline?.ts || null,
-      truncated: !!(c.truncated || meta.baseline?.truncated),
-    };
-    if (!entry.error && meta.baseline) {
-      if (c.viewportW !== meta.baseline.viewportW) {
-        // Dimension-mismatched diffs are noise, not signal — flag and skip.
-        entry.viewportMismatch = { baseline: meta.baseline.viewportW, current: c.viewportW };
-      } else {
-        const baseImg = await idbGet('vrImages', 'baseline|' + c.url);
-        if (!baseImg) {
-          entry.error = 'Baseline image missing from storage — set a new baseline';
-        } else {
-          try {
-            const diff = await vrDiffImages(baseImg, c.dataUrl, meta.baseline, c, threshold);
-            await idbPut('vrImages', c.dataUrl, 'current|' + c.url);
-            await idbPut('vrImages', diff.diffDataUrl, 'diff|' + c.url);
-            delete diff.diffDataUrl;   // images stay in IndexedDB, not in the result/export
-            Object.assign(entry, diff, { hasImages: true });
-          } catch (e) {
-            entry.error = 'Diff failed: ' + e.message;
-          }
-        }
-      }
-      vrMeta[c.url] = {
-        ...meta,
-        lastRun: { ts: c.ts, viewportW: c.viewportW, pageH: c.pageH, mismatchPct: entry.mismatchPct ?? null, pass: entry.pass ?? null },
-      };
-    } else if (!entry.error) {
-      entry.error = 'No baseline stored for this page';
-    }
-    pageResults.push(entry);
-  }
-  await chrome.storage.local.set({ vrMeta });
-  _vrLastRun = { ts: Date.now(), threshold, pages: pageResults };
-  await renderVrResults(pageResults);
-}
-
-async function renderVrResults(pages) {
-  const el = document.getElementById('vr-results');
-  const compared = pages.filter(p => !p.skipped);
-  const passed = compared.filter(p => p.pass === true).length;
-  const failed = compared.filter(p => p.pass === false).length;
-  const warned = compared.filter(p => p.viewportMismatch || (p.error && !p.pass)).length;
-
-  const blocks = [];
-  for (const p of pages) {
-    if (p.skipped) {
-      blocks.push(`<div class="ab-line ab-same-row">${esc(shortUrl(p.url))} — skipped (stopped)</div>`);
-      continue;
-    }
-    let hdr;
-    if (p.viewportMismatch) {
-      hdr = `<span class="ab-warn">⚠ Viewport changed</span> — baseline ${p.viewportMismatch.baseline}px, now ${p.viewportMismatch.current}px. Pixel diff skipped: resize the window to match (or set a new baseline).`;
-    } else if (p.error) {
-      hdr = `<span class="ab-err">${esc(p.error)}</span>`;
-    } else {
-      const verdict = p.pass
-        ? '<span style="color:var(--ok);font-weight:700">PASS</span>'
-        : '<span style="color:var(--err);font-weight:700">FAIL</span>';
-      hdr = `${verdict} — ${p.mismatchPct}% mismatch (threshold ${p.threshold}%)`
-        + (p.heightDeltaPx ? ` · page height changed by ${p.heightDeltaPx}px` : '')
-        + (p.truncated ? ' · <span class="ab-warn">capture truncated</span>' : '');
-    }
-    const meta = `baseline ${p.baselineTs ? new Date(p.baselineTs).toLocaleString() : '—'} · compared ${new Date(p.ts).toLocaleString()}`;
-
-    let imgs = '';
-    if (p.hasImages) {
-      const [b, c, d] = await Promise.all([
-        idbGet('vrImages', 'baseline|' + p.url),
-        idbGet('vrImages', 'current|' + p.url),
-        idbGet('vrImages', 'diff|' + p.url),
-      ]);
-      const thumb = (src, lbl) => src ? `
-        <div class="vr-thumb">
-          <img src="${src}" data-vr-open title="Click to open full size">
-          <div class="vr-thumb-lbl">${lbl}</div>
-        </div>` : '';
-      imgs = `<div class="vr-thumbs">${thumb(b, 'Baseline')}${thumb(c, 'Current')}${thumb(d, 'Diff')}</div>`;
-    }
-
-    blocks.push(`
-      <div class="ab-line">
-        <b>${esc(shortUrl(p.url))}</b>
-        <div class="ab-cline">${hdr}</div>
-        <div class="ab-cline" style="color:var(--fg3)">${meta}</div>
-        ${imgs}
-      </div>`);
-  }
-
-  const summaryColor = failed ? 'var(--err)' : 'var(--ok)';
-  el.innerHTML = `
-    <div class="a11y-summary-bar">
-      <span>${passed} passed · ${failed} failed${warned ? ` · ${warned} warning${warned !== 1 ? 's' : ''}` : ''}</span>
-      <div class="row" style="gap:8px">
-        <span class="a11y-summary-total" style="color:${summaryColor}">${failed ? failed + ' page' + (failed !== 1 ? 's' : '') + ' over threshold' : 'All within threshold'}</span>
-        <button class="btn ghost btn-icon" data-vr-export title="Download results as JSON (images excluded)">Export</button>
-        <button class="btn ghost btn-icon" data-clear-results title="Clear results">Clear</button>
-      </div>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:4px">${blocks.join('')}</div>`;
-
-  el.querySelector('[data-clear-results]')?.addEventListener('click', () => { el.innerHTML = ''; });
-  el.querySelector('[data-vr-export]')?.addEventListener('click', () => {
-    if (!_vrLastRun) return;
-    downloadJson(_vrLastRun, 'visual-regression-' + new Date(_vrLastRun.ts).toISOString().replace(/[:.]/g, '-') + '.json');
-  });
-  el.querySelectorAll('[data-vr-open]').forEach(img => {
-    img.addEventListener('click', () => openImageInTab(img.getAttribute('src')));
-  });
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -4441,26 +3958,6 @@ function rptAbSection(entry) {
   return rptSection(entry.name, badge, summary, body);
 }
 
-function rptVrSection(entry) {
-  if (entry.status === 'skipped') return rptSkipped(entry.name, entry.reason);
-  const run = entry.data;
-  const compared = run.pages.filter(p => !p.skipped);
-  const passed = compared.filter(p => p.pass === true).length;
-  const failed = compared.filter(p => p.pass === false).length;
-  const badge = rptBadge(failed ? 'fail' : 'pass', failed ? 'FAIL' : 'PASS');
-  const skippedCount = run.pages.length - compared.length;
-  const summary = `${passed} passed · ${failed} failed${skippedCount ? ` · ${skippedCount} skipped` : ''}`;
-  const rows = run.pages.map(p => {
-    if (p.skipped) return `<tr><td>${esc(shortUrl(p.url))}</td><td colspan="2">Skipped (stopped)</td></tr>`;
-    if (p.viewportMismatch) return `<tr><td>${esc(shortUrl(p.url))}</td><td>Viewport changed</td><td>baseline ${p.viewportMismatch.baseline}px, now ${p.viewportMismatch.current}px — diff skipped</td></tr>`;
-    if (p.error) return `<tr><td>${esc(shortUrl(p.url))}</td><td colspan="2">${esc(p.error)}</td></tr>`;
-    return `<tr><td>${esc(shortUrl(p.url))}</td><td>${p.pass ? 'PASS' : 'FAIL'}</td><td>${p.mismatchPct}% mismatch (threshold ${p.threshold}%)${p.heightDeltaPx ? ' · height changed ' + p.heightDeltaPx + 'px' : ''}</td></tr>`;
-  }).join('');
-  const body = `<table class="rpt-table"><thead><tr><th>Page</th><th>Result</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>
-    <p class="rpt-muted">Baseline/current/diff screenshots are available in the extension (Visual Regression Mode) — not embedded here.</p>`;
-  return rptSection(entry.name, badge, summary, body);
-}
-
 function rptWcagSection(entry) {
   if (entry.status === 'skipped') return rptSkipped(entry.name, entry.reason);
   const run = entry.data;
@@ -4552,7 +4049,7 @@ function rptFunnelSection(entry) {
 function buildReportBody(sections) {
   const { ts, pageUrls, modes, extraHtml } = sections;
   const builders = {
-    2: rptAbSection, 3: rptVrSection,
+    2: rptAbSection,
     4: rptWcagSection, 5: rptCvaSection, 6: rptPerfSection,
     funnel: rptFunnelSection,
   };
@@ -5526,9 +5023,9 @@ function mxSyncFromState() {
 //   restore   (snap) => void. Put that slice back and re-render. Undo.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Visual Regression ('3') and Performance ('6') hold the same flat page list
-// (tmModes[n].pages) with no label/override fields — one factory, two
-// entries, so the Apply-to-all summary can name each mode individually.
+// Performance ('6') holds a flat page list (tmModes[n].pages) with no
+// label/override fields — this factory lets the Apply-to-all summary name
+// the mode individually.
 function tmFillTarget(modeId, label) {
   return {
     id: 'tm' + modeId,
@@ -5605,7 +5102,6 @@ const FILL_TARGETS = [
       if (nameEl && !nameEl.value.trim()) nameEl.value = ctx.ticketKey;
     },
   },
-  tmFillTarget('3', 'Visual Regression'),
   tmFillTarget('6', 'Performance / Load'),
   {
     id: 'mx',
@@ -5975,10 +5471,10 @@ async function initFillTargets() {
 // same as A/B's abState; named, run audits (config + result history) are
 // saved to chrome.storage.local under `matrixAudits` — NOT storage.sync as
 // first sketched, since a single run easily exceeds sync's 8KB-per-item cap
-// (the same reason vrConfig/wcagHistory/perfHistory all live in local).
+// (the same reason wcagHistory/perfHistory all live in local).
 // Each URL is audited by its own `runMatrixAuditStep` message round-trip so
 // the "Next URL" button in the spec maps directly onto one bounded await —
-// no session-storage progress polling needed, unlike the CVA/VR/Perf loops
+// no session-storage progress polling needed, unlike the CVA/Perf loops
 // that run unattended across many pages in one background call.
 let mxState = null;
 let mxRun = null;          // { runId, index, total, targets: [{url, group}], results: { [url]: {...} } } while a run is active/complete
@@ -6532,7 +6028,7 @@ function mxRenderResultsTable() {
 // 'pause' auto-advances but stops on any problem so the user can look, and
 // 'manual' stops after every URL (the original one-at-a-time behavior). Each
 // URL is still one bounded await, so resuming is just re-entering the loop —
-// no progress polling needed (unlike CVA/VR/Perf's single background call). ──
+// no progress polling needed (unlike CVA/Perf's single background call). ──
 async function runMatrixAuditStart() {
   if (_mxRunning) return;
   const validSelectors = mxState.selectors.filter(s => s.selector.trim());
@@ -6847,8 +6343,7 @@ async function initMetricTracker() {
   document.getElementById('btn-mt-fix-capture').addEventListener('click', mtFixCapture);
 
   // Delegated on #mt-list — pattern typing must NOT rebuild the list (focus
-  // loss), so it updates in place; enabled/mode/remove do rebuild. Same split
-  // the Build tab's onMetricInput/onMetricRemove use.
+  // loss), so it updates in place; enabled/mode/remove/confirm do rebuild.
   const list = document.getElementById('mt-list');
   list.addEventListener('input',  onMtRowInput);
   list.addEventListener('change', onMtRowChange);
@@ -6924,7 +6419,7 @@ function mtRenderRows() {
           <option value="exact"${m.mode === 'exact' ? ' selected' : ''}>Exact</option>
           <option value="regex"${m.mode === 'regex' ? ' selected' : ''}>Regex</option>
         </select>
-        ${needsReview ? '<span style="font-size:10px;color:var(--warn)">⚠ needs review — confirm below</span>' : ''}
+        ${needsReview ? `<span class="btn-icon" data-mt-confirm="${esc(m.id)}" style="font-size:10px;color:var(--warn)" title="From a ticket Goal — needs review before Track Metric can assert on it. Click to confirm.">⚠ needs review — click to confirm</span>` : ''}
         <span data-mt-err="${esc(m.id)}" style="font-size:10px;color:var(--err)"></span>
       </div>
     </div>`;
@@ -7122,6 +6617,12 @@ function onMtRowChange(e) {
 }
 
 function onMtRowClick(e) {
+  const confirmBtn = e.target.closest('[data-mt-confirm]');
+  if (confirmBtn) {
+    const m = metrics.find((x) => x.id === confirmBtn.dataset.mtConfirm);
+    if (m) { m.reviewed = true; mtSyncAfterListChange(); }
+    return;
+  }
   const btn = e.target.closest('[data-mt-remove]');
   if (!btn) return;
   const i = metrics.findIndex((x) => x.id === btn.dataset.mtRemove);
