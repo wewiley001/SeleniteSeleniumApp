@@ -530,8 +530,12 @@ function expProbeFn() {
       if (data.projectId != null) out.snippetInfo.projectId = str(data.projectId);
       if (data.revision != null) out.snippetInfo.revision = str(data.revision);
       for (const [id, def] of Object.entries(data.experiments)) {
+        // Field name unconfirmed here — get('data') hasn't been checked
+        // against a real page. get('state').getExperimentStates() below HAS
+        // (confirmed real shape uses `experimentName`, not `name`), so try
+        // that same name first in case this catalog object shares it.
         rows.set(str(id), {
-          id: str(id), name: cap(str(def && def.name) || null, 200), known: true,
+          id: str(id), name: cap(str((def && (def.experimentName ?? def.name)) || null), 200), known: true,
           active: false, bucketed: false, variationId: null, variationName: null,
           variations: asArray(def && def.variations).slice(0, 12).map((v) => ({ id: str(v && v.id), name: cap(str(v && v.name) || null, 200) })),
           reason: null, forced: false, source: null,
@@ -545,6 +549,11 @@ function expProbeFn() {
         const key = str(id);
         const row = rows.get(key) || { id: key, name: null, known: true, active: false, bucketed: false, variationId: null, variationName: null, variations: [], reason: null, forced: false, source: null };
         row.active = !!st.isActive;
+        // Confirmed-real field (verified against a live getExperimentStates()
+        // call) — wins over the catalog's unconfirmed name when present,
+        // since this is the one source we know for certain is correct.
+        const stateName = cap(str(st.experimentName) || null, 200);
+        if (stateName) row.name = stateName;
         if (st.variation && st.variation.id != null) {
           row.bucketed = true;
           row.variationId = str(st.variation.id);
