@@ -287,6 +287,28 @@
     font-family:'Cascadia Code','Menlo',monospace}
   .mt-fire-hit .mt-fire-txt{color:var(--fg1)}
 
+  /* Experiment status */
+  #exp-card{display:flex;flex-direction:column;gap:6px}
+  #exp-headline{font-size:12px;font-weight:600;line-height:1.45;color:var(--fg1)}
+  #exp-sub{font-size:11px;color:var(--fg2);line-height:1.45;
+    font-family:'Cascadia Code','Menlo',monospace;word-break:break-word}
+  #exp-expected,#exp-actual{display:flex;align-items:baseline;gap:6px;font-size:11px;line-height:1.5}
+  .exp-k{flex:0 0 58px;color:var(--fg3);font-size:10px;text-transform:uppercase;letter-spacing:.4px}
+  .exp-v{flex:1;min-width:0;color:var(--fg1);word-break:break-word}
+  .exp-src{flex:0 0 auto;font-size:9px;padding:1px 5px;border-radius:3px;
+    background:var(--overlay);color:var(--fg2);white-space:nowrap}
+  .exp-src.exp-src-weak{color:var(--warn);background:rgba(204,167,0,.14)}
+  #exp-notes{display:flex;flex-direction:column;gap:3px}
+  .exp-note{font-size:10px;line-height:1.45;color:var(--warn)}
+  #exp-desc{font-size:10px;line-height:1.5;color:var(--fg2);background:var(--surface);
+    border:1px solid var(--stroke);border-radius:4px;padding:5px 7px;
+    max-height:76px;overflow-y:auto;white-space:pre-wrap}
+  #exp-stale{font-size:10px;color:var(--fg3)}
+  #exp-card.exp-ok   #exp-headline{color:var(--ok)}
+  #exp-card.exp-warn #exp-headline{color:var(--warn)}
+  #exp-card.exp-err  #exp-headline{color:var(--err)}
+  #exp-card.exp-idle #exp-headline{color:var(--fg3);font-weight:400}
+
   /* A/B Variant Comparison */
   #ab-target-list{display:flex;flex-direction:column;gap:5px}
   .ab-target{background:var(--surface);border:1px solid var(--stroke);border-radius:5px;
@@ -599,6 +621,32 @@
       <div id="mt-status" style="font-size:11px;color:var(--fg3);line-height:1.5">
         Tracking is off — flip the switch to start counting.
       </div>
+    </div>
+
+    <!-- Experiment status — live page reality vs. the active Test Context -->
+    <div class="card exp-idle" id="exp-card">
+      <div class="row-spread" style="margin-bottom:8px">
+        <div class="row">
+          <label class="toggle-wrap" title="Watch this page for the ticket's experiment and variation">
+            <input type="checkbox" id="exp-watch" checked>
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+          <span style="font-size:12px;font-weight:600">Experiment Status</span>
+          <span id="exp-dot" class="run-dot" style="display:none"></span>
+        </div>
+        <button class="btn ghost sm" id="btn-exp-refresh" title="Re-read this page's experiment state now">Refresh</button>
+      </div>
+      <div id="exp-headline">Waiting for a page…</div>
+      <div id="exp-sub"></div>
+      <div id="exp-expected"><span class="exp-k">Expected</span><span class="exp-v" id="exp-expected-v">—</span></div>
+      <div id="exp-actual">
+        <span class="exp-k">On page</span>
+        <span class="exp-v" id="exp-actual-v">—</span>
+        <span class="exp-src" id="exp-actual-src" style="display:none"></span>
+      </div>
+      <div id="exp-notes"></div>
+      <div id="exp-desc" style="display:none"></div>
+      <div id="exp-stale" style="display:none"></div>
     </div>
 
     <!-- Accordion 1: Metrics -->

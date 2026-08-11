@@ -224,6 +224,10 @@ async function addBrowserConsoleLog(winId, entry) {
 const METRICS_CAP = 500;
 async function addMetric(winId, level, text) {
   mtObserve(winId, level, text);   // never awaited, never rejects — see its header comment
+  // A tagged line is good evidence the experiment just did something —
+  // worth a fresh read of the page's experiment/variation state. Debounced
+  // 1500ms so a burst of fires (a whole activation sequence) costs one probe.
+  expSchedule(winId, 'tagged-line', 1500);
   const store = ns(resolveFeedWin(winId));
   const { metricsLog = [] } = await store.get('metricsLog');
   metricsLog.push({ ts: new Date().toLocaleTimeString(), t: Date.now(), level, text });
@@ -284,6 +288,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
   for (const k of Object.keys(changes)) {
     const m = /^w(\d+):mtSettings$/.exec(k);
     if (m) _mtSettings.delete(Number(m[1]));
+    const em = /^w(\d+):expSettings$/.exec(k);
+    if (em) _expSettings.delete(Number(em[1]));
   }
 });
 
@@ -382,6 +388,263 @@ async function mtObserve(winId, level, text) {
       }
     }
   } catch (_) { /* tracker faults are never surfaced — see header above */ }
+}
+
+// ── Experiment status runtime ───────────────────────────────────────────────
+// Live "what experiment/variation is this page actually showing" for the
+// Tracker tab, cross-referenced against the ticket context by the panel (this
+// worker never reads initContexts — it only reports raw platform facts).
+// Mirrors the Metric Tracker's shape one level up: mtGetSettings/mtObserve are
+// per-fire and driven by addMetric; expGetSettings/expProbe are per-page-event
+// and driven by expSchedule below. Both memoize per window and both recover
+// from an MV3 teardown by re-reading session storage lazily.
+const EXP_DEFAULTS = { watch: true };
+const EXP_MIN_MS = 1200;        // floor between probes of the same window, any reason
+const EXP_TICK_MIN_MS = 2500;   // additional floor specifically for the panel's heartbeat
+
+const _expSettings  = new Map(); // winId -> { watch }
+const _expLastProbe = new Map(); // winId -> ts of the last probe actually run
+
+async function expGetSettings(winId) {
+  const hit = _expSettings.get(winId);
+  if (hit) return hit;
+  const { expSettings } = await ns(winId).get('expSettings');
+  const s = { ...EXP_DEFAULTS, ...(expSettings || {}) };
+  _expSettings.set(winId, s);
+  return s;
+}
+
+// Debounced scheduler — many trigger sites (nav, SPA route change, a tagged
+// console line, tab activation, the panel's heartbeat) can all fire for the
+// same window within a short window of each other. Deliberately does NOT
+// collapse to a single pending timer per window: a navigation schedules BOTH
+// a quick probe (~600ms, catches an already-decided page) and a later one
+// (~2500ms, catches a platform that decides asynchronously after load) —
+// coalescing to one timer would silently drop whichever call came second.
+// Instead every call gets its own setTimeout, and the per-window floor below
+// (checked when a timer actually fires, not when it's scheduled) is what
+// prevents redundant back-to-back probes: only the first timer to fire after
+// the floor has elapsed actually reaches the page; the rest no-op for free.
+// No-ops when no panel is open for winId — a page probe nobody reads is
+// wasted work on the user's page. reason 'manual' (the panel's Refresh
+// button) bypasses the floor entirely so a click always feels immediate.
+function expSchedule(winId, reason, delayMs) {
+  if (!connectedPanels.has(winId)) return;
+
+  const run = () => {
+    const last = _expLastProbe.get(winId) || 0;
+    const floor = reason === 'tick' ? EXP_TICK_MIN_MS : EXP_MIN_MS;
+    if (reason !== 'manual' && Date.now() - last < floor) return;
+    _expLastProbe.set(winId, Date.now());
+    expProbe(winId, reason).catch(() => {});
+  };
+  if (reason === 'manual') { run(); return; }
+  setTimeout(run, delayMs);
+}
+
+// Reads the platform's own runtime state out of the page. Always writes an
+// envelope, even on failure — a missing w<winId>:expStatus must never be how
+// a probe failure is communicated to the panel, since "never probed" and
+// "just probed and it broke" need visibly different UI.
+async function expProbe(winId, reason) {
+  await restoreFollowState();
+  const tabId = winFollow.get(winId)?.tabId;
+  const envelope = { probedAt: Date.now(), tabId: tabId ?? null, reason, url: null, title: null, probe: null, error: null };
+  if (tabId == null) { envelope.error = 'no-tab'; await ns(winId).set({ expStatus: envelope }); return envelope; }
+
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) { tab = null; }
+  if (!tab || !isCapturableUrl(tab.url)) {
+    envelope.error = 'not-probeable';
+    envelope.url = tab?.url || null;
+    envelope.title = tab?.title || null;
+    await ns(winId).set({ expStatus: envelope });
+    return envelope;
+  }
+  envelope.url = tab.url || null;
+  envelope.title = tab.title || null;
+
+  try {
+    envelope.probe = await execMain(tabId, expProbeFn, []);
+  } catch (e) {
+    envelope.error = e.message || 'probe failed';
+  }
+  await ns(winId).set({ expStatus: envelope });
+  return envelope;
+}
+
+// Injected into the page's MAIN world (see execMain below) to read whatever
+// experimentation platform is running there. Must stay self-contained, like
+// mtRenderNotice/renderSessionOverlay above — executeScript serializes this
+// function and it cannot close over module scope. Every read is wrapped by
+// `safe()` so a platform API-shape change degrades to "couldn't read this
+// bit" (surfaced in `errors`) rather than throwing out of the whole probe —
+// this function must never throw.
+//
+// `catalogComplete` is the load-bearing defensive flag: an id's absence from
+// `experiments` means "not in this snippet" ONLY when the platform's full
+// catalog was actually read. Without it, an API shape we don't recognize
+// would silently read as "experiment not running" — a false negative on a
+// perfectly healthy page, which is worse than surfacing nothing at all.
+function expProbeFn() {
+  const errors = [];
+  const safe = (label, fn) => {
+    try { return fn(); } catch (e) { errors.push(label + ': ' + (e && e.message || e)); return undefined; }
+  };
+  const str = (v) => (v == null ? null : String(v).trim());
+  const cap = (s, n) => (typeof s === 'string' && s.length > n ? s.slice(0, n) : s);
+  const asArray = (v) => (Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : []));
+
+  const out = {
+    ok: true,
+    probedAt: Date.now(),
+    url: location.href,
+    platform: null,
+    detected: { optimizely: false, convert: false, convertScript: false },
+    snippetInfo: {},
+    catalogComplete: false,
+    experiments: [],
+    forced: { optimizely_x: null, optimizely_force_tracking: null, conv_eforce: null, cro_mode: null },
+    errors,
+  };
+
+  // ── Platform-agnostic: what the URL itself is asking for ──────────────────
+  safe('forced-params', () => {
+    const params = new URLSearchParams(location.search);
+    out.forced.optimizely_x = str(params.get('optimizely_x'));
+    out.forced.optimizely_force_tracking = str(params.get('optimizely_force_tracking'));
+    out.forced.conv_eforce = str(params.get('_conv_eforce'));
+    out.forced.cro_mode = str(params.get('cro_mode'));
+  });
+
+  // ── Optimizely (PJS) ───────────────────────────────────────────────────────
+  const opt = typeof window.optimizely === 'object' && window.optimizely ? window.optimizely : null;
+  if (opt && typeof opt.get === 'function') {
+    out.detected.optimizely = true;
+    out.platform = 'optimizely';   // set immediately — the Convert branch below checks this to detect 'both'
+    const rows = new Map(); // expId -> row
+
+    const data = safe('optimizely:get(data)', () => opt.get('data')) || null;
+    if (data && data.experiments) {
+      out.catalogComplete = true;
+      if (data.projectId != null) out.snippetInfo.projectId = str(data.projectId);
+      if (data.revision != null) out.snippetInfo.revision = str(data.revision);
+      for (const [id, def] of Object.entries(data.experiments)) {
+        rows.set(str(id), {
+          id: str(id), name: cap(str(def && def.name) || null, 200), known: true,
+          active: false, bucketed: false, variationId: null, variationName: null,
+          variations: asArray(def && def.variations).slice(0, 12).map((v) => ({ id: str(v && v.id), name: cap(str(v && v.name) || null, 200) })),
+          reason: null, forced: false, source: null,
+        });
+      }
+    }
+
+    const states = safe('optimizely:getExperimentStates', () => opt.get('state').getExperimentStates()) || null;
+    if (states) {
+      for (const [id, st] of Object.entries(states)) {
+        const key = str(id);
+        const row = rows.get(key) || { id: key, name: null, known: true, active: false, bucketed: false, variationId: null, variationName: null, variations: [], reason: null, forced: false, source: null };
+        row.active = !!st.isActive;
+        if (st.variation && st.variation.id != null) {
+          row.bucketed = true;
+          row.variationId = str(st.variation.id);
+          row.variationName = cap(str(st.variation.name) || null, 200);
+          row.source = 'state.getExperimentStates';
+        }
+        if (st.reason) row.reason = cap(str(st.reason), 200);
+        rows.set(key, row);
+      }
+    }
+
+    const varMap = safe('optimizely:getVariationMap', () => opt.get('state').getVariationMap()) || null;
+    if (varMap) {
+      for (const [id, v] of Object.entries(varMap)) {
+        const key = str(id);
+        const row = rows.get(key);
+        if (row && !row.bucketed && v && v.id != null) {
+          row.bucketed = true;
+          row.variationId = str(v.id);
+          row.variationName = cap(str(v.name) || null, 200);
+          row.source = row.source || 'state.getVariationMap';
+        }
+      }
+    }
+
+    const activeIds = safe('optimizely:getActiveExperimentIds', () => opt.get('state').getActiveExperimentIds()) || null;
+    if (Array.isArray(activeIds)) {
+      for (const id of activeIds) {
+        const key = str(id);
+        const row = rows.get(key) || { id: key, name: null, known: false, active: false, bucketed: false, variationId: null, variationName: null, variations: [], reason: null, forced: false, source: null };
+        row.active = true;
+        rows.set(key, row);
+      }
+    }
+
+    for (const row of rows.values()) {
+      if (out.forced.optimizely_x && row.variationId === out.forced.optimizely_x) row.forced = true;
+    }
+    out.experiments.push(...rows.values());
+  }
+
+  // ── Convert ────────────────────────────────────────────────────────────────
+  const hasConvertScript = safe('convert:script-tag', () => !!document.querySelector('script[src*="convertexperiments.com"]'));
+  out.detected.convertScript = !!hasConvertScript;
+  const conv = (typeof window.convert === 'object' && window.convert) ? window.convert
+    : (typeof window._conv_data === 'object' && window._conv_data) ? window._conv_data : null;
+  if (conv) {
+    out.detected.convert = true;
+    if (out.platform === null) out.platform = 'convert'; else if (out.platform === 'optimizely') out.platform = 'both';
+
+    const rows = new Map();
+    const catalog = safe('convert:data.experiments', () => (window.convert && window.convert.data && window.convert.data.experiments) || null);
+    if (catalog) {
+      out.catalogComplete = true;
+      for (const [id, def] of Object.entries(catalog)) {
+        rows.set(str(id), {
+          id: str(id), name: cap(str(def && def.name) || null, 200), known: true,
+          active: false, bucketed: false, variationId: null, variationName: null,
+          variations: asArray(def && (def.variations || def.variation_names)).slice(0, 12)
+            .map((v) => (v && typeof v === 'object'
+              ? { id: str(v.id ?? v.variation_id), name: cap(str(v.name ?? v.variation_name) || null, 200) }
+              : { id: null, name: cap(str(v) || null, 200) })),
+          reason: null, forced: false, source: null,
+        });
+      }
+    }
+
+    // currentData holds only experiments bucketed on THIS pageview — its
+    // presence is itself the "active and bucketed" signal for that id.
+    const current = safe('convert:currentData.experiments', () => (conv.currentData && conv.currentData.experiments) || null);
+    if (current) {
+      for (const [id, e] of Object.entries(current)) {
+        const key = str(id);
+        const row = rows.get(key) || { id: key, name: null, known: false, active: false, bucketed: false, variationId: null, variationName: null, variations: [], reason: null, forced: false, source: null };
+        row.active = true;
+        const vId = e && (e.variation_id ?? (e.variation && e.variation.id) ?? e.varId);
+        const vName = e && (e.variation_name ?? (e.variation && e.variation.name) ?? e.varName);
+        let source = null;
+        if (e && e.variation_id != null) source = 'currentData.variation_id';
+        else if (e && e.variation && e.variation.id != null) source = 'currentData.variation.id';
+        else if (e && e.varId != null) source = 'currentData.varId';
+        if (vId != null) {
+          row.bucketed = true;
+          row.variationId = str(vId);
+          row.variationName = cap(str(vName) || null, 200);
+          row.source = source;
+        }
+        rows.set(key, row);
+      }
+    }
+
+    for (const row of rows.values()) {
+      const eforce = out.forced.conv_eforce;
+      if (eforce && row.variationId && eforce.endsWith('.' + row.variationId)) row.forced = true;
+    }
+    out.experiments.push(...rows.values());
+  }
+
+  out.experiments = out.experiments.slice(0, 40);
+  return out;
 }
 
 function formatRemoteArg(o) {
@@ -641,10 +904,24 @@ chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   // Debounced so fast tab-cycling (e.g. Ctrl+Tab) doesn't thrash the native
   // debugger banner with an attach/detach pair per intermediate tab.
   clearTimeout(_activateDebounce.get(windowId));
-  _activateDebounce.set(windowId, setTimeout(() => { followTab(windowId, tabId); }, 250));
+  _activateDebounce.set(windowId, setTimeout(() => {
+    followTab(windowId, tabId);
+    expSchedule(windowId, 'activate', 400);
+  }, 250));
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, info) => {
+  if (info.url && info.status !== 'complete') {
+    // A client-side route change (history.pushState/replaceState, hashchange)
+    // fires onUpdated with changeInfo.url but never reaches 'complete' — for
+    // an SPA that re-buckets on route change, this is the only navigation
+    // signal that will ever arrive, so probe here instead of waiting for a
+    // 'complete' that isn't coming.
+    await restoreFollowState();
+    const spaWinId = tabToWin.get(tabId);
+    if (spaWinId != null) expSchedule(spaWinId, 'spa', 900);
+    return;
+  }
   if (info.status !== 'complete') return;
   // A fresh document load resets "first fire per page load" notice
   // bookkeeping — counting itself is untouched, this only affects when a
@@ -665,7 +942,16 @@ chrome.tabs.onUpdated.addListener(async (tabId, info) => {
   // that same tab should always refresh it, run or no run; it can never steal
   // a *different* tab away from an in-progress run (doFollow already released
   // any prior tab for this window before the run's own attach took its place).
-  if (winId != null) await followTab(winId, tabId, { force: true });
+  if (winId != null) {
+    await followTab(winId, tabId, { force: true });
+    // Two probes per navigation, not one: Optimizely/Convert both decide
+    // bucketing asynchronously after load, so a single probe right at
+    // 'complete' routinely reads an undecided state. The later probe catches
+    // the settled state; the floor in expSchedule's run() means the second
+    // one is nearly free if the first already found a stable answer.
+    expSchedule(winId, 'nav', 600);
+    expSchedule(winId, 'nav-late', 2500);
+  }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -765,6 +1051,21 @@ function waitForLoad(tabId) {
 async function exec(tabId, fn, args) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
+    func: fn,
+    args,
+  });
+  return results?.[0]?.result;
+}
+
+// Same as exec(), but runs in the page's own MAIN world instead of the
+// isolated content-script world — required to read page globals like
+// window.optimizely / window.convert, which exec() structurally cannot see.
+// Precedent: injectCapture() below already injects console-capture.js with
+// world:'MAIN' for the same reason.
+async function execMain(tabId, fn, args) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
     func: fn,
     args,
   });
@@ -2317,16 +2618,16 @@ function mtRenderNotice(d) {
     // sizes; these cards hold flow content, so a host page's `div{margin}` /
     // `*{font-family}` / Tailwind preflight rules would otherwise leak in and
     // visibly break the layout.
-    wrap.style.cssText = 'all:initial;position:fixed;right:14px;bottom:14px;' +
-      'z-index:2147483647;display:flex;flex-direction:column-reverse;gap:8px;' +
+    wrap.style.cssText = 'all:initial;position:fixed;right:14px;top:14px;' +
+      'z-index:2147483647;display:flex;flex-direction:column;gap:8px;' +
       'width:320px;max-height:60vh;overflow-y:auto;pointer-events:none;' +
       "font:12px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif";
 
-    // column-reverse puts this visually ABOVE the (newest-at-bottom) stack.
+    // First DOM child, so it's always the top-most header above the cards.
     const clear = document.createElement('div');
     clear.id = HOST + '-clear';
     clear.textContent = 'Clear all';
-    clear.style.cssText = 'all:initial;order:1;display:none;align-self:flex-end;cursor:pointer;' +
+    clear.style.cssText = 'all:initial;display:none;align-self:flex-end;cursor:pointer;' +
       'pointer-events:auto;background:#3D3D3D;color:#AAAAAA;border:1px solid #444;' +
       'border-radius:4px;padding:3px 9px;font:11px/1.4 inherit;box-sizing:border-box';
     clear.addEventListener('click', () => wrap.remove());
@@ -2344,8 +2645,8 @@ function mtRenderNotice(d) {
     // themselves and their ✕ / Clear all controls.
     card.style.cssText = 'all:initial;box-sizing:border-box;pointer-events:auto;' +
       'display:flex;align-items:flex-start;gap:8px;background:#2C2C2C;color:#F0F0F0;' +
-      'border:1px solid #444;border-left:3px solid #0078D4;border-radius:7px;' +
-      'padding:9px 10px;box-shadow:0 4px 16px rgba(0,0,0,.5);' +
+      'border:1px solid #444;border-left:5px solid #0078D4;border-radius:7px;' +
+      'padding:9px 10px;box-shadow:0 6px 20px rgba(0,0,0,.55),0 0 0 1px rgba(0,120,212,.35);' +
       "font:12px/1.5 'Segoe UI',system-ui,-apple-system,sans-serif;" +
       'transition:background .3s';
 
@@ -2355,7 +2656,7 @@ function mtRenderNotice(d) {
     const lbl = document.createElement('div');
     lbl.className = HOST + '-lbl';
     lbl.style.cssText = 'all:initial;display:flex;align-items:center;gap:6px;' +
-      'font:600 12px/1.4 inherit;color:#0078D4';
+      'font:700 13px/1.4 inherit;color:#0078D4';
     const lblText = document.createElement('span');
     lblText.style.cssText = 'all:initial;font:inherit;color:inherit;overflow:hidden;' +
       'text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0';
@@ -2389,7 +2690,14 @@ function mtRenderNotice(d) {
     });
 
     card.append(body, x);
-    wrap.appendChild(card);
+    // Insert right after the "Clear all" header (always children[0]) so a
+    // newly-fired metric's card enters at the top of the stack, above any
+    // already-tracked metrics' cards, instead of at the bottom.
+    wrap.insertBefore(card, wrap.children[1] || null);
+    card.animate(
+      [{ transform: 'translateY(-16px)', opacity: 0 }, { transform: 'translateY(0)', opacity: 1 }],
+      { duration: 240, easing: 'ease-out' }
+    );
   }
 
   const lblSpan = card.querySelector('.' + HOST + '-lbl > span');
@@ -2402,8 +2710,14 @@ function mtRenderNotice(d) {
   // A repeat fire flashes the card rather than stacking a new one. This is a
   // 300ms background pulse, NOT an auto-fade — the card itself never leaves
   // the page on its own (see the header comment above).
-  card.style.background = '#37424D';
+  card.style.background = '#3A5068';
   setTimeout(() => { card.style.background = '#2C2C2C'; }, 300);
+  if (nBadge) {
+    nBadge.animate(
+      [{ transform: 'scale(1)' }, { transform: 'scale(1.3)' }, { transform: 'scale(1)' }],
+      { duration: 300, easing: 'ease-out' }
+    );
+  }
 
   const clearEl2 = document.getElementById(HOST + '-clear');
   if (clearEl2) clearEl2.style.display = wrap.querySelectorAll('[data-mt-id]').length >= 2 ? 'block' : 'none';
@@ -3210,6 +3524,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: true });
     })();
+    return true;
+
+  } else if (msg.action === 'expProbeNow') {
+    // The Tracker's "Refresh" button — bypasses expSchedule's floor (reason
+    // 'manual') and awaits the probe so the click feels immediate rather than
+    // waiting for the panel's next poll.
+    (async () => {
+      try {
+        const status = await expProbe(msg.winId, 'manual');
+        sendResponse({ ok: true, status });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+
+  } else if (msg.action === 'expTick') {
+    // The panel's heartbeat while the Tracker tab is on screen. Fire-and-
+    // forget by design: expSchedule's own floor governs whether this actually
+    // reaches the page, and the panel reads the result on its next poll, not
+    // from this response.
+    expSchedule(msg.winId, 'tick', 0);
+    sendResponse({ ok: true });
     return true;
 
   } else if (msg.action === 'highlightElement') {

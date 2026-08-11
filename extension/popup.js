@@ -133,6 +133,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(syncCaptureStatus, 800);
   setInterval(mtSync, 600);          // Metric Tracker counts + recent-fires feed
   setInterval(mtSyncStatus, 800);    // Metric Tracker capture-health line + tracking dot
+  setInterval(expSync, 1000);        // Experiment status card — poll + heartbeat, see its header comment
 
   await loadUniversalDelay();
   await loadQueueMetricsTracking();
@@ -292,7 +293,7 @@ function showTab(name) {
 
   // The Tracker's rows may have been edited from another window since the
   // last visit — re-render on entry.
-  if (name === 'tracker') { mtRenderRows(); mtRenderCounts(); mtSyncStatus(); }
+  if (name === 'tracker') { mtRenderRows(); mtRenderCounts(); mtSyncStatus(); expRefreshCtx(); expSync(); }
 }
 
 // ── Test Agent ───────────────────────────────────────────────────────────────
@@ -4151,6 +4152,7 @@ async function initInitializeTab() {
       refreshInitContextSelect();
       renderActiveContext();
       refreshAllFillButtons();
+      expRefreshCtx();   // display-only — same invariant, just re-renders the Experiment card
     }
   });
 }
@@ -6355,6 +6357,10 @@ async function initMetricTracker() {
     const sel = document.getElementById('mt-sensitivity');
     if (sel) sel.value = changes.metricMatchSensitivity.newValue || 'balanced';
   });
+
+  // Experiment status card — inherits this function's own try/catch at its
+  // call site, so a fault here can't take the rest of the init chain with it.
+  await initExpStatus();
 }
 
 function mtApplySettingsToInputs() {
@@ -6581,6 +6587,398 @@ async function mtFixCapture() {
     await mtSyncStatus();
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Experiment status — live "what is this page actually showing" for the
+// active Test Context, cross-referenced against the worker's page probe
+// (see the "Experiment status runtime" section of background.js). This
+// panel does ALL the ticket cross-referencing and v0/v1 label mapping; the
+// worker only ever reports raw platform facts (see expProbeFn's header
+// comment there) — same split as the rest of this file: worker = runtime,
+// panel = reader + editor. Deliberately independent of console-capture
+// health: this card can show a live verdict while #mt-status says capture
+// is disconnected, since chrome.scripting needs no debugger session.
+let expStatus    = null;               // last w<winId>:expStatus envelope read, or null
+let expSettings  = { watch: true };
+let expCtx       = null;               // the active Test Context, or null
+let _expProbedAt = 0;                  // dirty-check for the 1s poll (mirrors _mtCountsKey/_mtLogLen)
+let _expCtxKey   = '';                 // dirty-check for context changes: ticketKey + '|' + extractedAt
+let _expTickAt   = 0;                  // heartbeat throttle, mirrors the worker's own EXP_TICK_MIN_MS
+
+async function initExpStatus() {
+  if (!document.getElementById('exp-card')) return;
+
+  const { expSettings: saved } = await sessionNS.get('expSettings');
+  if (saved) expSettings = { watch: true, ...saved };
+  const watchEl = document.getElementById('exp-watch');
+  if (watchEl) watchEl.checked = expSettings.watch !== false;
+
+  document.getElementById('exp-watch')?.addEventListener('change', onExpWatchChange);
+  document.getElementById('btn-exp-refresh')?.addEventListener('click', onExpRefresh);
+
+  await expRefreshCtx();
+  await expSync();
+}
+
+function onExpWatchChange(e) {
+  expSettings.watch = e.target.checked;
+  sessionNS.set({ expSettings });
+  expRender();
+}
+
+// The panel's own "Refresh" — bypasses expSchedule's floor (reason 'manual')
+// and awaits the result directly rather than waiting for the next poll, so
+// the click feels immediate.
+async function onExpRefresh() {
+  const btn = document.getElementById('btn-exp-refresh');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({ action: 'expProbeNow', winId: WIN_ID });
+    if (res?.ok && res.status) {
+      expStatus = res.status;
+      _expProbedAt = res.status.probedAt || 0;
+      expRender();
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ── Polling ───────────────────────────────────────────────────────────────
+// The heartbeat lives here rather than as a second interval: while the
+// Tracker tab is the visible panel and watching is on, ping the worker at
+// most once every 3s so a page that re-buckets client-side (no nav, no
+// tagged line) still gets picked up. Fire-and-forget — a slow round trip
+// must never delay this poll's own render.
+async function expSync() {
+  if (!document.getElementById('exp-card')) return;
+
+  const trackerVisible = document.getElementById('panel-tracker')?.classList.contains('active');
+  if (trackerVisible && expSettings.watch !== false && Date.now() - _expTickAt >= 3000) {
+    _expTickAt = Date.now();
+    chrome.runtime.sendMessage({ action: 'expTick', winId: WIN_ID }).catch(() => {});
+  }
+
+  const { expStatus: status = null } = await sessionNS.get('expStatus');
+  const probedAt = status?.probedAt || 0;
+  if (probedAt === _expProbedAt) return;   // nothing new since the last render
+  _expProbedAt = probedAt;
+  expStatus = status;
+  expRender();
+}
+
+// Display-only — reads the active Test Context and re-renders. Never writes
+// to initContexts/activeInitContext; honors the same "nothing is ever pushed
+// to a mode" invariant the fill-target registry documents above.
+async function expRefreshCtx() {
+  if (!document.getElementById('exp-card')) return;
+  const ctx = await getActiveContext();
+  const key = ctx ? (ctx.ticketKey + '|' + ctx.extractedAt) : '';
+  if (key === _expCtxKey) return;
+  _expCtxKey = key;
+  expCtx = ctx;
+  expRender();
+}
+
+// ── Native variation → ticket label mapping ─────────────────────────────────
+// Reuses the forcing-param vocabulary mxComposeUrl already owns (popup.js
+// ~5522) plus Convert's _conv_eforce. Preview links get pasted through
+// redirectors and nested url= params, so this checks the parsed query AND
+// hash before falling back to a raw-string scan.
+function expExtractForcedVarId(url) {
+  if (!url) return null;
+  let u = null;
+  try { u = new URL(url); } catch (_) { /* not an absolute URL — raw scan below still works */ }
+  const haystacks = [];
+  if (u) {
+    haystacks.push(u.search);
+    if (u.hash) haystacks.push(u.hash);
+  }
+  haystacks.push(String(url));
+
+  for (const s of haystacks) {
+    let m = /[?&#]optimizely_x=([^&#]+)/.exec(s);
+    if (m) return { varId: decodeURIComponent(m[1]), expId: null };
+    m = /[?&#]_conv_eforce=([^&#]+)/.exec(s);
+    if (m) {
+      const raw = decodeURIComponent(m[1]);
+      const dot = raw.lastIndexOf('.');
+      if (dot > -1) return { varId: raw.slice(dot + 1), expId: raw.slice(0, dot) };
+    }
+  }
+  return null;
+}
+
+// Layer A of the mapping strategy: nativeVarId -> { label, source } built
+// from ctx.previewLinks. Pure. Returns notes for any preview link whose
+// forced experiment id doesn't match the ticket's — that's evidence worth
+// surfacing, not silently dropping.
+function expBuildLabelMap(ctx) {
+  const map = {};
+  const notes = [];
+  for (const link of (ctx.previewLinks || [])) {
+    const forced = expExtractForcedVarId(link?.url);
+    if (!forced || !forced.varId) continue;
+    if (forced.expId && ctx.experimentId && String(forced.expId) !== String(ctx.experimentId)) {
+      notes.push(`Preview link "${link.id}" forces experiment ${forced.expId}, not this ticket's ${ctx.experimentId}.`);
+      continue;
+    }
+    map[String(forced.varId)] = { label: link.id, source: 'preview-link' };
+  }
+  return { map, notes };
+}
+
+// Resolves one native variation id to a ticket v0/v1 label. Layer A (preview
+// link) wins outright; Layer B (ordinal position in the platform's own
+// variation order) applies ONLY when the platform and ticket both list the
+// same number of variations — otherwise this returns null rather than guess,
+// which is what puts the card into BUCKETED_UNMAPPED instead of a confident
+// wrong answer. Pure.
+function expLabelFor(nativeVarId, row, ctx, labelMap) {
+  const fromLink = labelMap[String(nativeVarId)];
+  if (fromLink) {
+    const variant = (ctx.variants || []).find((v) => v.id === fromLink.label);
+    return { label: fromLink.label, source: 'preview-link', rawDescription: variant?.rawDescription || null };
+  }
+
+  const variations = row?.variations || [];
+  const variants = (ctx.variants || []).slice().sort((a, b) => {
+    const na = parseInt(String(a.id).replace(/\D/g, ''), 10);
+    const nb = parseInt(String(b.id).replace(/\D/g, ''), 10);
+    return (Number.isFinite(na) ? na : 0) - (Number.isFinite(nb) ? nb : 0);
+  });
+  if (variations.length && variations.length === variants.length) {
+    const idx = variations.findIndex((v) => String(v.id) === String(nativeVarId));
+    if (idx > -1) {
+      const variant = variants[idx];
+      return { label: variant.id, source: 'ordinal', rawDescription: variant.rawDescription || null };
+    }
+  }
+  return null;
+}
+
+// ── The state machine ────────────────────────────────────────────────────────
+// Pure — no DOM, no storage, no async — which is what makes a chain this long
+// reviewable (and testable via JXA, see the plan's verification section).
+// Ordered guard chain, first match wins; `others` and the platform-mismatch
+// note are evaluated ORTHOGONALLY on top of the terminal state rather than
+// competing with it, so e.g. a real collision with a second live experiment
+// is never swallowed just because the expected one also resolved cleanly.
+function expEvaluate(status, ctx, settings) {
+  const base = { expected: null, actual: null, others: [], notes: [], staleMs: null };
+
+  if (!ctx) {
+    return { ...base, state: 'NO_CONTEXT', severity: 'idle',
+      headline: 'No active ticket context',
+      sub: 'Open the Initialize tab and set an active context to watch its experiment.' };
+  }
+
+  const expected = {
+    ticketKey: ctx.ticketKey || null,
+    platform: ctx.platform || null,
+    experimentId: ctx.experimentId ? String(ctx.experimentId).trim() : null,
+  };
+  base.expected = expected;
+
+  if (!ctx.reviewed) {
+    return { ...base, state: 'CONTEXT_UNREVIEWED', severity: 'warn',
+      headline: 'Ticket context not yet reviewed',
+      sub: `${expected.ticketKey || 'This context'} hasn't been reviewed on the Initialize tab yet.` };
+  }
+  if (!expected.experimentId) {
+    return { ...base, state: 'NO_EXPERIMENT_ID', severity: 'warn',
+      headline: 'No experiment ID on this ticket',
+      sub: `The Initialize tab found no Platform Experiment ID for ${expected.ticketKey || 'this ticket'}.` };
+  }
+  if (settings.watch === false) {
+    return { ...base, state: 'WATCH_OFF', severity: 'idle',
+      headline: 'Watching is off',
+      sub: `Flip the switch above to watch this page for experiment ${expected.experimentId}.` };
+  }
+  if (!status || status.tabId == null) {
+    return { ...base, state: 'NO_TAB', severity: 'idle',
+      headline: 'No page to watch',
+      sub: 'Focus a normal http(s) tab in this window.' };
+  }
+  if (status.error === 'not-probeable') {
+    return { ...base, state: 'TAB_NOT_PROBEABLE', severity: 'idle',
+      headline: "This tab can't be probed",
+      sub: 'chrome://, the PDF viewer, and other extension pages can’t be read — switch to a normal http(s) page.' };
+  }
+  if (!status.probe) {
+    return { ...base, state: 'NEVER_PROBED', severity: 'idle',
+      headline: 'Waiting for a probe…',
+      sub: status.error ? `Last attempt failed: ${status.error}` : '' };
+  }
+
+  const probe = status.probe;
+  base.staleMs = status.probedAt ? Math.max(0, Date.now() - status.probedAt) : null;
+
+  if (ctx.platform && probe.platform && probe.platform !== 'both') {
+    const wants = String(ctx.platform).toLowerCase();
+    if (wants && wants !== probe.platform) {
+      const running = probe.platform === 'optimizely' ? 'Optimizely' : 'Convert';
+      base.notes.push(`Ticket says ${ctx.platform}, but this page is running ${running}.`);
+    }
+  }
+
+  const anyDetected = !!(probe.detected?.optimizely || probe.detected?.convert);
+  const hasForcedParam = !!(probe.forced?.optimizely_x || probe.forced?.conv_eforce);
+
+  if (!anyDetected && !probe.detected?.convertScript) {
+    if (hasForcedParam) {
+      return { ...base, state: 'FORCED_PARAM_ONLY', severity: 'err',
+        headline: 'URL forces a variation, but no snippet is on this page',
+        sub: 'The experiment is not running here — this page never loaded Optimizely or Convert.' };
+    }
+    return { ...base, state: 'SNIPPET_NOT_DETECTED', severity: 'err',
+      headline: 'No experimentation snippet detected',
+      sub: 'Neither Optimizely nor Convert appears to be running on this page.' };
+  }
+  if (probe.detected?.convertScript && !probe.detected?.convert) {
+    return { ...base, state: 'SNIPPET_INITIALIZING', severity: 'idle',
+      headline: 'Snippet loading…',
+      sub: 'Convert is on the page but hasn’t initialized yet — try Refresh in a moment.' };
+  }
+
+  const row = (probe.experiments || []).find((e) => String(e.id) === expected.experimentId) || null;
+  // Every OTHER experiment the probe found running on this page — not just
+  // ones this visitor happens to be bucketed into. A QA needs to know about
+  // a live collision even when they were excluded from it (audience,
+  // holdback, mutual exclusion) just as much as when they were bucketed.
+  base.others = (probe.experiments || [])
+    .filter((e) => e.active && String(e.id) !== expected.experimentId)
+    .map((e) => ({ id: e.id, name: e.name, bucketed: e.bucketed, variationId: e.variationId, variationName: e.variationName }));
+
+  if (!row) {
+    if (probe.catalogComplete) {
+      return { ...base, state: 'EXPERIMENT_NOT_IN_SNIPPET', severity: 'err',
+        headline: `Experiment ${expected.experimentId} not found on this page`,
+        sub: 'The snippet’s full catalog was read and this id isn’t in it — wrong site/environment, or unpublished.' };
+    }
+    return { ...base, state: 'EXPERIMENT_UNKNOWN', severity: 'warn',
+      headline: `Can't confirm experiment ${expected.experimentId}`,
+      sub: 'The platform’s catalog couldn’t be fully read, so its absence here doesn’t prove it isn’t running.' };
+  }
+
+  if (row.known && !row.active && !row.bucketed) {
+    return { ...base, state: 'EXPERIMENT_NOT_RUNNING', severity: 'warn',
+      headline: `${row.name || expected.experimentId} is not running`,
+      sub: row.reason ? `Platform reason: ${row.reason}` : 'The experiment exists but isn’t active on this page.' };
+  }
+  if (row.active && !row.bucketed) {
+    return { ...base, state: 'NOT_BUCKETED', severity: 'warn',
+      headline: `${row.name || expected.experimentId} is running, but this visitor isn't bucketed`,
+      sub: row.reason ? `Reason: ${row.reason}` : 'Excluded by audience, holdback, or traffic allocation.' };
+  }
+
+  // Bucketed — resolve the native variation id back to the ticket's v0/v1.
+  const { map: labelMap, notes: mapNotes } = expBuildLabelMap(ctx);
+  base.notes = base.notes.concat(mapNotes);
+  const mapped = expLabelFor(row.variationId, row, ctx, labelMap);
+  const actual = {
+    experimentId: row.id, experimentName: row.name || null,
+    variationId: row.variationId, variationName: row.variationName || null,
+    label: mapped?.label || null, labelSource: mapped?.source || null,
+    rawDescription: mapped?.rawDescription || null,
+  };
+  base.actual = actual;
+
+  const forcedVarId = probe.forced?.optimizely_x
+    || (probe.forced?.conv_eforce ? probe.forced.conv_eforce.slice(probe.forced.conv_eforce.lastIndexOf('.') + 1) : null);
+  if (forcedVarId && String(forcedVarId) !== String(row.variationId)) {
+    const forcedLabel = expLabelFor(forcedVarId, row, ctx, labelMap);
+    return { ...base, state: 'EXPECTED_MISMATCH', severity: 'err',
+      headline: `Forced ${forcedLabel?.label || forcedVarId} but showing ${actual.label || actual.variationId}`,
+      sub: 'The URL asked for a specific variation and the page is showing a different one.' };
+  }
+
+  if (!mapped) {
+    return { ...base, state: 'BUCKETED_UNMAPPED', severity: 'warn',
+      headline: `Bucketed into ${row.variationName || row.variationId}`,
+      sub: 'Couldn’t match this native variation id back to the ticket’s v0/v1 labels.' };
+  }
+
+  return { ...base, state: 'BUCKETED', severity: 'ok',
+    headline: `Bucketed into ${mapped.label} — ${row.variationName || row.variationId}`,
+    sub: `${probe.platform === 'convert' ? 'Convert' : 'Optimizely'} · exp ${row.id} · var ${row.variationId}` };
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────
+// DOM writes only. All text goes through textContent (auto-escaping) except
+// the notes list, which is the one innerHTML rebuild — esc()'d per line and
+// holding no focusable inputs, the same split mtRenderCounts/mtRenderRows use.
+function expRender() {
+  const card = document.getElementById('exp-card');
+  if (!card) return;
+  const v = expEvaluate(expStatus, expCtx, expSettings);
+
+  card.classList.remove('exp-ok', 'exp-warn', 'exp-err', 'exp-idle');
+  card.classList.add('exp-' + v.severity);
+
+  const dot = document.getElementById('exp-dot');
+  if (dot) dot.style.display = v.severity === 'ok' ? '' : 'none';
+
+  const headline = document.getElementById('exp-headline');
+  if (headline) headline.textContent = v.headline;
+  const sub = document.getElementById('exp-sub');
+  if (sub) sub.textContent = v.sub || '';
+
+  const expectedV = document.getElementById('exp-expected-v');
+  if (expectedV) {
+    const e = v.expected;
+    expectedV.textContent = e ? ([e.ticketKey, e.platform, e.experimentId].filter(Boolean).join(' · ') || '—') : '—';
+  }
+
+  const actualV = document.getElementById('exp-actual-v');
+  if (actualV) {
+    const a = v.actual;
+    actualV.textContent = a ? [a.label, a.variationName || a.variationId || '—'].filter(Boolean).join(' — ') : '—';
+  }
+  const actualSrc = document.getElementById('exp-actual-src');
+  if (actualSrc) {
+    const source = v.actual?.labelSource;
+    if (source) {
+      actualSrc.style.display = '';
+      actualSrc.textContent = source === 'preview-link' ? 'via preview link' : 'via order (unverified)';
+      actualSrc.classList.toggle('exp-src-weak', source === 'ordinal');
+    } else {
+      actualSrc.style.display = 'none';
+    }
+  }
+
+  const desc = document.getElementById('exp-desc');
+  if (desc) {
+    if (v.actual?.rawDescription) { desc.style.display = ''; desc.textContent = v.actual.rawDescription; }
+    else { desc.style.display = 'none'; desc.textContent = ''; }
+  }
+
+  const notesHost = document.getElementById('exp-notes');
+  if (notesHost) {
+    const notes = (v.notes || []).slice();
+    // One line per other live experiment — bucketed ones name the variation;
+    // ones this visitor was excluded from say so, since "running but I'm not
+    // in it" is exactly as important a collision to know about as being in it.
+    for (const o of (v.others || [])) {
+      const label = o.name || o.id;
+      notes.push(o.bucketed
+        ? `Also running: ${label} → ${o.variationName || o.variationId}`
+        : `Also running: ${label} (not bucketed)`);
+    }
+    notesHost.innerHTML = notes.map((n) => `<div class="exp-note">${esc(n)}</div>`).join('');
+  }
+
+  const staleEl = document.getElementById('exp-stale');
+  if (staleEl) {
+    if (v.staleMs != null && v.staleMs > 8000) {
+      staleEl.style.display = '';
+      staleEl.textContent = `As of ${Math.round(v.staleMs / 1000)}s ago — waiting for a fresh read.`;
+    } else {
+      staleEl.style.display = 'none';
+      staleEl.textContent = '';
+    }
   }
 }
 
