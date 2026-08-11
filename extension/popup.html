@@ -304,6 +304,14 @@
   .exp-src.exp-src-weak{color:var(--warn);background:rgba(204,167,0,.14)}
   #exp-notes{display:flex;flex-direction:column;gap:3px}
   .exp-note{font-size:10px;line-height:1.45;color:var(--warn)}
+  .exp-rel-wrap{margin-top:4px}
+  .exp-rel-hdr{font-size:9px;color:var(--fg3);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+  .exp-rel-row{display:flex;justify-content:space-between;gap:6px;font-size:10px;line-height:1.5}
+  .exp-rel-lbl{color:var(--fg2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .exp-rel-v{flex-shrink:0}
+  .exp-rel-row.exp-rel-hit  .exp-rel-v{color:var(--ok)}
+  .exp-rel-row.exp-rel-warn .exp-rel-v{color:var(--warn)}
+  .exp-rel-row.exp-rel-miss .exp-rel-v{color:var(--fg3)}
   #exp-desc{font-size:10px;line-height:1.5;color:var(--fg2);background:var(--surface);
     border:1px solid var(--stroke);border-radius:4px;padding:5px 7px;
     max-height:76px;overflow-y:auto;white-space:pre-wrap}
@@ -643,6 +651,14 @@
         <span class="exp-src" id="exp-actual-src" style="display:none"></span>
       </div>
       <div id="exp-notes"></div>
+      <div id="exp-softcoded-wrap" class="exp-rel-wrap" style="display:none">
+        <div class="exp-rel-hdr">Softcoded</div>
+        <div id="exp-softcoded"></div>
+      </div>
+      <div id="exp-concurrent-wrap" class="exp-rel-wrap" style="display:none">
+        <div class="exp-rel-hdr">Concurrent</div>
+        <div id="exp-concurrent"></div>
+      </div>
       <div id="exp-desc" style="display:none"></div>
       <div id="exp-stale" style="display:none"></div>
     </div>

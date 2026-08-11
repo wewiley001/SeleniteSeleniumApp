@@ -4364,6 +4364,28 @@ function extractTestContext(issue, origin, ticketKeyFromPage) {
   }));
   if (specNodes && !variants.length) warnings.push('"Test Specifications" section found, but no v0/v1/… markers inside it.');
 
+  // Step 3b/3c — Softcoded Tests / Concurrent Tests. Deterministic like
+  // variants above — never AI, never fetched. `{prefix:true}` because the
+  // real heading text may be just the short label or may swallow the
+  // trailing instructional sentence ("Softcoded Tests: Generate preview
+  // links that include..."); unknown without seeing raw ADF from a real
+  // ticket, so both are tolerated. No warning when the heading is simply
+  // absent — unlike Test Specifications, these are a newer, optional
+  // template addition and most existing tickets won't have them.
+  const softcodedNodes = adf ? adfSectionNodes(adf, 'Softcoded Tests', { prefix: true }) : null;
+  const softcodedLines = adfSectionLines(softcodedNodes || []);
+  const softcodedTests = isNoneSection(softcodedLines) ? [] : parseRelatedTestBullets(softcodedLines);
+  if (softcodedNodes && !softcodedTests.length && !isNoneSection(softcodedLines)) {
+    warnings.push('"Softcoded Tests" section found, but no linked tests could be parsed from it.');
+  }
+
+  const concurrentNodes = adf ? adfSectionNodes(adf, 'Concurrent Tests', { prefix: true }) : null;
+  const concurrentLines = adfSectionLines(concurrentNodes || []);
+  const concurrentTests = isNoneSection(concurrentLines) ? [] : parseRelatedTestBullets(concurrentLines);
+  if (concurrentNodes && !concurrentTests.length && !isNoneSection(concurrentLines)) {
+    warnings.push('"Concurrent Tests" section found, but no linked tests could be parsed from it.');
+  }
+
   // Step 4 — assemble and hold for review. Nothing touches storage yet.
   // platform/previewLinks/itwLink/goals start empty and are filled entirely
   // by mergeAiFieldsIntoDraft — the cross-check between the final
@@ -4372,6 +4394,7 @@ function extractTestContext(issue, origin, ticketKeyFromPage) {
   _initDraft = {
     ticketKey, ticketUrl, summary, platform: null, experimentId,
     variants, previewLinks: [], itwLink: null, goals: [], qaTestPlanUrl,
+    softcodedTests, concurrentTests,
     extractedAt: new Date().toISOString(),
     reviewed: false,
   };
@@ -4395,15 +4418,20 @@ function adfText(node) {
 // matches (case-insensitive, trimmed) anywhere in the tree, and return its
 // sibling nodes up to the next heading of equal-or-higher level. Returns null
 // when the heading isn't found — callers distinguish "section missing" (null)
-// from "section empty" ([]).
-function adfSectionNodes(doc, headingText) {
+// from "section empty" ([]). `prefix: true` matches a heading that STARTS WITH
+// headingText instead of requiring an exact match — for sections whose real
+// heading text may swallow a trailing instructional sentence (e.g. "Softcoded
+// Tests: Generate preview links that include...").
+function adfSectionNodes(doc, headingText, { prefix = false } = {}) {
   const want = headingText.trim().toLowerCase();
   let result = null;
   (function walk(nodes) {
     if (!Array.isArray(nodes) || result) return;
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
-      if (n?.type === 'heading' && adfText(n).trim().toLowerCase() === want) {
+      const headingLower = n?.type === 'heading' ? adfText(n).trim().toLowerCase() : '';
+      const matches = prefix ? headingLower.startsWith(want) : headingLower === want;
+      if (n?.type === 'heading' && matches) {
         const level = n.attrs?.level ?? 1;
         const out = [];
         for (let j = i + 1; j < nodes.length; j++) {
@@ -4479,6 +4507,36 @@ function splitVariantBlocks(lines) {
     }
   }
   return blocks;
+}
+
+// Related-test link parser for the "Softcoded Tests" / "Concurrent Tests"
+// sections. Each bullet is one line ({text, urls} — same shape
+// splitVariantBlocks consumes above): link text carries a ticket key + human
+// label, the href optionally repeats the key (Iris test pages are shaped
+// /tests/<KEY>). The href is only ever used here, to help recover the ticket
+// key — nothing is fetched, and nothing beyond {ticketKey, label} is kept:
+// the label text alone is what Experiment Status matches against live
+// experiment names, so the link itself is noise once parsing is done.
+function parseRelatedTestBullets(lines) {
+  const entries = [];
+  for (const line of lines) {
+    const text = (line.text || '').trim();
+    if (!text) continue;
+    const url = line.urls?.[0] || null;
+    const fromUrl  = url ? /\/tests\/([A-Za-z][A-Za-z0-9]*-\d+)/i.exec(url) : null;
+    const fromText = /^([A-Za-z][A-Za-z0-9]*-\d+)\b/.exec(text);
+    const ticketKey = (fromUrl?.[1] || fromText?.[1] || '').toUpperCase() || null;
+    if (!ticketKey && !url) continue;   // not a recognizable related-test row
+    entries.push({ ticketKey, label: text });
+  }
+  return entries;
+}
+
+// The ticket template's own placeholder for "nothing here" — treated the
+// same as a section with zero parseable bullets, so a stray typo can't
+// silently read as confirmed-none.
+function isNoneSection(lines) {
+  return /^none$/i.test(lines.map((l) => l.text).join(' ').trim());
 }
 
 // Flattens the whole ADF description into text with heading structure kept
@@ -4559,6 +4617,19 @@ function renderInitReview() {
     ${g.resolutionNeeded ? `<div style="font-size:10px;color:var(--warn);margin:-2px 0 4px 2px">ID not in Jira — ${d.qaTestPlanUrl ? `<a href="${q(d.qaTestPlanUrl)}" target="_blank" style="color:var(--info)">check test plan</a>` : 'check the QA test plan'}</div>` : ''}`).join('')
     : '<div style="font-size:11px;color:var(--fg3)">Not found in ticket — no goals extracted.</div>';
 
+  // Softcoded Tests / Concurrent Tests — same flat row shape for both. Just
+  // ticketKey + label — that title text is all Experiment Status matches
+  // against live experiment names; the link itself isn't kept.
+  const relatedRows = (list, key) => list.length ? list.map((r, i) => `
+    <div class="ab-sel-row" style="flex-wrap:wrap">
+      <input type="text" data-init="${key}.${i}.ticketKey" value="${q(r.ticketKey || '')}" placeholder="Ticket" style="max-width:80px;flex:0 1 auto">
+      <input type="text" data-init="${key}.${i}.label" value="${q(r.label || '')}" placeholder="Title" style="flex:2 1 200px">
+      <button class="btn-icon" data-init-rm="${key}.${i}" title="Remove" style="color:var(--err)">✕</button>
+    </div>`).join('')
+    : '<div style="font-size:11px;color:var(--fg3)">None found in ticket.</div>';
+  const softcodedRows  = relatedRows(d.softcodedTests, 'softcodedTests');
+  const concurrentRows = relatedRows(d.concurrentTests, 'concurrentTests');
+
   host.innerHTML = `
   <div class="card">
     <div class="card-title" style="margin-bottom:1px">Review — ${esc(d.ticketKey)}</div>
@@ -4603,6 +4674,14 @@ function renderInitReview() {
     <label class="cap">Goals — adding one tracks it immediately but flags it "needs review"; it stays out of Track Metric until you confirm it</label>
     <div style="display:flex;flex-direction:column;gap:4px">${goalRows}</div>
     <button class="btn sm" data-init-add="goals" style="margin:5px 0 10px">+ Add Goal</button>
+
+    <label class="cap">Softcoded Tests — forced 100% dependencies; tracked live in Experiment Status, never auto-forced into generated links</label>
+    <div style="display:flex;flex-direction:column;gap:4px">${softcodedRows}</div>
+    <button class="btn sm" data-init-add="softcodedTests" style="margin:5px 0 10px">+ Add Softcoded Test</button>
+
+    <label class="cap">Concurrent Tests — expected to be running alongside this one</label>
+    <div style="display:flex;flex-direction:column;gap:4px">${concurrentRows}</div>
+    <button class="btn sm" data-init-add="concurrentTests" style="margin:5px 0 10px">+ Add Concurrent Test</button>
 
     <div class="arg-row" style="margin-top:8px">
       <span class="arg-lbl">Save as</span>
@@ -4659,6 +4738,8 @@ function onInitReviewClick(e) {
     if (list === 'variants')     _initDraft.variants.push({ id: 'v' + _initDraft.variants.length, isControl: false, rawDescription: '' });
     if (list === 'previewLinks') _initDraft.previewLinks.push({ id: 'v' + _initDraft.previewLinks.length, url: '' });
     if (list === 'goals')        _initDraft.goals.push({ text: '', isNew: false, convertMetricId: null, resolutionNeeded: false });
+    if (list === 'softcodedTests')  _initDraft.softcodedTests.push({ ticketKey: '', label: '' });
+    if (list === 'concurrentTests') _initDraft.concurrentTests.push({ ticketKey: '', label: '' });
     renderInitReview();
   }
 }
@@ -4830,6 +4911,14 @@ async function commitInitContext() {
       resolutionNeeded: d.platform === 'Convert' && !hasId,
     };
   }).filter(g => g.text);
+  const normalizeRelated = (list) => (list || [])
+    .map(r => ({
+      ticketKey: (r.ticketKey || '').trim().toUpperCase() || null,
+      label: (r.label || '').trim(),
+    }))
+    .filter(r => r.ticketKey || r.label);
+  d.softcodedTests  = normalizeRelated(d.softcodedTests);
+  d.concurrentTests = normalizeRelated(d.concurrentTests);
 
   const ctx = { ...d, summary: (d.summary || '').trim(), experimentId: (d.experimentId || '').trim() || null, qaTestPlanUrl: (d.qaTestPlanUrl || '').trim() || null, reviewed: true };
 
@@ -6759,6 +6848,59 @@ function expLabelFor(nativeVarId, row, ctx, labelMap) {
   return null;
 }
 
+// ── Related-test name matching ──────────────────────────────────────────────
+// Softcoded/Concurrent tests carry no native experiment id — only a
+// ticket-authored label ("ARIC-471 (All Users)(PDP) Buy Now (Mobile)"). Per
+// the ticket template's own convention the platform's experiment name
+// usually resembles that label, so identification is name matching against
+// the probe's live catalog — never a page fetch. mtNormalize (metric-match.js)
+// is safe to reuse on prose; mtTokens is NOT — its MT_DOMAIN_STOP set is
+// console-log-specific and would silently drop a legitimate word like
+// "tracking" from a real experiment name, so tokenizing is done locally.
+function expTokenize(s) {
+  return mtNormalize(s).split(' ').filter((t) => t.length >= 3 || /^\d+$/.test(t));
+}
+function expStripLabelNoise(label) {
+  return String(label || '')
+    .replace(/^[A-Za-z][A-Za-z0-9]*-\d+\s*/, '')   // leading ticket key
+    .replace(/\([^)]*\)/g, ' ')                     // (All Users)(PDP) audience/page tags
+    .trim();
+}
+// Best-match-above-threshold, never a guess below it — an unmatched entry
+// reports "not detected" rather than a low-confidence wrong answer.
+function expMatchByName(label, experiments, { minOverlap = 0.5 } = {}) {
+  const core = expStripLabelNoise(label) || label;
+  const want = new Set(expTokenize(core));
+  if (!want.size) return null;
+  let best = null;
+  for (const e of (experiments || [])) {
+    if (!e?.name) continue;
+    const have = new Set(expTokenize(e.name));
+    if (!have.size) continue;
+    let hit = 0;
+    for (const t of want) if (have.has(t)) hit++;
+    const score = hit / want.size;
+    if (score >= minOverlap && (!best || score > best.score)) best = { row: e, score };
+  }
+  return best;
+}
+
+// Cross-references ctx.softcodedTests/concurrentTests against the probe's
+// live experiment catalog. Neutral/informational only — matches the
+// "list neutrally, no pass/fail" treatment for both, since neither carries a
+// forcing param anymore that could be right or wrong about.
+function expEvaluateRelated(list, probe) {
+  return (list || []).map((r) => {
+    const match = probe ? expMatchByName(r.label, probe.experiments) : null;
+    if (!match) return { ...r, found: false };
+    const row = match.row;
+    return {
+      ...r, found: true, experimentName: row.name, active: row.active,
+      bucketed: row.bucketed, variationId: row.variationId, variationName: row.variationName,
+    };
+  });
+}
+
 // ── The state machine ────────────────────────────────────────────────────────
 // Pure — no DOM, no storage, no async — which is what makes a chain this long
 // reviewable (and testable via JXA, see the plan's verification section).
@@ -6767,7 +6909,7 @@ function expLabelFor(nativeVarId, row, ctx, labelMap) {
 // competing with it, so e.g. a real collision with a second live experiment
 // is never swallowed just because the expected one also resolved cleanly.
 function expEvaluate(status, ctx, settings) {
-  const base = { expected: null, actual: null, others: [], notes: [], staleMs: null };
+  const base = { expected: null, actual: null, others: [], notes: [], staleMs: null, softcoded: [], concurrent: [] };
 
   if (!ctx) {
     return { ...base, state: 'NO_CONTEXT', severity: 'idle',
@@ -6852,6 +6994,12 @@ function expEvaluate(status, ctx, settings) {
     .filter((e) => e.active && String(e.id) !== expected.experimentId)
     .map((e) => ({ id: e.id, name: e.name, bucketed: e.bucketed, variationId: e.variationId, variationName: e.variationName }));
 
+  // Ticket-declared dependencies (Softcoded/Concurrent Tests) — cross-
+  // referenced by name against the same live catalog, independent of
+  // whether the primary experiment itself resolved cleanly below.
+  base.softcoded  = expEvaluateRelated(ctx.softcodedTests, probe);
+  base.concurrent = expEvaluateRelated(ctx.concurrentTests, probe);
+
   if (!row) {
     if (probe.catalogComplete) {
       return { ...base, state: 'EXPERIMENT_NOT_IN_SNIPPET', severity: 'err',
@@ -6910,6 +7058,28 @@ function expEvaluate(status, ctx, settings) {
 // DOM writes only. All text goes through textContent (auto-escaping) except
 // the notes list, which is the one innerHTML rebuild — esc()'d per line and
 // holding no focusable inputs, the same split mtRenderCounts/mtRenderRows use.
+// Renders one ticket-declared dependency list (Softcoded or Concurrent) —
+// the header stays outside this function's reach (static markup) so only the
+// rows div is ever rebuilt.
+function expRenderRelatedList(wrapId, hostId, list) {
+  const wrap = document.getElementById(wrapId);
+  const host = document.getElementById(hostId);
+  if (!wrap || !host) return;
+  if (!list || !list.length) { wrap.style.display = 'none'; host.innerHTML = ''; return; }
+  wrap.style.display = '';
+  host.innerHTML = list.map((r) => {
+    const status = !r.found ? 'not detected on page'
+      : r.bucketed ? (r.variationName || r.variationId)
+      : r.active ? 'running, not bucketed'
+      : 'not active';
+    const cls = !r.found ? 'exp-rel-miss' : r.bucketed ? 'exp-rel-hit' : 'exp-rel-warn';
+    return `<div class="exp-rel-row ${cls}">
+      <span class="exp-rel-lbl">${esc(r.ticketKey || r.label || '—')}</span>
+      <span class="exp-rel-v">${esc(status)}</span>
+    </div>`;
+  }).join('');
+}
+
 function expRender() {
   const card = document.getElementById('exp-card');
   if (!card) return;
@@ -6980,6 +7150,9 @@ function expRender() {
       staleEl.textContent = '';
     }
   }
+
+  expRenderRelatedList('exp-softcoded-wrap', 'exp-softcoded', v.softcoded);
+  expRenderRelatedList('exp-concurrent-wrap', 'exp-concurrent', v.concurrent);
 }
 
 // ── Row mutations ────────────────────────────────────────────────────────
