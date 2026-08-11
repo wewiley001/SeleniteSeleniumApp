@@ -4984,7 +4984,7 @@ async function renderActiveContext() {
     metrics.push({
       id, label: g.text, pattern: g.text, mode: 'smart',
       convertMetricId: g.convertMetricId || null,
-      enabled: true, source: 'goal', reviewed: false, createdAt: Date.now(),
+      enabled: !!g.isNew, source: 'goal', reviewed: false, createdAt: Date.now(),
     });
     mtSyncAfterListChange();
     btn.textContent = 'Added ✓';
@@ -5311,7 +5311,8 @@ const FILL_TARGETS = [
       const gs = (ctx.goals || []).filter(g => (g.text || '').trim());
       const withId = gs.filter(g => g.convertMetricId).length;
       const tbd    = gs.filter(g => g.resolutionNeeded).length;
-      return `${gs.length} goal(s) → tracked, flagged "needs review"`
+      const isNewCount = gs.filter(g => g.isNew).length;
+      return `${gs.length} goal(s) → added, flagged "needs review" (${isNewCount} new → active by default, ${gs.length - isNewCount} off)`
         + (withId ? ` · ${withId} with a Convert metric id` : '')
         + (tbd    ? ` · ${tbd} with an unresolved id`       : '')
         + ' · not assertable by Track Metric until confirmed';
@@ -5355,7 +5356,7 @@ const FILL_TARGETS = [
         metrics.push({
           id, label: text, pattern: text, mode: 'smart',
           convertMetricId: g.convertMetricId || null,
-          enabled: true, source: 'goal', reviewed: false, createdAt: Date.now(),
+          enabled: !!g.isNew, source: 'goal', reviewed: false, createdAt: Date.now(),
         });
       }
       mtSyncAfterListChange();
