@@ -294,6 +294,11 @@ function showTab(name) {
   // The Tracker's rows may have been edited from another window since the
   // last visit — re-render on entry.
   if (name === 'tracker') { mtRenderRows(); mtRenderCounts(); mtSyncStatus(); expRefreshCtx(); expSync(); }
+
+  // A Visual Diff run that died mid-pass (panel closed, worker evicted)
+  // should surface its resume banner on return, not just on panel load —
+  // fire-and-forget since showTab itself is synchronous.
+  if (name === 'abtest') checkForResumableVisualDiff();
 }
 
 // ── Test Agent ───────────────────────────────────────────────────────────────
@@ -307,8 +312,27 @@ function taAgenticTestingEnabled() {
 
 const TA_MODES = {
   '2': {
-    label: 'A/B Variant Comparison', bodyId: 'tm2-body', homeParentId: 'ta-mode-homes',
-    run: () => runAbComparison({ agenticTesting: taAgenticTestingEnabled() }),
+    label: 'A/B Variant Comparison',
+    // No bodyId/homeParentId — its settings card lives permanently in its
+    // own tab (#panel-abtest) now, not parked here for reparenting. A DOM
+    // node can't be in two places, so this renders a pointer instead of the
+    // real settings — same shape Funnel Crawl has always used (it has never
+    // had a parked body either). run/isConfigured/getData are unchanged, so
+    // "Also Run" batching and the combined report still work exactly as before.
+    renderSlot: (slot) => {
+      slot.innerHTML = `
+        <div class="card">
+          <div class="card-title">A/B Variant Comparison</div>
+          <div style="font-size:11px;color:var(--fg2);margin-bottom:8px">Settings and results live in the A/B tab now. Running from here uses whatever is configured there, and the findings still land in this combined report.</div>
+          <button class="btn sm" data-ta-open-abtest type="button">Open the A/B tab</button>
+        </div>`;
+      slot.querySelector('[data-ta-open-abtest]').addEventListener('click', () => showTab('abtest'));
+    },
+    // fromTestAgent: true — runTestAgent() opens its own single combined
+    // report once the whole queued sequence finishes (getData() below feeds
+    // rptAbSection there); this run must not ALSO pop its own report tab, or
+    // queuing A/B in Test Agent would open two tabs for one run.
+    run: () => runAbComparison({ agenticTesting: taAgenticTestingEnabled(), fromTestAgent: true }),
     isConfigured: () => (abState ? abState.targets.map(t => abComposeUrl(t)).filter(Boolean) : []).length >= 2,
     getData: () => _abLastRun,
   },
@@ -465,7 +489,12 @@ function taShowPrimary() {
     syncFunnelRunEnabled();
   } else if (TA_MODES[val]) {
     slot.innerHTML = '';
-    slot.appendChild(document.getElementById(TA_MODES[val].bodyId));
+    const mode = TA_MODES[val];
+    // bodyId modes (WCAG/CVA/Perf) reparent their settings in; A/B has no
+    // bodyId anymore (see TA_MODES['2']'s own comment) and renders a
+    // pointer instead via renderSlot.
+    if (mode.bodyId) slot.appendChild(document.getElementById(mode.bodyId));
+    else if (mode.renderSlot) mode.renderSlot(slot);
     _taActiveBody = val;
     runBtn.disabled = false;
   } else {
@@ -560,6 +589,7 @@ async function runTestAgent() {
 
 function stopTestAgent() {
   _taStopRequested = true;
+  _abVisualDiffStopRequested = true;   // runAbComparison also runs as a Test Agent mode
   chrome.runtime.sendMessage({ action: 'stop' });
 }
 
@@ -2364,7 +2394,8 @@ async function initWcagMode() {
   await renderWcagHistoryList();
 }
 
-// ── Test Agent mode: A/B Variant Comparison (#tm2-body) ───────────────────────
+// ── A/B Variant Comparison (its own tab, #ab-body — also batchable from Test
+// Agent via TA_MODES['2'], which has no bodyId of its own; see renderSlot) ──
 // Static load-and-compare mode: opens each variant target once (background owns
 // the tab lifecycle and capture), then diffs every variant against the first
 // target — the baseline, typically Control. Differences are surfaced neutrally:
@@ -2372,8 +2403,95 @@ async function initWcagMode() {
 // failures are styled as errors. This mode never reads or executes the Build
 // tab queue.
 
-let abState = null;   // { baseUrl, qaMode, settleSec, keepTabs, recordHeatmap, targets: [{label,url,override}], selectors: [] }
+let abState = null;   // { baseUrl, qaMode, settleSec, keepTabs, recordHeatmap, visualDiff, targets: [{label,url,override}], selectors: [] }
 let _abLastRun = null;   // last comparison, for the Run All & Generate Report mode
+
+// Visual Diff: Stop is shared with the Test Agent mode's own Stop button
+// (stopTestAgent), since runAbComparison also runs as a Test Agent mode —
+// unlike deterministic capture, whose stop flag lives in background.js
+// (_abStopRequested) and is never exposed here, this pass is driven entirely
+// from popup.js one variant at a time, so it needs its own client-side flag.
+let _abVisualDiffStopRequested = false;
+
+// Resolves a URL to its ticket variant ({id, isControl, rawDescription}) via
+// the ticket's forced-variant-id convention — not by trusting a target's
+// display label, which only equals the ticket's v0/v1 id when it came from
+// "Fill from ticket" (ctxVariantTargets). expExtractForcedVarId/expLabelFor
+// already do this URL -> ticket-variant resolution for the experiment-
+// results matching feature; reused here with no results row, since a row is
+// only needed for that feature's ordinal fallback. labelMap comes from
+// expBuildLabelMap(ctx), built once by the caller and reused across every URL.
+function resolveTicketVariantForUrl(ctx, labelMap, url) {
+  const forced = expExtractForcedVarId(url);
+  if (!forced || !forced.varId) return null;
+  const resolved = expLabelFor(forced.varId, null, ctx, labelMap);
+  return resolved ? (ctx.variants || []).find(v => v.id === resolved.label) || null : null;
+}
+
+// Resolves which of a set of {label,url} items (targets, before capture, or
+// captures, after) is the baseline — AND how it was decided. Shared by
+// runAbComparison (resolved BEFORE capture, so background.js knows which
+// target to double-capture for baseline subtraction) and runVisualDiffPass
+// (resolved again, post-capture, since capture can fail/skip a target).
+//
+// Ticket resolution (via the forced-variant-id convention) wins when it can.
+// When it can't — a plain, unforced Control URL is a normal way to express
+// "Control," not an edge case, since nothing requires a ticket's Control
+// preview link to carry its own optimizely_x/_conv_eforce param — fall back
+// to the FIRST item, matching what the deterministic sections
+// (diffAbCaptures/renderAbResults) already hardcode as index 0. Returns null
+// only for an empty list. `notes` carries expBuildLabelMap's own diagnostics
+// (e.g. a preview link forcing the wrong experiment id) — previously built
+// and silently discarded at both call sites.
+function resolveAbBaseline(ctx, items) {
+  if (!items.length) return null;
+  const { map: labelMap = {}, notes = [] } = ctx ? expBuildLabelMap(ctx) : {};
+  if (ctx) {
+    const idx = items.findIndex(i => resolveTicketVariantForUrl(ctx, labelMap, i.url)?.isControl);
+    if (idx > -1) return { index: idx, label: items[idx].label, source: 'ticket', notes, labelMap };
+  }
+  return { index: 0, label: items[0].label, source: 'first-target', notes, labelMap };
+}
+
+// ── Visual Diff checkpointing (chrome.storage.local) ────────────────────────
+// Root lifecycle (create/finalize/clear) lives here; background.js only ever
+// patches an existing entry (see its own patchVisualDiffCheckpoint), guarded
+// by runId so a straggling write from a superseded/aborted run can never
+// resurrect a stale entry. "Resume" can only mean skipping the Claude
+// re-call for variants already checkpointed done — every target still needs
+// a fresh capture (closing the side panel kills this very loop's state
+// regardless of where the pixel work happens, and the full-page screenshots
+// a resume would need are gone from the worker within ~30s of idle either
+// way) — real value is saved API cost/time for whatever finished before the
+// run died, not seamless continuation.
+const VD_CHECKPOINT_KEY = 'visualDiffCheckpoints';
+
+function computeVisualDiffRunSignature(ctx, targets) {
+  return `${ctx?.ticketKey || ''}::${targets.map(t => t.url).slice().sort().join('|')}`;
+}
+async function getVisualDiffCheckpoint(winId) {
+  const { [VD_CHECKPOINT_KEY]: all = {} } = await chrome.storage.local.get(VD_CHECKPOINT_KEY);
+  return all[winId] || null;
+}
+// Writes go through background.js rather than chrome.storage directly:
+// background.js patches the same blob per batch, and two contexts each doing
+// an unlocked get -> mutate -> set silently lose whichever write read first.
+// Everything that mutates VD_CHECKPOINT_KEY is serialized there
+// (vdCheckpointTx); reads stay local, since a stale read is harmless. All
+// three swallow send failures: checkpointing is a best-effort convenience,
+// and a worker that restarted mid-message must not take down the rendered
+// A/B results with it (runAbComparison's catch replaces the whole panel).
+function setVisualDiffCheckpointRoot(winId, root) {
+  return chrome.runtime.sendMessage({ action: 'vdCheckpointRoot', payload: { winId, root } }).catch(() => {});
+}
+// status 'completed' only for a run that reached its natural end — a run the
+// user stopped finalizes as 'stopped' so the resume banner still offers it.
+function finalizeVisualDiffCheckpoint(winId, runId, status = 'completed') {
+  return chrome.runtime.sendMessage({ action: 'vdCheckpointFinalize', payload: { winId, runId, status } }).catch(() => {});
+}
+function clearVisualDiffCheckpoint(winId) {
+  return chrome.runtime.sendMessage({ action: 'vdCheckpointClear', payload: { winId } }).catch(() => {});
+}
 
 // Optional per-variant interaction heatmap (opt-in, requires keepTabs) — reuses
 // the Session Replay recording/overlay engine (sessionRecordStart/Stop,
@@ -2385,6 +2503,7 @@ let _abHeatmapRecordingTabId = null;
 function abDefaultState() {
   return {
     baseUrl: '', qaMode: false, settleSec: '3', keepTabs: false, recordHeatmap: false,
+    visualDiff: false, agenticTesting: false,
     targets: [
       { label: 'Control',   url: '', override: '' },
       { label: 'Variant A', url: '', override: '' },
@@ -2416,6 +2535,14 @@ async function initAbCompare() {
     abState.recordHeatmap = e.target.checked;
     persistAbState();
   });
+  document.getElementById('ab-visual-diff').addEventListener('change', e => {
+    abState.visualDiff = e.target.checked;
+    persistAbState();
+  });
+  document.getElementById('ab-agentic-testing').addEventListener('change', e => {
+    abState.agenticTesting = e.target.checked;
+    persistAbState();
+  });
 
   document.getElementById('btn-ab-add-target').addEventListener('click', () => {
     // Default labels continue the sequence: Control, Variant A, Variant B, …
@@ -2436,9 +2563,18 @@ async function initAbCompare() {
   document.getElementById('btn-ab-delete-set').addEventListener('click', deleteAbSet);
   // "Fill from ticket" binding + refresh now lives in the fill-target
   // registry (initFillTargets), which runs later in the init chain.
-  document.getElementById('btn-run-abcompare').addEventListener('click', runAbComparison);
-  document.getElementById('btn-stop-abcompare').addEventListener('click', () =>
-    chrome.runtime.sendMessage({ action: 'stop' }));
+  // Not a bare `runAbComparison` reference — that would hand the click
+  // Event straight into opts (harmless only because every field this
+  // function reads off opts happens to be absent on an Event; a trap for
+  // the next option added to it).
+  document.getElementById('btn-run-abcompare').addEventListener('click', () => runAbComparison());
+  document.getElementById('btn-stop-abcompare').addEventListener('click', () => {
+    _abVisualDiffStopRequested = true;
+    chrome.runtime.sendMessage({ action: 'stop' });
+  });
+
+  initVisualDiffResumeBanner();
+  checkForResumableVisualDiff();
 
   renderAbTargets();
   renderAbSelectors();
@@ -2452,6 +2588,8 @@ function applyAbStateToInputs() {
   document.getElementById('ab-keep-tabs').checked = !!abState.keepTabs;
   document.getElementById('ab-record-heatmap').checked  = !!abState.recordHeatmap;
   document.getElementById('ab-record-heatmap').disabled = !abState.keepTabs;
+  document.getElementById('ab-visual-diff').checked     = !!abState.visualDiff;
+  document.getElementById('ab-agentic-testing').checked = !!abState.agenticTesting;
 }
 
 function persistAbState() {
@@ -2600,16 +2738,90 @@ function abComposeUrl(target) {
 
 let _abProgressPoller = null;
 
+// Resume banner is built here rather than in popup.html/sidepanel.html —
+// this file is loaded by both, and the two host files are hand-synced
+// duplicates that must be edited together for any markup change; a purely
+// JS-constructed, idempotent insertion avoids that risk for a small, opt-in
+// piece of UI. Inserted once, as a sibling immediately before #ab-results.
+function initVisualDiffResumeBanner() {
+  if (document.getElementById('ab-visual-diff-resume-banner')) return;
+  const resultsEl = document.getElementById('ab-results');
+  if (!resultsEl) return;
+  resultsEl.insertAdjacentHTML('beforebegin', `
+    <div id="ab-visual-diff-resume-banner" class="a11y-summary-bar" style="display:none;margin-bottom:8px">
+      <span data-vd-resume-text style="font-size:11px"></span>
+      <div class="row" style="gap:6px">
+        <button class="btn primary sm" data-vd-resume>Resume</button>
+        <button class="btn ghost sm" data-vd-discard>Discard</button>
+      </div>
+    </div>`);
+  const banner = document.getElementById('ab-visual-diff-resume-banner');
+  banner.querySelector('[data-vd-resume]').addEventListener('click', () => {
+    const cp = JSON.parse(banner.dataset.checkpoint || 'null');
+    if (cp) runAbComparison({ resumeCheckpoint: cp });
+  });
+  banner.querySelector('[data-vd-discard]').addEventListener('click', async () => {
+    await clearVisualDiffCheckpoint(WIN_ID);
+    hideVisualDiffResumeBanner();
+  });
+}
+
+function hideVisualDiffResumeBanner() {
+  const banner = document.getElementById('ab-visual-diff-resume-banner');
+  if (banner) banner.style.display = 'none';
+}
+
+// Checked on panel load. A checkpoint whose signature doesn't match the
+// CURRENT ticket context + targets is ignored outright — never silently
+// resume a run against a different page or ticket.
+async function checkForResumableVisualDiff() {
+  const banner = document.getElementById('ab-visual-diff-resume-banner');
+  if (!banner) return;
+  const cp = await getVisualDiffCheckpoint(WIN_ID);
+  if (!cp || cp.status === 'completed') { banner.style.display = 'none'; return; }
+
+  const ctx = await getActiveContext().catch(() => null);
+  const targets = abState.targets
+    .map(t => ({ label: (t.label || '').trim() || 'Variant', url: abComposeUrl(t) }))
+    .filter(t => t.url);
+  if (cp.signature !== computeVisualDiffRunSignature(ctx, targets)) { banner.style.display = 'none'; return; }
+
+  const perVariant = cp.perVariant || {};
+  const doneCount = Object.values(perVariant).filter(v => v.status === 'done').length;
+  const totalCount = Object.keys(perVariant).length;
+  banner.dataset.checkpoint = JSON.stringify(cp);
+  banner.querySelector('[data-vd-resume-text]').textContent =
+    `A previous Visual Diff run didn't finish (${new Date(cp.updatedAt).toLocaleString()}). ${doneCount} of ${totalCount || '?'} variant${totalCount !== 1 ? 's' : ''} were analyzed.`;
+  banner.style.display = '';
+}
+
+// Sets the single status line #ab-results shows for the whole run — matching
+// Test Agent's own one-line-status + report-tab pattern (runTestAgent's
+// `status.textContent = ...`) rather than the incremental live result
+// rendering this replaced. #ab-heatmap-block stays a permanent sibling so
+// renderAbHeatmapBlock (a genuinely live tool tied to open tabs — recording a
+// walk only makes sense while the variant tabs are still around, unlike a
+// static report) keeps working exactly as before.
+function setAbStatus(text, { error = false } = {}) {
+  const resultsEl = document.getElementById('ab-results');
+  if (!resultsEl) return;
+  if (!resultsEl.querySelector('#ab-status')) {
+    resultsEl.innerHTML = `<div id="ab-status" style="font-size:12px;text-align:center;padding:10px 0"></div><div id="ab-heatmap-block"></div>`;
+  }
+  const statusEl = resultsEl.querySelector('#ab-status');
+  statusEl.style.color = error ? 'var(--err)' : 'var(--fg3)';
+  statusEl.textContent = text;
+}
+
 async function runAbComparison(opts = {}) {
   const btn       = document.getElementById('btn-run-abcompare');
   const stopBtn   = document.getElementById('btn-stop-abcompare');
-  const resultsEl = document.getElementById('ab-results');
 
   const targets = abState.targets
     .map(t => ({ label: (t.label || '').trim() || 'Variant', url: abComposeUrl(t) }))
     .filter(t => t.url);
   if (targets.length < 2) {
-    resultsEl.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Define at least two variant targets with a URL (or set a base URL).</div>';
+    setAbStatus('Define at least two variant targets with a URL (or set a base URL).');
     return;
   }
 
@@ -2620,30 +2832,123 @@ async function runAbComparison(opts = {}) {
   // (their variant tabs are about to be replaced or closed).
   _abHeatmapSessions = {};
   _abHeatmapRecordingTabId = null;
+  _abVisualDiffStopRequested = false;
+  hideVisualDiffResumeBanner();
+
+  // Resolved up front, before capture, so background.js knows which target
+  // to double-capture for baseline subtraction (see resolveAbBaseline's own
+  // comment for why URL, not label, is the source of truth, and for the
+  // first-target fallback). Passed through to runVisualDiffPass below too,
+  // so it isn't re-fetched.
+  let ctx = null, controlLabel = null;
+  const resumeCheckpoint = opts.resumeCheckpoint || null;
+  if (abState.visualDiff) {
+    ctx = await getActiveContext().catch(() => null);
+    controlLabel = resolveAbBaseline(ctx, targets)?.label ?? null;
+  }
+
+  // Test Agent passes this explicitly, from its own shared checkbox — a
+  // standalone run from the A/B tab falls back to that tab's own toggle.
+  const agenticTesting = opts.agenticTesting !== undefined ? !!opts.agenticTesting : !!abState.agenticTesting;
+  // TA_MODES['2'].run sets this true: runTestAgent() opens its OWN single
+  // combined report at the end of the whole queued sequence (getData() below
+  // feeds rptAbSection there, same as always) — this run must not ALSO pop
+  // its own separate report tab, or queuing A/B in Test Agent would open two
+  // tabs for one run.
+  const fromTestAgent = !!opts.fromTestAgent;
 
   btn.disabled = true;
   btn.textContent = 'Running…';
   if (stopBtn) stopBtn.style.display = '';
-  resultsEl.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Loading variants…</div>';
+  setAbStatus('Loading variants…');
 
   _abProgressPoller = setInterval(async () => {
     const { abProgress } = await sessionNS.get('abProgress');
     if (abProgress?.running) {
       btn.textContent = `Running ${abProgress.index + 1}/${abProgress.total}…`;
-      resultsEl.innerHTML = `<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Loading ${esc(abProgress.label)} (${abProgress.index + 1} of ${abProgress.total})…</div>`;
+      setAbStatus(`Loading ${abProgress.label} (${abProgress.index + 1} of ${abProgress.total})…`);
     }
   }, 400);
 
   try {
     const res = await chrome.runtime.sendMessage({
       action: 'runVariantComparison',
-      payload: { targets, settleSeconds: abState.settleSec, keepTabs: abState.keepTabs, selectors, winId: WIN_ID, agenticTesting: !!opts.agenticTesting },
+      payload: {
+        targets, settleSeconds: abState.settleSec, keepTabs: abState.keepTabs, selectors, winId: WIN_ID,
+        agenticTesting, visualDiff: !!abState.visualDiff, controlLabel,
+      },
     });
     if (!res?.ok) throw new Error(res?.error || 'Comparison failed');
-    _abLastRun = { captures: res.results, metricsList, selectors, ts: Date.now(), agenticNote: res.agenticNote || null };
-    renderAbResults(res.results, metricsList, selectors);
+
+    // Two independent notions of "which target is Control" otherwise coexist
+    // in one report: the deterministic section below always treats index 0
+    // as the baseline, while Visual Diff resolves Control from the ticket's
+    // forced-variant-id convention. Nothing sorts Control to index 0 ("Fill
+    // from ticket" populates targets in ctx.previewLinks order), so
+    // "Baseline: X" and "Visual Diff vs Y" could name different targets.
+    // Reordering here makes the ticket-resolved Control govern both. Only
+    // applies when Visual Diff is on — that's the only time controlLabel is
+    // resolved, and with it off there's no second mechanism to disagree with.
+    let captures = res.results;
+    if (controlLabel) {
+      const ci = captures.findIndex(c => c.label === controlLabel);
+      if (ci > 0) captures = [captures[ci], ...captures.filter((_, i) => i !== ci)];
+    }
+
+    _abLastRun = { captures, metricsList, selectors, ts: Date.now(), agenticNote: res.agenticNote || null };
+    if (abState.keepTabs && abState.recordHeatmap) renderAbHeatmapBlock();
+
+    if (abState.visualDiff) setAbStatus('Comparing visuals…');
+    const visualDiffResult = await runVisualDiffPass(captures, {
+      ctx, resumeCheckpoint, onStatus: (text) => setAbStatus(text),
+    });
+    // Metadata-only mirror on _abLastRun (no crops) — this is what
+    // getData()/rptAbSection see via the Test-Agent-queued path, and what
+    // the AI summarize-results prompt reads; a crop's base64 data URL has no
+    // business in a text-summarization prompt or that combined report.
+    if (visualDiffResult) {
+      _abLastRun.visualDiff = visualDiffResult.skipped
+        ? { skipped: true, reason: visualDiffResult.reason }
+        : {
+            skipped: false, baselineLabel: visualDiffResult.baselineLabel,
+            baselineWarning: visualDiffResult.baselineWarning,
+            perVariant: (visualDiffResult.perVariant || []).map(v => ({
+              label: v.label, skipped: v.skipped, reason: v.reason, error: v.error,
+              note: v.note, structuralFindings: v.structuralFindings,
+              totalRegionCount: v.totalRegionCount, keptRegionCount: v.keptRegionCount, analyzedRegionCount: v.analyzedRegionCount,
+              stoppedEarly: v.stoppedEarly, batchCount: v.batchCount, batchError: v.batchError,
+              truncatedRegionCount: v.truncatedRegionCount, noVerdictCount: v.noVerdictCount,
+              duplicateIndexCount: v.duplicateIndexCount, truncated: v.truncated,
+              fullPageTruncated: v.fullPageTruncated, resumed: v.resumed, noSpecText: v.noSpecText,
+              regionCount: v.regions ? v.regions.length : 0,
+              // noSpecText variants carry no expected/unexpected verdicts at all — every
+              // finding for them lands in unclearCount instead, so a no-spec run's real
+              // finding count isn't silently reported as zero.
+              unexpectedCount: v.regions ? v.regions.filter(r => r.classification === 'unexpected').length : 0,
+              unclearCount: v.regions ? v.regions.filter(r => r.classification === 'unclear').length : 0,
+            })),
+          };
+    }
+
+    if (fromTestAgent) {
+      setAbStatus('Done — included in the Test Agent report.');
+    } else {
+      // Built fresh here, NOT from _abLastRun/getData(): visualDiffFull is
+      // the LIVE runVisualDiffPass result, crops included, and is only ever
+      // read by rptAbVisualDiffSection on this standalone path.
+      setAbStatus('Building report…');
+      await openReportTab({
+        ts: Date.now(), pageUrls: [],
+        modes: [{
+          mode: 2, name: 'A/B Variant Comparison', status: 'ran',
+          data: { captures, metricsList, selectors, agenticNote: res.agenticNote || null, visualDiffFull: visualDiffResult },
+        }],
+        extraHtml: '',
+      });
+      setAbStatus('Done — report opened in a new tab.');
+    }
   } catch (e) {
-    resultsEl.innerHTML = '<div style="color:var(--err);font-size:12px;padding:6px 0">Error: ' + esc(e.message) + '</div>';
+    setAbStatus('Error: ' + e.message, { error: true });
   } finally {
     clearInterval(_abProgressPoller);
     _abProgressPoller = null;
@@ -2733,134 +3038,147 @@ function diffAbCaptures(captures, metricsList, selectors) {
   return { basics, selectorRows, metricRows, consoleRows, shared, errors };
 }
 
-// ── Results rendering ─────────────────────────────────────────────────────────
-function abSection(title, deltaCount, body, { error = false, extra = '' } = {}) {
-  const dot = error ? 'a11y-fail-dot' : deltaCount ? 'a11y-info-dot' : 'a11y-pass-dot';
-  const countLabel = error
-    ? `${deltaCount} error${deltaCount !== 1 ? 's' : ''}`
-    : deltaCount ? `${deltaCount} delta${deltaCount !== 1 ? 's' : ''}` : 'Identical';
-  return `
-    <div class="a11y-row${deltaCount ? ' open' : ''}" data-suite-row>
-      <div class="a11y-row-hdr">
-        <span class="a11y-dot ${dot}"></span>
-        <span class="a11y-row-label">${esc(title)}${extra}</span>
-        <span class="a11y-count">${countLabel}</span>
-        <span class="a11y-chevron">›</span>
-      </div>
-      <div class="a11y-body">${body}</div>
-    </div>`;
-}
-
-function renderAbResults(allCaptures, metricsList, selectors) {
-  const el = document.getElementById('ab-results');
-  const captures = (allCaptures || []).filter(c => !c.skipped);
-  const skippedCount = (allCaptures || []).length - captures.length;
-  if (captures.length < 2) {
-    el.innerHTML = '<div style="color:var(--fg3);font-size:12px;text-align:center;padding:10px 0">Stopped before two variants were captured — nothing to compare.</div>';
-    return;
+// ── Visual Diff (A/B Variant Comparison, opt-in) ────────────────────────────
+// Post-pass driven from popup.js, one variant at a time via a SEPARATE
+// chrome.runtime.sendMessage per variant rather than being bundled into
+// runVariantComparison's own response. The vision call has no
+// service-worker keepalive of its own guarantee if it were part of that
+// single round trip — if a slow request outlived the worker, runAbComparison's
+// catch would discard the entire deterministic AB result, not just the
+// visual diff. Per-message also lets Stop halt cleanly between variants. All
+// pixel work (decode/diff/crop/downscale) happens in background.js via
+// OffscreenCanvas — this function only decides WHICH pair to compare and
+// WHAT ticket text to send; it holds no image data of its own.
+//
+// No longer renders anything itself — the whole A/B result (this pass
+// included) now surfaces as a single report tab once the run finishes,
+// matching Test Agent's own run → report-tab pattern, rather than the
+// previous incremental live rendering into the side panel. `onStatus`, if
+// given, receives a short human-readable line for the caller's single status
+// element (mirroring Test Agent's own `status.textContent = ...`).
+async function runVisualDiffPass(captures, { ctx, resumeCheckpoint, onStatus } = {}) {
+  if (!abState.visualDiff) return null;
+  const bail = (reason) => ({ skipped: true, reason });
+  if (!ctx?.reviewed) {
+    return bail('Visual Diff needs an active, reviewed ticket context (Initialize tab) with variant spec text.');
   }
 
-  const d = diffAbCaptures(captures, metricsList, selectors);
-  const q = esc;
-  const mark = (val, isDiff) => isDiff ? `<span class="ab-delta">${q(String(val))}</span>` : q(String(val));
+  // Resolve which capture is Control (ticket-resolved, falling back to the
+  // first capture — see resolveAbBaseline's own comment) and reuse its
+  // labelMap for resolving each OTHER capture's ticket variant from the URL
+  // it actually loaded, not from its display label — a target's label only
+  // equals the ticket's v0/v1 id when it came from "Fill from ticket"
+  // (ctxVariantTargets).
+  const baseline = resolveAbBaseline(ctx, captures);
+  const { index: baselineIdx, labelMap } = baseline;
+  const resolveVariant = (url) => resolveTicketVariantForUrl(ctx, labelMap, url);
+  const baselineWarning = baseline.source === 'first-target'
+    ? `Control could not be identified from the ticket — using the first target, "${baseline.label}", as the baseline.`
+      + (baseline.notes.length ? ' ' + baseline.notes.join(' ') : '')
+    : null;
 
-  const sections = [];
-
-  // Errors — only shown when present, always red.
-  if (d.errors.length) {
-    const count = d.errors.reduce((n, e) => n + (e.loadError ? 1 : 0) + e.jsErrors.length, 0);
-    sections.push(abSection('Errors', count, d.errors.map(e => `
-      <div class="ab-line">
-        <b>${q(e.label)}</b>
-        ${e.loadError ? `<div class="ab-cline ab-err">Load failure: ${q(e.loadError)}</div>` : ''}
-        ${e.jsErrors.map(x => `<div class="ab-cline ab-err">${q(x)}</div>`).join('')}
-      </div>`).join(''), { error: true }));
+  const base = captures[baselineIdx];
+  if (base.skipped || base.loadError || !base.fullPage || base.fullPage.error) {
+    return bail('Control failed to load or capture — nothing to compare against.');
   }
 
-  // Page basics
-  const basicsDeltas = d.basics.filter(b => b.titleDiff || b.urlDiff).length;
-  sections.push(abSection('Page Basics', basicsDeltas, d.basics.map((b, i) => `
-    <div class="ab-line${!b.titleDiff && !b.urlDiff && i > 0 ? ' ab-same-row' : ''}">
-      <b>${q(b.label)}</b>${i === 0 ? ' <span style="color:var(--fg3)">(baseline)</span>' : ''}
-      ${b.loadError ? '<span class="ab-err"> — not captured (load failed)</span>' : `
-      <div class="ab-cline">title: ${mark(b.title, b.titleDiff)}</div>
-      <div class="ab-cline">url: ${mark(b.finalUrl, b.urlDiff)}</div>`}
-    </div>`).join('')));
-
-  // Watched selectors
-  if (selectors.length) {
-    const selDeltas = d.selectorRows.filter(s => !s.allSame).length;
-    sections.push(abSection('Watched Selectors', selDeltas, d.selectorRows.map(s => `
-      <div class="ab-sel-block${s.allSame ? ' ab-same-row' : ''}">
-        <div class="ab-sel-name">${q(s.selector)}${s.allSame ? ' <span style="color:var(--fg3)">— identical in all variants</span>' : ''}</div>
-        ${s.rows.map((r, i) => {
-          if (!r) return `<div class="ab-cline"><b>${q(captures[i].label)}</b> <span class="ab-err">not captured</span></div>`;
-          const df = new Set(s.diffs[i]);
-          const facts = [
-            `exists ${mark(r.exists ? '✓' : '✗', df.has('exists'))}`,
-            `visible ${mark(r.visible ? '✓' : '✗', df.has('visible'))}`,
-            `text ${mark(JSON.stringify(r.text.slice(0, 80)), df.has('text'))}`,
-            `display:${mark(r.display, df.has('display'))}`,
-            `visibility:${mark(r.visibility, df.has('visibility'))}`,
-            `color:${mark(r.color, df.has('color'))}`,
-            `bg:${mark(r['background-color'], df.has('background-color'))}`,
-          ];
-          return `<div class="ab-cline"><b>${q(captures[i].label)}</b> — ${facts.join(' · ')}</div>`;
-        }).join('')}
-      </div>`).join('') || '<div class="ab-line ab-same-row">No watched selectors.</div>'));
+  // A resumed run reuses the checkpoint's runId (so background.js's
+  // per-batch patches keep landing in the SAME entry); a fresh run mints one
+  // and writes the root before the loop starts, so even an all-skipped run
+  // is distinguishable from "no run happened."
+  const runId = resumeCheckpoint?.runId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  if (!resumeCheckpoint) {
+    await setVisualDiffCheckpointRoot(WIN_ID, {
+      runId, signature: computeVisualDiffRunSignature(ctx, captures), ticketKey: ctx.ticketKey || null,
+      baselineLabel: base.label, startedAt: Date.now(), updatedAt: Date.now(), status: 'running', perVariant: {},
+    });
   }
 
-  // Metrics
-  if (metricsList.length) {
-    const metricDeltas = d.metricRows.filter(m => !m.allSame).length;
-    sections.push(abSection('Metrics', metricDeltas, d.metricRows.map(m => `
-      <div class="ab-line${m.allSame ? ' ab-same-row' : ''}">
-        ${m.mixedFiring ? '<span class="ab-warn">⚠ </span>' : ''}<b>${q(m.metric)}</b> —
-        ${m.counts.map((c, i) => mark(`${captures[i].label} ×${c}`, !m.allSame && c !== m.counts[0])).join(' · ')}
-        ${m.mixedFiring ? '<div class="ab-cline ab-warn">Fired in some variants but not others</div>' : ''}
-      </div>`).join('')));
+  const perVariant = [];
+  let stopped = false;
+
+  for (let i = 0; i < captures.length; i++) {
+    if (i === baselineIdx) continue;
+    const c = captures[i];
+
+    // Break, not continue: the run is over the moment Stop is pressed, and
+    // it must NOT finalize as 'completed' — that's what kept the resume
+    // banner from ever appearing after the one interruption a user controls.
+    if (_abVisualDiffStopRequested) {
+      stopped = true;
+      for (let k = i; k < captures.length; k++) {
+        if (k === baselineIdx) continue;
+        perVariant.push({ label: captures[k].label, skipped: true, reason: 'Stopped' });
+      }
+      break;
+    }
+    if (c.skipped)   { perVariant.push({ label: c.label, skipped: true, reason: 'Not captured (stopped)' }); continue; }
+    if (c.loadError) { perVariant.push({ label: c.label, skipped: true, reason: c.loadError }); continue; }
+    if (!c.fullPage || c.fullPage.error) {
+      perVariant.push({ label: c.label, skipped: true, reason: c.fullPage?.error || 'Not captured' });
+      continue;
+    }
+
+    const prior = resumeCheckpoint?.perVariant?.[c.label];
+    if (prior?.status === 'done') {
+      // Real value here: skip the Claude re-call entirely, hydrating this
+      // row from stored coordinates/findings — never crops (never
+      // persisted), so its regions render as text, not images. This is NOT
+      // seamless resume: the page above was still freshly recaptured.
+      perVariant.push({ label: c.label, resumed: true, fullPageTruncated: !!c.fullPage.truncated, ...prior });
+      continue;
+    }
+
+    // No matching ticket spec text no longer skips the variant outright — a
+    // manually-typed URL with no forcing param (this user's exact case) has
+    // no way to resolve to ticket prose either, and the pixel comparison is
+    // still useful without it. background.js is told there's no spec via
+    // ticketVariantText: null, constrains every finding to "unclear" instead
+    // of expected/unexpected (see buildVisualDiffPrompt), and stamps
+    // noSpecText onto its own response — read from there (res.noSpecText),
+    // not recomputed here, so a resumed row (which hydrates from a stored
+    // checkpoint, never from this local ticketText) still carries it.
+    const variant = resolveVariant(c.url);
+    const ticketText = (variant?.rawDescription || '').trim();
+
+    onStatus?.(`Comparing ${c.label}…`);
+
+    const res = await chrome.runtime.sendMessage({
+      action: 'compareVisualRegions',
+      payload: {
+        baselineLabel: base.label, variantLabel: c.label, ticketVariantText: ticketText || null,
+        winId: WIN_ID, runId,
+        viewportH: base.fullPage.viewportH ?? null,
+        watchedRects: (base.selectors || []).map(s => s.rect).filter(Boolean),
+      },
+    });
+
+    if (!res?.ok) {
+      perVariant.push({ label: c.label, error: res?.error || 'Comparison failed' });
+    } else {
+      perVariant.push({
+        label: c.label, regions: res.regions, note: res.note,
+        structuralFindings: res.structuralFindings,
+        totalRegionCount: res.totalRegionCount, keptRegionCount: res.keptRegionCount, analyzedRegionCount: res.analyzedRegionCount,
+        stoppedEarly: res.stoppedEarly, batchCount: res.batchCount, batchError: res.batchError,
+        truncatedRegionCount: res.truncatedRegionCount, noVerdictCount: res.noVerdictCount,
+        duplicateIndexCount: res.duplicateIndexCount, truncated: res.truncated,
+        fullPageTruncated: !!c.fullPage.truncated, noSpecText: res.noSpecText,
+      });
+    }
   }
 
-  // Console
-  const consoleDeltas = d.consoleRows.filter(v => v.added.length || v.missing.length).length;
-  sections.push(abSection('Console (tagged lines)', consoleDeltas, `
-    ${d.consoleRows.slice(1).map(v => (v.added.length || v.missing.length) ? `
-      <div class="ab-line"><b>${q(v.label)}</b> — vs baseline
-        ${v.added.map(t => `<div class="ab-cline ab-line-add">${q(t)}</div>`).join('')}
-        ${v.missing.map(t => `<div class="ab-cline ab-line-miss">${q(t)}</div>`).join('')}
-      </div>` : `<div class="ab-line ab-same-row"><b>${q(v.label)}</b> — no differences vs baseline</div>`).join('')}
-    <div class="ab-line ab-same-row">${d.shared.length} shared line${d.shared.length !== 1 ? 's' : ''} across all variants${d.shared.length ? ':' : ''}
-      ${d.shared.map(t => `<div class="ab-cline">${q(t)}</div>`).join('')}
-    </div>`));
+  // The flag is also checked here, not just via `stopped`: Stop pressed
+  // during the LAST variant's batches aborts inside background.js and the
+  // loop then ends naturally, which would otherwise finalize as 'completed'
+  // and hide the resume banner for a run the user did interrupt.
+  const wasStopped = stopped || _abVisualDiffStopRequested;
+  await finalizeVisualDiffCheckpoint(WIN_ID, runId, wasStopped ? 'stopped' : 'completed');
+  // Best-effort — frees the stored full-page PNGs in background.js promptly
+  // rather than waiting for the next run or a worker teardown to do it.
+  chrome.runtime.sendMessage({ action: 'clearVisualDiffCaptures', payload: { winId: WIN_ID } }).catch(() => {});
 
-  const totalDeltas =
-    basicsDeltas +
-    d.selectorRows.filter(s => !s.allSame).length +
-    d.metricRows.filter(m => !m.allSame).length +
-    consoleDeltas;
-  const errCount = d.errors.reduce((n, e) => n + (e.loadError ? 1 : 0) + e.jsErrors.length, 0);
-  const summaryColor = errCount ? 'var(--err)' : 'var(--info)';
-  const summaryText = (errCount ? `${errCount} error${errCount !== 1 ? 's' : ''} · ` : '')
-    + `${totalDeltas} difference${totalDeltas !== 1 ? 's' : ''} vs baseline`;
-
-  el.innerHTML = `
-    <div class="a11y-summary-bar">
-      <span>Baseline: ${q(captures[0].label)}</span>
-      <div class="row" style="gap:8px">
-        <span class="a11y-summary-total" style="color:${summaryColor}">${summaryText}</span>
-        <button class="btn ghost btn-icon" data-clear-results title="Clear results">Clear</button>
-      </div>
-    </div>
-    <div style="font-size:10px;color:var(--fg3);padding:0 2px 6px">Differences are expected in an A/B test — review whether each delta matches the intended variant change. Only errors and load failures are defects.${skippedCount ? ` · ${skippedCount} variant${skippedCount !== 1 ? 's' : ''} skipped (stopped)` : ''}${abState.keepTabs ? ' · Variant tabs were left open for inspection.' : ''}</div>
-    <div id="ab-heatmap-block"></div>
-    <div style="display:flex;flex-direction:column;gap:4px">${sections.join('')}</div>`;
-
-  el.querySelectorAll('[data-suite-row] .a11y-row-hdr').forEach(hdr => {
-    hdr.addEventListener('click', () => hdr.closest('[data-suite-row]').classList.toggle('open'));
-  });
-  el.querySelector('[data-clear-results]')?.addEventListener('click', () => { el.innerHTML = ''; });
-
-  if (abState.keepTabs && abState.recordHeatmap) renderAbHeatmapBlock();
+  return { skipped: false, baselineLabel: base.label, baselineWarning, perVariant };
 }
 
 // ── Optional per-variant interaction heatmap (opt-in extra on Keep tabs open) ─
@@ -3956,7 +4274,93 @@ function rptAbSection(entry) {
   }
   body += '<p class="rpt-muted">Differences are expected in an A/B test — review whether each delta matches the intended variant change. Only errors and load failures are defects.</p>';
   body += rptAgenticNoteHtml(entry.data.agenticNote);
-  return rptSection(entry.name, badge, summary, body);
+  // visualDiffFull carries the LIVE runVisualDiffPass result — crops
+  // included — built fresh by the standalone A/B report call, never sourced
+  // from _abLastRun/getData(). The Test-Agent-queued path never sets this
+  // field, so this stays a no-op there — no crop images flow into that
+  // combined report or the AI summarize-results prompt it feeds.
+  return rptSection(entry.name, badge, summary, body) + rptAbVisualDiffSection(entry.data.visualDiffFull);
+}
+
+// Static-report counterpart to the retired renderAbVisualDiff: same data
+// shape (runVisualDiffPass's return value) and the same per-variant grouping
+// logic, rendered as inert markup instead of live, collapsible DOM — a
+// report has no toggle state to preserve, so every section renders open
+// except the usually-uninteresting "expected" bucket, kept collapsed via
+// <details> to match the inline version's own choice.
+function rptAbVisualDiffSection(vd) {
+  if (!vd) return '';
+  if (vd.skipped) {
+    return rptSection('Visual Diff (AI)', rptBadge('skip', 'SKIPPED'), vd.reason || 'Not run.', '');
+  }
+
+  const q = esc;
+  const qa = (s) => esc(s || '').replace(/"/g, '&quot;');
+  const regionRow = (r) => `
+    <div class="ab-line">
+      ${(r.baselineCrop || r.variantCrop) ? `
+      <div class="row" style="display:flex;gap:8px;align-items:flex-start">
+        ${r.baselineCrop ? `<img src="${qa(r.baselineCrop)}" style="max-width:260px;max-height:200px;border:1px solid #d8dbe0;border-radius:3px" alt="Control crop">` : ''}
+        ${r.variantCrop ? `<img src="${qa(r.variantCrop)}" style="max-width:260px;max-height:200px;border:1px solid #d8dbe0;border-radius:3px" alt="Variant crop">` : ''}
+      </div>` : `<p class="rpt-muted">Crop unavailable (restored from a saved checkpoint) — region near (${r.x}, ${r.y}), ${r.w}×${r.h}px.</p>`}
+      <div class="ab-cline"><span class="ab-delta">${q(r.type)}</span> ${q(r.note)}</div>
+    </div>`;
+
+  const structuralLine = (f) => {
+    const verb = f.type === 'insert' ? 'adds' : 'removes';
+    const y = f.type === 'insert' ? f.variantY : f.controlY;
+    return `<div class="ab-cline ab-warn">The variant ${verb} ~${Math.round(f.height)}px of content around y=${Math.round(y)} — not evaluated as a cropped region.${f.note ? ' ' + q(f.note) : ''}</div>`;
+  };
+
+  // Same noSpecText-aware counting as the inline renderer's badgeCount fix —
+  // a no-spec variant returns ONLY 'unclear' verdicts by construction, so
+  // treating 'unexpected' as the only signal would report 0 issues for a
+  // variant that actually surfaced real findings.
+  const variantIssueCount = (v) => {
+    if (v.skipped || v.error) return 0;
+    const regions = v.regions || [];
+    const unexpected = regions.filter(r => r.classification === 'unexpected').length;
+    const unclear = regions.filter(r => r.classification === 'unclear').length;
+    return v.noSpecText ? unexpected + unclear : unexpected;
+  };
+  const totalIssues = (vd.perVariant || []).reduce((n, v) => n + variantIssueCount(v), 0);
+  const badge = totalIssues ? rptBadge('issues', 'ISSUES FOUND') : rptBadge('pass', 'PASS');
+  const summary = `Visual Diff vs ${vd.baselineLabel} (AI-compared)${vd.baselineWarning ? ' — ' + vd.baselineWarning : ''}`;
+
+  const variantSections = (vd.perVariant || []).map(v => {
+    if (v.skipped) return `<h3>${q(v.label)}</h3><p class="rpt-muted">Skipped — ${q(v.reason || 'not captured')}</p>`;
+    if (v.error)   return `<h3>${q(v.label)}</h3><p class="ab-err">${q(v.error)}</p>`;
+
+    const regions = v.regions || [];
+    const unexpected = regions.filter(r => r.classification === 'unexpected');
+    const unclear    = regions.filter(r => r.classification === 'unclear');
+    const expected    = regions.filter(r => r.classification === 'expected');
+
+    const notes = [
+      v.note ? `<div class="ab-cline ab-warn">${q(v.note)}</div>` : '',
+      v.noSpecText ? '<div class="ab-cline">No ticket spec text for this target — differences are described but not judged expected vs unexpected.</div>' : '',
+      ...(v.structuralFindings || []).map(structuralLine),
+      v.fullPageTruncated ? '<div class="ab-cline ab-warn">Page exceeds the 8000px capture limit — differences below the cutoff were not evaluated.</div>' : '',
+      abState.qaMode ? '<div class="ab-cline">QA Mode is on — its on-page badge usually shows the variant’s own name, so it may appear as a difference here even though it isn’t one.</div>' : '',
+      (v.totalRegionCount > v.keptRegionCount) ? `<div class="ab-cline">${v.totalRegionCount} region${v.totalRegionCount !== 1 ? 's' : ''} detected, ${v.keptRegionCount} analyzed${v.batchCount > 1 ? ` across ${v.batchCount} calls` : ''}.</div>` : '',
+      v.noVerdictCount ? `<div class="ab-cline rpt-muted">${v.noVerdictCount} region${v.noVerdictCount !== 1 ? 's' : ''} with no notable difference (omitted).</div>` : '',
+      v.duplicateIndexCount ? `<div class="ab-cline ab-warn">The model returned inconsistent region references for ${v.duplicateIndexCount} region${v.duplicateIndexCount !== 1 ? 's' : ''}.</div>` : '',
+      v.truncated ? '<div class="ab-cline ab-warn">Response was cut off — some findings may be incomplete.</div>' : '',
+      v.stoppedEarly ? `<div class="ab-cline ab-warn">Stopped partway through — ${v.analyzedRegionCount || 0} of ${v.keptRegionCount || 0} region${v.keptRegionCount !== 1 ? 's' : ''} analyzed.</div>` : '',
+      v.batchError ? `<div class="ab-cline ab-warn">One comparison batch failed (${q(v.batchError)}) — showing partial results.</div>` : '',
+      v.resumed ? '<div class="ab-cline rpt-muted">Restored from a previous run that didn’t finish — crops unavailable.</div>' : '',
+    ].filter(Boolean).join('');
+
+    const body = notes + (regions.length ? `
+      ${unexpected.map(regionRow).join('')}
+      ${unclear.map(regionRow).join('')}
+      ${expected.length ? `<details><summary style="cursor:pointer;font-size:11px;color:#777">${expected.length} expected difference${expected.length !== 1 ? 's' : ''}</summary>${expected.map(regionRow).join('')}</details>` : ''}
+    ` : ((v.note || (v.structuralFindings || []).length) ? '' : '<p class="rpt-muted">No visible differences detected.</p>'));
+
+    return `<h3>${q(v.label)}${v.resumed ? ' <span class="rpt-muted" style="font-size:9px">(resumed)</span>' : ''}</h3>${body}`;
+  });
+
+  return rptSection('Visual Diff (AI)', badge, summary, variantSections.join(''));
 }
 
 function rptWcagSection(entry) {

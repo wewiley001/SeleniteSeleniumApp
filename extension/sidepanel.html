@@ -377,6 +377,7 @@
 <div id="tabs">
   <div class="tab" data-tab="init">Initialize</div>
   <div class="tab" data-tab="testagent">Test Agent</div>
+  <div class="tab" data-tab="abtest" title="A/B Variant Comparison">A/B</div>
   <div class="tab active" data-tab="build">Functional Testing</div>
   <div class="tab" data-tab="matrixauditor">Matrix Auditor</div>
   <div class="tab" data-tab="tracker" title="Metric Tracker">Tracker</div>
@@ -838,71 +839,14 @@
 
     <div id="ta-settings-slot"></div>
 
-    <!-- Permanent hosts for the reparented mode settings bodies (A/B, WCAG,
+    <!-- Permanent hosts for the reparented mode settings bodies (WCAG,
          Cross-Variant Accessibility, Performance) — the Test Modes tab that
-         used to own these was retired; Test Agent is now their only home. -->
+         used to own these was retired; Test Agent is now their only home.
+         A/B Variant Comparison used to be parked here too (as tm2-body) but
+         now lives permanently in its own tab (#panel-abtest) — see ab-body
+         there and TA_MODES['2'].renderSlot in popup.js for how Test Agent
+         still batches it without owning its settings UI. -->
     <div id="ta-mode-homes" style="display:none">
-<div class="card" id="tm2-body" style="margin-top:8px">
-      <div class="row-spread" style="margin-bottom:10px">
-        <div>
-          <div class="card-title" style="margin-bottom:1px">A/B Variant Comparison</div>
-          <div style="font-size:10px;color:var(--fg3)">Loads each variant once, then shows what differs · differences are not failures</div>
-        </div>
-        <div class="row" style="gap:5px;flex-shrink:0">
-          <button class="btn danger sm mode-stop-btn" id="btn-stop-abcompare" style="display:none">Stop</button>
-          <button class="btn primary sm mode-run-btn" id="btn-run-abcompare">Run Comparison</button>
-        </div>
-      </div>
-
-      <div class="script-row">
-        <select id="ab-set-select"><option disabled>&lt;no saved sets&gt;</option></select>
-        <button class="btn sm" id="btn-ab-load-set">Load</button>
-        <button class="btn danger sm" id="btn-ab-delete-set">Delete</button>
-      </div>
-      <div class="script-row" style="margin-bottom:8px">
-        <input type="text" id="ab-set-name" placeholder="Save targets as…">
-        <button class="btn sm" id="btn-ab-save-set">Save</button>
-      </div>
-
-      <div class="row" style="gap:6px;margin-bottom:8px">
-        <button class="btn sm" id="btn-ab-fill-ticket" disabled title="Populate Base URL and the variant list from the ticket context committed on the Initialize tab">Fill from ticket</button>
-        <span id="ab-fill-hint" style="font-size:10px;color:var(--fg3)">No committed ticket context — use the Initialize tab</span>
-      </div>
-
-      <div class="arg-row" style="margin-bottom:6px">
-        <span class="arg-lbl">Base URL</span>
-        <input type="text" id="ab-base-url" placeholder="https://example.com — shared by all variants">
-      </div>
-      <div class="row" style="gap:14px;flex-wrap:wrap;margin-bottom:10px">
-        <span class="row" style="gap:5px">
-          <label class="toggle-wrap" title="Append cro_mode=qa as the last parameter on every variant URL">
-            <input type="checkbox" id="ab-qa-mode">
-            <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          </label>
-          <span style="font-size:11px;color:var(--fg2)">QA Mode</span>
-        </span>
-        <span class="row" style="gap:5px" title="Extra wait after page load so experiment scripts can apply their changes">
-          <span style="font-size:11px;color:var(--fg2)">Settle (s)</span>
-          <input type="text" id="ab-settle" value="3" style="width:40px">
-        </span>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Leave each variant tab open for manual inspection">
-          <input type="checkbox" id="ab-keep-tabs" style="accent-color:var(--brand);cursor:pointer">Keep tabs open
-        </label>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Record your own walk on each kept-open variant tab and view it as a click/scroll heatmap overlay — requires Keep tabs open">
-          <input type="checkbox" id="ab-record-heatmap" disabled style="accent-color:var(--brand);cursor:pointer">Record interaction heatmap (requires keep tabs open)
-        </label>
-      </div>
-
-      <label class="cap">Variant Targets</label>
-      <div id="ab-target-list"></div>
-      <button class="btn sm" id="btn-ab-add-target" style="margin:5px 0 10px">+ Add Variant</button>
-
-      <label class="cap">Watched Selectors (optional)</label>
-      <div id="ab-selector-list"></div>
-      <button class="btn sm" id="btn-ab-add-selector" style="margin:5px 0 10px">+ Add Selector</button>
-
-      <div id="ab-results"></div>
-    </div>
 <div class="card" id="tm4-body">
       <div class="row-spread" style="margin-bottom:12px">
         <div>
@@ -1153,6 +1097,80 @@
       <div id="init-apply-status" style="font-size:11px;margin-top:6px"></div>
     </div>
 
+  </div>
+
+  <!-- A/B Variant Comparison panel — used to be reparented into Test Agent's
+       slot as tm2-body; now lives permanently here. TA_MODES['2'] in popup.js
+       still lets Test Agent run and batch it via renderSlot, without owning
+       this markup. -->
+  <div class="panel" id="panel-abtest">
+    <div class="card" id="ab-body">
+      <div class="row-spread" style="margin-bottom:10px">
+        <div>
+          <div class="card-title" style="margin-bottom:1px">A/B Variant Comparison</div>
+          <div style="font-size:10px;color:var(--fg3)">Loads each variant once, then shows what differs · differences are not failures</div>
+        </div>
+        <div class="row" style="gap:5px;flex-shrink:0">
+          <button class="btn danger sm mode-stop-btn" id="btn-stop-abcompare" style="display:none">Stop</button>
+          <button class="btn primary sm mode-run-btn" id="btn-run-abcompare">Run Comparison</button>
+        </div>
+      </div>
+
+      <div class="script-row">
+        <select id="ab-set-select"><option disabled>&lt;no saved sets&gt;</option></select>
+        <button class="btn sm" id="btn-ab-load-set">Load</button>
+        <button class="btn danger sm" id="btn-ab-delete-set">Delete</button>
+      </div>
+      <div class="script-row" style="margin-bottom:8px">
+        <input type="text" id="ab-set-name" placeholder="Save targets as…">
+        <button class="btn sm" id="btn-ab-save-set">Save</button>
+      </div>
+
+      <div class="row" style="gap:6px;margin-bottom:8px">
+        <button class="btn sm" id="btn-ab-fill-ticket" disabled title="Populate Base URL and the variant list from the ticket context committed on the Initialize tab">Fill from ticket</button>
+        <span id="ab-fill-hint" style="font-size:10px;color:var(--fg3)">No committed ticket context — use the Initialize tab</span>
+      </div>
+
+      <div class="arg-row" style="margin-bottom:6px">
+        <span class="arg-lbl">Base URL</span>
+        <input type="text" id="ab-base-url" placeholder="https://example.com — shared by all variants">
+      </div>
+      <div class="row" style="gap:14px;flex-wrap:wrap;margin-bottom:10px">
+        <span class="row" style="gap:5px">
+          <label class="toggle-wrap" title="Append cro_mode=qa as the last parameter on every variant URL">
+            <input type="checkbox" id="ab-qa-mode">
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          </label>
+          <span style="font-size:11px;color:var(--fg2)">QA Mode</span>
+        </span>
+        <span class="row" style="gap:5px" title="Extra wait after page load so experiment scripts can apply their changes">
+          <span style="font-size:11px;color:var(--fg2)">Settle (s)</span>
+          <input type="text" id="ab-settle" value="3" style="width:40px">
+        </span>
+        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Leave each variant tab open for manual inspection">
+          <input type="checkbox" id="ab-keep-tabs" style="accent-color:var(--brand);cursor:pointer">Keep tabs open
+        </label>
+        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Record your own walk on each kept-open variant tab and view it as a click/scroll heatmap overlay — requires Keep tabs open">
+          <input type="checkbox" id="ab-record-heatmap" disabled style="accent-color:var(--brand);cursor:pointer">Record interaction heatmap (requires keep tabs open)
+        </label>
+        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Full-page screenshot of each variant vs Control, AI-compared for visual differences. Separate from Agentic Testing. Requires an active, reviewed ticket context with variant spec text.">
+          <input type="checkbox" id="ab-visual-diff" style="accent-color:var(--brand);cursor:pointer">Visual Diff (AI)
+        </label>
+        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="One viewport screenshot per variant, AI-compared for a holistic summary. Separate from Visual Diff.">
+          <input type="checkbox" id="ab-agentic-testing" style="accent-color:var(--brand);cursor:pointer">Agentic Testing (Sonnet)
+        </label>
+      </div>
+
+      <label class="cap">Variant Targets</label>
+      <div id="ab-target-list"></div>
+      <button class="btn sm" id="btn-ab-add-target" style="margin:5px 0 10px">+ Add Variant</button>
+
+      <label class="cap">Watched Selectors (optional)</label>
+      <div id="ab-selector-list"></div>
+      <button class="btn sm" id="btn-ab-add-selector" style="margin:5px 0 10px">+ Add Selector</button>
+
+      <div id="ab-results"></div>
+    </div>
   </div>
 
 </div>

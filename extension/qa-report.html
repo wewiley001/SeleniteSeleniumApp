@@ -72,6 +72,18 @@
   @media (prefers-color-scheme: dark) { table.rpt-table th { color: #c3c8d1; } }
   table.rpt-table tr { page-break-inside: avoid; }
   ul { margin: 4px 0; padding-left: 18px; }
+  /* Visual Diff (A/B report section) — same hardcoded-hex + dark-media-override
+     convention as the rest of this file, not popup.html's CSS-variable system,
+     which doesn't exist on this page. */
+  .ab-line { padding: 8px 0; border-bottom: 1px solid #e3e5e9; }
+  .ab-line:last-child { border-bottom: none; }
+  @media (prefers-color-scheme: dark) { .ab-line { border-color: #333844; } }
+  .ab-cline { font-size: 12.5px; margin: 4px 0; }
+  .ab-warn { color: #8a5300; }
+  @media (prefers-color-scheme: dark) { .ab-warn { color: #f2c675; } }
+  .ab-err { color: #9b1c1c; font-weight: 600; }
+  @media (prefers-color-scheme: dark) { .ab-err { color: #f29b9b; } }
+  .ab-delta { font-weight: 700; text-transform: capitalize; margin-right: 4px; }
   @media print {
     .no-print { display: none; }
     body { background: #fff; color: #000; padding: 0; }
