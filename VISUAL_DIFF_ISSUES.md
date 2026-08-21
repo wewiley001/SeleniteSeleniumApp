@@ -1,5 +1,22 @@
 # A/B Visual Diff — Known Issues (all 10 fixed 2026-08-17, unverified on a real page)
 
+> **2026-08-18 — this whole document now describes a RETIRED pipeline.**
+> Everything below (row-hash alignment, pixelmatch region detection, the
+> `VIS_PAD`/`VIS_ROWHASH_*`/`VIS_MAX_REGIONS_TOTAL`-style tuning constants,
+> the single-Sonnet-call-per-batch classification) was deleted and replaced
+> with a 3-stage LLM pipeline (Sonnet scrapes each page → a deterministic
+> local diff compares the two scrapes → Opus classifies and writes the
+> report) — see `CHANGELOG.md`'s `## 2026-08-18` entry for the full design
+> and reasoning. Every fix recorded below is still historically accurate
+> (each really was a real bug in the pipeline that existed *at the time*),
+> and several of the underlying lessons (don't let a pixel-diff pipeline
+> silently swallow a skip reason; keep Control resolution consistent across
+> two independent code paths; watch for false-positive/false-negative
+> alignment at merge boundaries) carried forward into the new design's own
+> test coverage — but none of the *code* this document references still
+> exists. Kept as a historical record, not as a description of current
+> behavior.
+
 > **Status update — all 10 findings below have been fixed in the working tree.**
 > Each fix is described in the "What was done" note appended to its section.
 > Every fix is still **static-only**: verified by re-reading the code, a
