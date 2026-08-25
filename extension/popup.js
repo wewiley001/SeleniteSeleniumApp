@@ -2471,6 +2471,7 @@ const VD_CHECKPOINT_KEY = 'visualDiffCheckpoints';
 function computeVisualDiffRunSignature(ctx, targets) {
   return `${ctx?.ticketKey || ''}::${targets.map(t => t.url).slice().sort().join('|')}`;
 }
+
 async function getVisualDiffCheckpoint(winId) {
   const { [VD_CHECKPOINT_KEY]: all = {} } = await chrome.storage.local.get(VD_CHECKPOINT_KEY);
   return all[winId] || null;
@@ -2505,7 +2506,10 @@ let _abHeatmapRecordingTabId = null;
 function abDefaultState() {
   return {
     baseUrl: '', qaMode: false, settleSec: '3', keepTabs: false, recordHeatmap: false,
-    visualDiff: false, visualDiffCrops: true, agenticTesting: false, summaryOfChanges: '',
+    // Visual Diff and Agentic Testing are always on and no longer have
+    // checkboxes; recordHeatmap stays in the state (and the code behind it
+    // still works) but has no UI and is never switched on.
+    visualDiff: true, visualDiffCrops: true, agenticTesting: true, summaryOfChanges: '',
     targets: [
       { label: 'v0', url: '', override: '' },
       { label: 'v1', url: '', override: '' },
@@ -2518,6 +2522,13 @@ async function initAbCompare() {
   if (!document.getElementById('ab-target-list')) return;
   const { abCompareState } = await sessionNS.get('abCompareState');
   abState = { ...abDefaultState(), ...(abCompareState || {}) };
+  // These three are no longer user-controllable, so the persisted value must
+  // not win: a session saved before the checkboxes were removed carries
+  // visualDiff:false / agenticTesting:false, and with no control left to flip
+  // them the feature would appear permanently broken for that user.
+  abState.visualDiff = true;
+  abState.agenticTesting = true;
+  abState.recordHeatmap = false;
   if (!Array.isArray(abState.targets) || !abState.targets.length) abState.targets = abDefaultState().targets;
   if (!Array.isArray(abState.selectors)) abState.selectors = [];
 
@@ -2528,30 +2539,10 @@ async function initAbCompare() {
   document.getElementById('ab-settle').addEventListener('input',     e => { abState.settleSec = e.target.value;  persistAbState(); });
   document.getElementById('ab-keep-tabs').addEventListener('change', e => {
     abState.keepTabs = e.target.checked;
-    const hmChk = document.getElementById('ab-record-heatmap');
-    hmChk.disabled = !abState.keepTabs;
-    if (!abState.keepTabs && hmChk.checked) { hmChk.checked = false; abState.recordHeatmap = false; }
-    persistAbState();
-  });
-  document.getElementById('ab-record-heatmap').addEventListener('change', e => {
-    abState.recordHeatmap = e.target.checked;
-    persistAbState();
-  });
-  document.getElementById('ab-visual-diff').addEventListener('change', e => {
-    abState.visualDiff = e.target.checked;
-    // Unlike keepTabs/recordHeatmap, turning Visual Diff off doesn't reset
-    // the crops preference — it's just irrelevant (nothing to crop) until
-    // Visual Diff is back on, not a structural impossibility, so the user's
-    // choice survives being toggled off and on again.
-    document.getElementById('ab-visual-diff-crops').disabled = !abState.visualDiff;
     persistAbState();
   });
   document.getElementById('ab-visual-diff-crops').addEventListener('change', e => {
     abState.visualDiffCrops = e.target.checked;
-    persistAbState();
-  });
-  document.getElementById('ab-agentic-testing').addEventListener('change', e => {
-    abState.agenticTesting = e.target.checked;
     persistAbState();
   });
   document.getElementById('ab-summary-of-changes').addEventListener('input', e => {
@@ -2588,6 +2579,12 @@ async function initAbCompare() {
   document.getElementById('btn-run-abcompare').addEventListener('click', () => runAbComparison());
   document.getElementById('btn-stop-abcompare').addEventListener('click', () => {
     _abVisualDiffStopRequested = true;
+    // Stage 1's band calls for one page run in parallel (Promise.all) — Stop
+    // can only land before/after that whole set of calls finishes, not
+    // mid-band. Says so up front rather than leaving whatever mid-stage
+    // status text ("Scraping…"/"Analyzing…") was last shown, unexplained,
+    // until the run actually unwinds.
+    setAbStatus('Stopping — this takes effect after the current page finishes its scrape/report calls…');
     chrome.runtime.sendMessage({ action: 'stop' });
   });
 
@@ -2605,12 +2602,7 @@ function applyAbStateToInputs() {
   document.getElementById('ab-qa-mode').checked   = !!abState.qaMode;
   document.getElementById('ab-settle').value      = abState.settleSec || '3';
   document.getElementById('ab-keep-tabs').checked = !!abState.keepTabs;
-  document.getElementById('ab-record-heatmap').checked  = !!abState.recordHeatmap;
-  document.getElementById('ab-record-heatmap').disabled = !abState.keepTabs;
-  document.getElementById('ab-visual-diff').checked     = !!abState.visualDiff;
-  document.getElementById('ab-visual-diff-crops').checked  = abState.visualDiffCrops !== false;
-  document.getElementById('ab-visual-diff-crops').disabled = !abState.visualDiff;
-  document.getElementById('ab-agentic-testing').checked = !!abState.agenticTesting;
+  document.getElementById('ab-visual-diff-crops').checked = abState.visualDiffCrops !== false;
   document.getElementById('ab-summary-of-changes').value = abState.summaryOfChanges || '';
 }
 
@@ -2966,12 +2958,22 @@ async function runAbComparison(opts = {}) {
         : {
             skipped: false, baselineLabel: visualDiffResult.baselineLabel,
             baselineWarning: visualDiffResult.baselineWarning,
+            sharedFindingCount: (visualDiffResult.sharedFindings || []).length,
             perVariant: (visualDiffResult.perVariant || []).map(v => ({
               label: v.label, skipped: v.skipped, reason: v.reason, error: v.error,
+              controlDuplicate: v.controlDuplicate,
               overallSummary: v.overallSummary, structuralStats: v.structuralStats,
               truncatedFindingCount: v.truncatedFindingCount, noVerdictCount: v.noVerdictCount,
               duplicateIndexCount: v.duplicateIndexCount, truncated: v.truncated, pixelDiff: v.pixelDiff,
               fullPageTruncated: v.fullPageTruncated, resumed: v.resumed, noSpecText: v.noSpecText,
+              // Diff diagnostics ride along on this mirror too. It exists to
+              // keep crops out of the text-summarization prompt, and these are
+              // small text-only counters — without them a Test-Agent-queued
+              // run (which only ever sees this mirror, never visualDiffFull)
+              // would export a debug log with no diff diagnostics at all,
+              // which is the run most likely to need them.
+              aggregate: v.aggregate, diffMode: v.diffMode, matchedFraction: v.matchedFraction,
+              matchTierCounts: v.matchTierCounts, diffDebug: v.diffDebug,
               findingCount: v.findings ? v.findings.length : 0,
               // noSpecText variants carry no expected/unexpected verdicts at all — every
               // finding for them lands in unclearCount instead, so a no-spec run's real
@@ -3098,206 +3100,41 @@ function diffAbCaptures(captures, metricsList, selectors) {
 // CHANGELOG.md for why. No pixel work happens in this file at all; it only
 // orchestrates messages and does the Stage-2 diff math.
 
-// ── Stage 2: local diff (pure JS, no network call) ──────────────────────────
-// Compares two pages' Stage-1 scrapes (ordered semantic content blocks) to
-// find what changed. Same spirit as the old row-hash alignRowHashes DP — a
-// global sequence alignment — but score-weighted and at block granularity
-// (dozens of blocks per page, not hundreds of pixel-row bands), so the DP
-// table here is trivially small.
-const VIS_MAX_DIFF_FINDINGS = 60;   // cap before sending findings to Opus — far higher than the
-                                     // old per-image region cap since there's no per-image cost
-                                     // driving it down; still a backstop for a pathological page
+// ── The local diff now lives in vd-diff.js ─────────────────────────────────
+// Everything that used to be here — blockSimilarity, needlemanWunschAlign,
+// diffPageScrapes, vdChangeSignals, rankAndCapDiffFindings, and the
+// vdBoxesOverlap/vdNormalizeTokens/vdTokenSimilarity helpers — moved into
+// extension/vd-diff.js and runs in background.js now. Two reasons, both
+// load-bearing: the diff's inputs (two full DOM-candidate lists) already live
+// in the worker and shipping them here would newly cross ~1MB over
+// sendMessage, and vd-diff.js as a plain globalThis IIFE can be load()ed
+// directly by jsc, so the matching logic is unit-testable with no browser and
+// no extraction step. This panel still reads those functions as bare globals
+// (vd-diff.js is loaded before popup.js in both popup.html and
+// sidepanel.html) — nothing here needs to import anything.
 
-function vdBoxesOverlap(a, b) {
-  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+// ── Visual Diff diagnostics (console-only, never wired into the UI) ────────
+// window.__vdDebug — call from the panel's OWN DevTools console (right-click
+// the side panel → Inspect). Deliberately no chrome.storage flag, no
+// checkbox, no settings surface: a normal user never opens DevTools on this
+// panel, so this is the cheapest possible zero-footprint hidden affordance,
+// consistent with keeping the real A/B workflow exactly as seamless as
+// before. Navigate to the target page yourself before calling this.
+//
+// scrapeStabilityCheck() is gone with the Sonnet scrape stage it measured:
+// it existed to quantify how much the model's semantic grouping varied
+// between two runs of the SAME page, and there is no model in the parse path
+// any more for that number to be nonzero.
+async function vdShowCandidateOverlay() {
+  const res = await chrome.runtime.sendMessage({ action: 'vdShowCandidateOverlay' });
+  if (!res?.ok) console.error('[vdDebug] Failed:', res?.error);
+  else console.log(`[vdDebug] Drew ${res.count} candidate rects on the active tab — click anywhere or press Esc to clear.`);
+  return res;
 }
 
-function vdNormalizeTokens(s) {
-  const set = new Set();
-  String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(t => { if (t) set.add(t); });
-  return set;
-}
-
-function vdTokenSimilarity(a, b) {
-  const setA = vdNormalizeTokens(a), setB = vdNormalizeTokens(b);
-  if (!setA.size && !setB.size) return 1;
-  if (!setA.size || !setB.size) return 0;
-  let inter = 0;
-  for (const t of setA) if (setB.has(t)) inter++;
-  const union = setA.size + setB.size - inter;
-  return union ? inter / union : 1;
-}
-
-// 0.5 text + 0.3 type + 0.2 position — text dominates since it's the
-// strongest signal a block genuinely corresponds to the same content;
-// position only contributes when both sides have a real DOM rect.
-function blockSimilarity(a, b, pageHA, pageHB) {
-  const textSim = vdTokenSimilarity(`${a.label || ''} ${a.text || ''}`, `${b.label || ''} ${b.text || ''}`);
-  const typeMatch = a.type === b.type ? 1 : 0;
-  let positionProximity = 0;
-  if (a.rect && b.rect && pageHA && pageHB) {
-    positionProximity = 1 - Math.abs(a.rect.y / pageHA - b.rect.y / pageHB);
-  }
-  return 0.5 * textSim + 0.3 * typeMatch + 0.2 * positionProximity;
-}
-
-// Standard Needleman-Wunsch global alignment — same idea as the old
-// alignRowHashes, but the "match" cell holds a real similarity score
-// instead of binary hash-equality, and a small gap penalty replaces the old
-// code's plain max(up,left).
-function needlemanWunschAlign(a, b, simFn, gapPenalty) {
-  const n = a.length, m = b.length;
-  const dp = [];
-  for (let i = 0; i <= n; i++) dp.push(new Float64Array(m + 1));
-  for (let i = 1; i <= n; i++) dp[i][0] = -i * gapPenalty;
-  for (let j = 1; j <= m; j++) dp[0][j] = -j * gapPenalty;
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      const diag = dp[i - 1][j - 1] + simFn(a[i - 1], b[j - 1]);
-      const up = dp[i - 1][j] - gapPenalty;
-      const left = dp[i][j - 1] - gapPenalty;
-      dp[i][j] = Math.max(diag, up, left);
-    }
-  }
-  const pairs = [];
-  let i = n, j = m;
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + simFn(a[i - 1], b[j - 1])) {
-      pairs.push({ aIdx: i - 1, bIdx: j - 1 }); i--; j--;
-    } else if (i > 0 && dp[i][j] === dp[i - 1][j] - gapPenalty) {
-      pairs.push({ aIdx: i - 1, bIdx: null }); i--;
-    } else {
-      pairs.push({ aIdx: null, bIdx: j - 1 }); j--;
-    }
-  }
-  pairs.reverse();
-  return pairs;
-}
-
-function vdChangeSignals(a, b) {
-  if (a && !b) return ['removed'];
-  if (!a && b) return ['added'];
-  const signals = [];
-  if ((a.text || '') !== (b.text || '')) signals.push('text-changed');
-  if (a.type !== b.type) signals.push('type-changed');
-  if (a.rect && b.rect) {
-    const dy = b.rect.y - a.rect.y;
-    if (Math.abs(dy) > 20) signals.push(`moved-vertically:${dy > 0 ? '+' : ''}${dy}px`);
-    if (Math.abs(b.rect.w - a.rect.w) > 20 || Math.abs(b.rect.h - a.rect.h) > 20) signals.push('resized');
-  }
-  return signals;
-}
-
-// Two-pass alignment: (1) order-preserving global alignment handles the
-// common case — growth/shrink pushing later content down, the same way the
-// old row-hash LCS did; (2) a stricter, position-agnostic greedy pass
-// recovers blocks a pure reorder would otherwise report as a spurious
-// remove+add pair. Known risk, accepted rather than solved: a grid of
-// near-identical items (e.g. product cards) can still mismatch siblings
-// against each other in pass 2 — the stricter threshold + same-type gate
-// reduces but doesn't eliminate this.
-function diffPageScrapes(controlBlocks, variantBlocks) {
-  // A same-type, same-slot pair whose text is UNRECOGNIZABLY different (a
-  // real content rewrite, not a light edit) scores at most 0.3 (type) + 0.2
-  // (position) = 0.5 on textSim=0 alone — a genuine in-place edit like "Buy
-  // Now" -> "Add to Cart". A 0.55 threshold rejected that pairing outright,
-  // reporting it as a false remove+add instead of one 'modified' finding —
-  // exactly the class of bug the old pipeline's collapseAdjacentModifiedPairs
-  // existed to prevent. 0.45 lets same-type-same-slot pairs through (caught
-  // by the unit tests) while still rejecting a coincidental same-type match
-  // at a genuinely different position (typeMatch alone, no position/text
-  // support, tops out well below this).
-  const MATCH_THRESHOLD = 0.45;
-  const REORDER_THRESHOLD = 0.7;
-  const GAP_PENALTY = 0.3;
-  const pageHA = Math.max(1, ...controlBlocks.map(b => (b.rect ? b.rect.y + b.rect.h : 0)));
-  const pageHB = Math.max(1, ...variantBlocks.map(b => (b.rect ? b.rect.y + b.rect.h : 0)));
-  const sim = (a, b) => blockSimilarity(a, b, pageHA, pageHB);
-
-  const pairs = needlemanWunschAlign(controlBlocks, variantBlocks, sim, GAP_PENALTY);
-
-  const findings = [];
-  const unmatchedControl = [], unmatchedVariant = [];
-  let fid = 0;
-
-  for (const p of pairs) {
-    if (p.aIdx != null && p.bIdx != null) {
-      const a = controlBlocks[p.aIdx], b = variantBlocks[p.bIdx];
-      const score = sim(a, b);
-      if (score >= MATCH_THRESHOLD) {
-        const unchanged = a.type === b.type && (a.text || '') === (b.text || '');
-        findings.push({
-          findingId: 'f' + (fid++), status: unchanged ? 'unchanged' : 'modified',
-          controlBlock: a, variantBlock: b, similarityScore: score,
-          changeSignals: unchanged ? [] : vdChangeSignals(a, b), matchedViaReorder: false,
-        });
-        continue;
-      }
-    }
-    if (p.aIdx != null) unmatchedControl.push(controlBlocks[p.aIdx]);
-    if (p.bIdx != null) unmatchedVariant.push(variantBlocks[p.bIdx]);
-  }
-
-  const usedVariant = new Set();
-  const stillUnmatchedControl = [];
-  for (const a of unmatchedControl) {
-    let best = null, bestScore = REORDER_THRESHOLD;
-    for (const b of unmatchedVariant) {
-      if (usedVariant.has(b) || a.type !== b.type) continue;
-      const score = sim(a, b);
-      if (score > bestScore) { bestScore = score; best = b; }
-    }
-    if (best) {
-      usedVariant.add(best);
-      findings.push({
-        findingId: 'f' + (fid++), status: 'modified', controlBlock: a, variantBlock: best,
-        similarityScore: bestScore, changeSignals: vdChangeSignals(a, best), matchedViaReorder: true,
-      });
-    } else {
-      stillUnmatchedControl.push(a);
-    }
-  }
-  const stillUnmatchedVariant = unmatchedVariant.filter(b => !usedVariant.has(b));
-
-  stillUnmatchedControl.forEach(a => findings.push({
-    findingId: 'f' + (fid++), status: 'removed', controlBlock: a, variantBlock: null,
-    similarityScore: null, changeSignals: ['removed'], matchedViaReorder: false,
-  }));
-  stillUnmatchedVariant.forEach(b => findings.push({
-    findingId: 'f' + (fid++), status: 'added', controlBlock: null, variantBlock: b,
-    similarityScore: null, changeSignals: ['added'], matchedViaReorder: false,
-  }));
-
-  findings.sort((x, y) => {
-    const yx = x.controlBlock?.rect?.y ?? x.variantBlock?.rect?.y ?? Infinity;
-    const yy = y.controlBlock?.rect?.y ?? y.variantBlock?.rect?.y ?? Infinity;
-    return yx - yy;
-  });
-  return findings;
-}
-
-// Caps the non-unchanged findings sent to Opus. Tiers: overlaps a watched
-// selector rect > modified > added/removed > larger text delta (tiebreak).
-// unchanged findings never go to Opus, but the caller keeps the full list
-// for the structural stat counts shown in the report.
-function rankAndCapDiffFindings(findings, { watchedRects = [], maxTotal = VIS_MAX_DIFF_FINDINGS } = {}) {
-  const actionable = findings.filter(f => f.status !== 'unchanged');
-  if (actionable.length <= maxTotal) return { kept: actionable, truncatedCount: 0 };
-  const scored = actionable.map(f => {
-    const rect = f.controlBlock?.rect || f.variantBlock?.rect;
-    const overlapsWatched = rect ? watchedRects.some(r => vdBoxesOverlap(rect, r)) : false;
-    const statusTier = f.status === 'modified' ? 1 : 0;
-    const textLen = ((f.controlBlock?.text || '') + (f.variantBlock?.text || '')).length;
-    return { f, overlapsWatched, statusTier, textLen };
-  });
-  scored.sort((a, c) => {
-    if (a.overlapsWatched !== c.overlapsWatched) return a.overlapsWatched ? -1 : 1;
-    if (a.statusTier !== c.statusTier) return c.statusTier - a.statusTier;
-    return c.textLen - a.textLen;
-  });
-  const kept = scored.slice(0, maxTotal).map(s => s.f);
-  return { kept, truncatedCount: actionable.length - kept.length };
-}
+window.__vdDebug = {
+  showCandidateOverlay: vdShowCandidateOverlay,
+};
 
 // ── Pipeline orchestrator ────────────────────────────────────────────────────
 // Drives Stage 1 (scrape, once for Control then once per variant) → Stage 2
@@ -3310,6 +3147,108 @@ function rankAndCapDiffFindings(findings, { watchedRects = [], maxTotal = VIS_MA
 // finishes, matching Test Agent's own run → report-tab pattern. `onStatus`,
 // if given, receives a short human-readable line for the caller's single
 // status element (mirroring Test Agent's own `status.textContent = ...`).
+// ── Control-vs-Control is never a valid comparison ──────────────────────────
+// Diffing Control against itself yields zero findings, and zero findings is
+// indistinguishable from a clean pass — which makes it the most dangerous
+// possible outcome: a misconfigured run that reports success. Two ways it
+// happens, and both must stop the analysis rather than produce a report.
+function vdNormalizeTargetUrl(u) {
+  return String(u || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+// (1) Configuration: this target IS Control — same URL, or it redirected onto
+// Control's final URL (a forced-variant parameter silently dropped en route).
+function vdControlDuplicateReason(base, c) {
+  const bu = vdNormalizeTargetUrl(base.url), cu = vdNormalizeTargetUrl(c.url);
+  if (bu && cu && bu === cu) {
+    return `it is configured with the same URL as Control ("${base.label}"), so this would compare Control against itself`;
+  }
+  const bf = vdNormalizeTargetUrl(base.finalUrl), cf = vdNormalizeTargetUrl(c.finalUrl);
+  if (bf && cf && bf === cf) {
+    return `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter was probably dropped on redirect`;
+  }
+  return null;
+}
+
+// (2) Result: the pages are configured differently but rendered identically.
+// The experiment did not apply. Reporting "no differences" here would read as
+// a pass on a test that never ran, so it is an error, not a result.
+function vdRenderedAsControlReason(diffRes) {
+  if (!diffRes || diffRes.mode !== 'normal') return null;
+  if ((diffRes.findings || []).length) return null;
+  const s = diffRes.structuralStats || {};
+  if (s.addedCount || s.removedCount || s.modifiedCount || s.styleChangedCount) return null;
+  return 'it rendered identically to Control — no added, removed, changed or restyled element anywhere on the page. '
+    + 'The forced-variant parameter most likely did not apply, so there is nothing to QA';
+}
+
+// ── Changes common to every variant, reported once ──────────────────────────
+// A four-variant run where the variants share a restructured page reports the
+// same handful of changes once per variant: measured on a real run, 15 of 27
+// finding rows were five shared changes repeated three times, and only 12 rows
+// were the copy differences that actually distinguished the variants. Lifting
+// the shared ones into their own section removes the repetition without
+// removing the information.
+//
+// Deliberately NOT suppressed. A change every variant makes is still a change
+// from Control, and "all three variants dropped the same CTA" is a regression
+// worth seeing — hiding it would repeat the mistake that let a run with zero
+// findings read as a pass.
+//
+// The key is (changeClass, control text, variant text) with NO rect: the same
+// change lands at different y in different variants (a taller hero pushes it
+// down), and including position would defeat the grouping in exactly the cases
+// it matters most. `moved` findings likewise vary by a few px between variants
+// and are still one change.
+function vdFindingIdentity(f) {
+  const t = (s) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const c = f.controlBlock, v = f.variantBlock;
+  // Control is captured ONCE and reused for every variant, so any control-side
+  // attribute is perfectly stable across them — which makes its rect the ideal
+  // tiebreaker. Text alone is not enough: two different images both have empty
+  // text, so ('removed','','') collided and two distinct removals were reported
+  // as one. Position is only safe on the control side; the variant side moves
+  // (a taller hero pushes "Contact sales" 50px down in one variant), so only
+  // its SIZE participates.
+  const cKey = c ? t(c.text) + '@' + (c.rect ? [c.rect.x, c.rect.y, c.rect.w, c.rect.h].join(',') : '-') : '-';
+  const vKey = v ? t(v.text) + '@' + (v.rect ? v.rect.w + 'x' + v.rect.h : '-') : '-';
+  return [f.changeClass, cKey, vKey].join('\u0000');
+}
+
+function vdExtractSharedFindings(perVariant) {
+  const analysed = perVariant.filter(v => !v.skipped && !v.error && Array.isArray(v.findings));
+  // Needs at least two comparisons for "common to all" to mean anything.
+  if (analysed.length < 2) return [];
+
+  const counts = new Map();
+  for (const v of analysed) {
+    // Count each identity once per variant, so a change appearing twice within
+    // one variant can't masquerade as appearing across two.
+    for (const id of new Set(v.findings.map(vdFindingIdentity))) {
+      counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  }
+
+  const sharedIds = new Set();
+  for (const [id, n] of counts) if (n === analysed.length) sharedIds.add(id);
+  if (!sharedIds.size) return [];
+
+  // The first variant's instance represents the group; every variant's copy is
+  // identical by construction apart from geometry and the model's own wording.
+  const shared = [];
+  const taken = new Set();
+  for (const f of analysed[0].findings) {
+    const id = vdFindingIdentity(f);
+    if (!sharedIds.has(id) || taken.has(id)) continue;
+    taken.add(id);
+    shared.push({ ...f, sharedAcross: analysed.map(v => v.label) });
+  }
+  for (const v of analysed) {
+    v.findings = v.findings.filter(f => !sharedIds.has(vdFindingIdentity(f)));
+  }
+  return shared;
+}
+
 async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus } = {}) {
   if (!abState.visualDiff) return null;
   const bail = (reason) => ({ skipped: true, reason });
@@ -3349,29 +3288,26 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
   // writes the root before the loop starts, so even an all-skipped run is
   // distinguishable from "no run happened."
   const runId = resumeCheckpoint?.runId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Recorded on the run and every checkpoint, not just for display — item
+  // 3's per-block pixel check and item 6b's cross-run cache both need
+  // Control and a variant to be captured at the same scale, and this is
+  // what a resume/cross-run comparison checks against. Within a single run
+  // this is never a real risk (every variant shares one capture window by
+  // construction) — it's cross-run/resume where widths can actually drift.
+  const captureWidth = base.fullPage.pageW;
   if (!resumeCheckpoint) {
     await setVisualDiffCheckpointRoot(WIN_ID, {
       runId, signature: computeVisualDiffRunSignature(ctx, captures), ticketKey: ctx?.ticketKey || null,
       baselineLabel: base.label, startedAt: Date.now(), updatedAt: Date.now(), status: 'running',
-      controlScrape: null, perVariant: {},
+      captureWidth, perVariant: {},
     });
   }
 
-  // Control is scraped ONCE per run and reused for every variant — resumed
-  // from the checkpoint if a prior run already finished it (background.js's
-  // own in-memory cache only survives as long as the service worker does;
-  // the checkpoint is what makes this resilient across a worker restart).
-  let controlScrape = resumeCheckpoint?.controlScrape?.status === 'done' ? resumeCheckpoint.controlScrape : null;
-  if (!controlScrape) {
-    if (_abVisualDiffStopRequested) return bail('Stopped before Control was scraped.');
-    onStatus?.(`Scraping ${base.label}…`);
-    const res = await chrome.runtime.sendMessage({
-      action: 'scrapeVisualDiffPage',
-      payload: { winId: WIN_ID, runId, label: base.label, role: 'control' },
-    });
-    if (!res?.ok) return bail(`Could not scrape Control (${res?.error || 'unknown error'}).`);
-    controlScrape = { blocks: res.blocks, unmatchedNotes: res.unmatchedNotes };
-  }
+  // No Control pre-pass any more. Parsing a page used to be a Sonnet call, so
+  // Control was scraped once per run, cached in the checkpoint, and cached
+  // again across runs — all of it machinery to avoid re-paying for that call.
+  // The diff now reads Control's DOM candidates straight out of vdState on
+  // every variant, which is free, so all three caching layers are gone.
 
   const perVariant = [];
   let stopped = false;
@@ -3398,6 +3334,16 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       continue;
     }
 
+    // Stop before spending anything on a comparison that cannot be valid.
+    const dupReason = vdControlDuplicateReason(base, c);
+    if (dupReason) {
+      perVariant.push({
+        label: c.label, controlDuplicate: true,
+        error: `Analysis stopped — ${dupReason}.`,
+      });
+      continue;
+    }
+
     const prior = resumeCheckpoint?.perVariant?.[c.label];
     if (prior?.status === 'done') {
       // Fully done already — hydrate from the checkpoint, no re-calls at
@@ -3412,41 +3358,66 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       continue;
     }
 
-    // Per-stage resume: a variant already scraped (worker restarted before
-    // the Opus call landed) skips straight to diff+report instead of
-    // re-scraping it.
-    let variantScrape = prior?.status === 'scraped' ? prior.scrape : null;
-    if (!variantScrape) {
-      onStatus?.(`Scraping ${c.label}…`);
-      const scrapeRes = await chrome.runtime.sendMessage({
-        action: 'scrapeVisualDiffPage',
-        payload: { winId: WIN_ID, runId, label: c.label, role: 'variant' },
+    // The entire deterministic diff, in one round trip and with no model
+    // call: match, classify, suppress reflow/punctuation/counter noise,
+    // group, pixel backstop, rank and cap. There's no per-stage resume left
+    // to do here — the expensive stage this used to resume past (Control's
+    // Sonnet scrape) no longer exists, and re-running the diff itself is free.
+    onStatus?.(`Comparing ${c.label}…`);
+    const diffRes = await chrome.runtime.sendMessage({
+      action: 'diffVisualDiffVariant',
+      payload: {
+        winId: WIN_ID, runId, baselineLabel: base.label, variantLabel: c.label,
+        watchedRects: (base.selectors || []).map(s => s.rect).filter(Boolean),
+      },
+    });
+    if (!diffRes?.ok) {
+      perVariant.push({ label: c.label, error: diffRes?.error || 'Diff failed' });
+      continue;
+    }
+    const { structuralStats, truncatedCount, pixelDiff, aggregate, mode, matchedFraction, matchTierCounts } = diffRes;
+    const diffDebug = diffRes.debug || null;
+    const kept = diffRes.findings;
+
+    // A variant that renders identically to Control is a broken run, not a
+    // clean one. This used to report "No differences detected against
+    // control." as an ordinary result, which is the single most misleading
+    // thing this tool could say: it is exactly what a forced-variant
+    // parameter that never applied looks like, and it reads as a pass.
+    // Stop the analysis and say so instead.
+    const sameAsControl = vdRenderedAsControlReason(diffRes);
+    if (sameAsControl) {
+      perVariant.push({
+        label: c.label, controlDuplicate: true,
+        error: `Analysis stopped — ${sameAsControl}.`,
+        structuralStats, pixelDiff, aggregate, diffMode: mode, matchedFraction,
+        matchTierCounts, diffDebug, fullPageTruncated: !!c.fullPage.truncated,
       });
-      if (!scrapeRes?.ok) {
-        if (scrapeRes?.stoppedAbort) { stopped = true; perVariant.push({ label: c.label, skipped: true, reason: 'Stopped' }); break; }
-        perVariant.push({ label: c.label, error: scrapeRes?.error || 'Scrape failed' });
-        continue;
-      }
-      variantScrape = { blocks: scrapeRes.blocks, unmatchedNotes: scrapeRes.unmatchedNotes };
+      continue;
     }
 
-    const allFindings = diffPageScrapes(controlScrape.blocks, variantScrape.blocks);
-    const structuralStats = {
-      addedCount: allFindings.filter(f => f.status === 'added').length,
-      removedCount: allFindings.filter(f => f.status === 'removed').length,
-      modifiedCount: allFindings.filter(f => f.status === 'modified').length,
-      unchangedCount: allFindings.filter(f => f.status === 'unchanged').length,
-    };
-    const { kept, truncatedCount } = rankAndCapDiffFindings(allFindings, {
-      watchedRects: (base.selectors || []).map(s => s.rect).filter(Boolean),
-    });
+    // Findings exist but none survived ranking — skip the one remaining model
+    // call rather than sending it an empty list. Distinct from the branch
+    // above: the page genuinely differs, there is just nothing left to
+    // classify. The coarse pixel backstop already ran inside the diff, so it
+    // is never a casualty of this optimization.
+    if (kept.length === 0) {
+      perVariant.push({
+        label: c.label, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
+        noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
+        noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
+        aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
+        fullPageTruncated: !!c.fullPage.truncated,
+      });
+      continue;
+    }
 
     onStatus?.(`Analyzing ${c.label}…`);
     const reportRes = await chrome.runtime.sendMessage({
       action: 'reportVisualDiffFindings',
       payload: {
         winId: WIN_ID, runId, baselineLabel: base.label, variantLabel: c.label,
-        findings: kept, stats: structuralStats, ticketVariantText: ticketText || null,
+        findings: kept, stats: structuralStats, ticketVariantText: ticketText || null, pixelDiff,
       },
     });
     if (!reportRes?.ok) {
@@ -3455,9 +3426,9 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       continue;
     }
 
-    // Join Opus's classification back onto the full Stage-2 finding records
-    // — Opus never saw controlBlock/variantBlock/rect directly, only a text
-    // summary of them, so those fields still need to come from `kept`.
+    // Join the model's classification back onto the full diff records — it
+    // never saw controlBlock/variantBlock/rect directly, only a text summary
+    // of them, so those fields still need to come from `kept`.
     const byId = new Map(reportRes.findings.map(f => [f.findingId, f]));
     let findings = kept.map(f => ({ ...f, ...(byId.get(f.findingId) || {}) }));
 
@@ -3475,6 +3446,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
       noVerdictCount: reportRes.noVerdictCount, duplicateIndexCount: reportRes.duplicateIndexCount,
       truncated: reportRes.truncated, pixelDiff: reportRes.pixelDiff,
+      aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
       fullPageTruncated: !!c.fullPage.truncated,
     });
   }
@@ -3483,6 +3455,24 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
   // during the LAST variant's calls aborts inside background.js and the
   // loop then ends naturally, which would otherwise finalize as 'completed'
   // and hide the resume banner for a run the user did interrupt.
+  // Every variant turned out to be Control. Nothing was compared, so the run
+  // has no result at all — say that once at the top rather than leaving the
+  // reader to infer it from a list of per-variant errors.
+  const analysed = perVariant.filter(v => !v.skipped);
+  if (analysed.length && analysed.every(v => v.controlDuplicate)) {
+    await finalizeVisualDiffCheckpoint(WIN_ID, runId, 'completed');
+    chrome.runtime.sendMessage({ action: 'clearVisualDiffCaptures', payload: { winId: WIN_ID } }).catch(() => {});
+    return {
+      skipped: true, baselineLabel: base.label, baselineWarning, perVariant,
+      reason: `Every target resolved to the same page as Control ("${base.label}"), so nothing was compared. `
+        + 'Check that each variant carries its own forced-variant parameter and that none of them redirect onto Control.',
+    };
+  }
+
+  // Runs after every variant is analysed, so it can see the whole set. Mutates
+  // each variant's findings in place to strip what it lifts out.
+  const sharedFindings = vdExtractSharedFindings(perVariant);
+
   const wasStopped = stopped || _abVisualDiffStopRequested;
   await finalizeVisualDiffCheckpoint(WIN_ID, runId, wasStopped ? 'stopped' : 'completed');
   // Best-effort — frees the stored full-page PNGs (and DOM candidates) in
@@ -3490,7 +3480,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
   // teardown to do it.
   chrome.runtime.sendMessage({ action: 'clearVisualDiffCaptures', payload: { winId: WIN_ID } }).catch(() => {});
 
-  return { skipped: false, baselineLabel: base.label, baselineWarning, perVariant };
+  return { skipped: false, baselineLabel: base.label, baselineWarning, perVariant, sharedFindings };
 }
 
 // ── Optional per-variant interaction heatmap (opt-in extra on Keep tabs open) ─
@@ -4615,6 +4605,7 @@ function rptAbVisualDiffSection(vd) {
   // changeSignals so the vocabulary a reader sees stays familiar.
   const findingType = (f) => {
     if (f.status === 'added' || f.status === 'removed') return f.status;
+    if (f.status === 'style-changed') return 'style';
     const signals = f.changeSignals || [];
     if (signals.includes('text-changed')) return 'copy';
     if (signals.some(s => s.startsWith('moved-vertically') || s === 'resized')) return 'layout';
@@ -4652,9 +4643,26 @@ function rptAbVisualDiffSection(vd) {
     const unclear = findings.filter(f => f.classification === 'unclear').length;
     return v.noSpecText ? unexpected + unclear : unexpected;
   };
-  const totalIssues = (vd.perVariant || []).reduce((n, v) => n + variantIssueCount(v), 0);
-  const badge = totalIssues ? rptBadge('issues', 'ISSUES FOUND') : rptBadge('pass', 'PASS');
-  const summary = `Visual Diff vs ${vd.baselineLabel} (AI-compared)${vd.baselineWarning ? ' — ' + vd.baselineWarning : ''}`;
+  const shared = vd.sharedFindings || [];
+  // Shared changes were lifted out of every variant, so they must be counted
+  // here or a run whose only findings are common to all variants would tally
+  // zero issues and badge PASS.
+  const sharedIssueCount = shared.filter(f =>
+    f.classification === 'unexpected' || (f.classification === 'unclear')).length;
+  const totalIssues = (vd.perVariant || []).reduce((n, v) => n + variantIssueCount(v), 0) + sharedIssueCount;
+  // A Control-vs-Control variant contributes no findings, and variantIssueCount
+  // returns 0 for anything errored — so without this a run where the experiment
+  // never applied would badge a green PASS. That is the one verdict this
+  // section must never show for a comparison that did not happen.
+  const dupVariants = (vd.perVariant || []).filter(v => v.controlDuplicate);
+  const badge = dupVariants.length ? rptBadge('fail', 'NOT COMPARED')
+    : totalIssues ? rptBadge('issues', 'ISSUES FOUND')
+    : rptBadge('pass', 'PASS');
+  let summary = `Visual Diff vs ${vd.baselineLabel}${vd.baselineWarning ? ' — ' + vd.baselineWarning : ''}`;
+  if (dupVariants.length) {
+    summary += ` — ${dupVariants.length} variant(s) resolved to the same page as Control and were not compared. `
+      + 'Their lack of findings is not a pass.';
+  }
 
   const variantSections = (vd.perVariant || []).map(v => {
     if (v.skipped) return `<h3>${q(v.label)}</h3><p class="rpt-muted">Skipped — ${q(v.reason || 'not captured')}</p>`;
@@ -4667,9 +4675,38 @@ function rptAbVisualDiffSection(vd) {
     const s = v.structuralStats || {};
 
     const summaryHtml = v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '';
+
+    // MANDATORY, not cosmetic. Every entry here is a filter that removed a
+    // real difference from the findings above, and an invisible filter is
+    // worse than the noise it removes — a reader who can't see that 38
+    // elements were dropped as page reflow has no way to tell a clean diff
+    // from an over-aggressive one. If suppression ever hides a genuine
+    // regression, this line is what makes that discoverable.
+    const agg = v.aggregate || {};
+    const reflowDetail = [
+      agg.reflowPxMax ? `up to ${Math.round(agg.reflowPxMax)}px vertically` : '',
+      agg.reflowHorizontal ? `${agg.reflowHorizontal} of them a horizontal grid re-wrap` : '',
+    ].filter(Boolean).join(', ');
+    const suppressed = [
+      agg.reflow ? `${agg.reflow} suppressed as page reflow${reflowDetail ? ` (${reflowDetail})` : ''}` : '',
+      agg.punctuationOnly ? `${agg.punctuationOnly} punctuation- or whitespace-only` : '',
+      agg.numericOnly ? `${agg.numericOnly} live counter${agg.numericOnly === 1 ? '' : 's'}` : '',
+    ].filter(Boolean);
+
     const notes = [
       v.noSpecText ? '<div class="ab-cline">No Summary of Changes provided — differences are described but not judged expected vs unexpected.</div>' : '',
-      (s.addedCount || s.removedCount || s.modifiedCount) ? `<div class="ab-cline rpt-muted">${s.addedCount || 0} added, ${s.removedCount || 0} removed, ${s.modifiedCount || 0} modified, ${s.unchangedCount || 0} unchanged content block${s.unchangedCount === 1 ? '' : 's'} detected.</div>` : '',
+      suppressed.length ? `<div class="ab-cline rpt-muted">Filtered before analysis: ${q(suppressed.join(', '))}.</div>` : '',
+      // Which identity key actually matched each element. Instrumentation for
+      // the load-bearing assumption behind the whole matching scheme — that a
+      // structural path survives what experiment JS does to a page. If the
+      // 'path' tier is starved on real forced-variant URLs, elements are
+      // being carried by the text tiers alone and a copy rewrite inside a
+      // restructured subtree would fall through to add/remove.
+      v.matchTierCounts && Object.keys(v.matchTierCounts).length
+        ? `<div class="ab-cline rpt-muted">Matched by: ${q(Object.entries(v.matchTierCounts).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t} ${n}`).join(', '))}.</div>`
+        : '',
+      v.diffMode === 'redesign' ? `<div class="ab-cline ab-warn">Only ${Math.round((v.matchedFraction || 0) * 100)}% of elements have a counterpart in ${q(vd.baselineLabel)} — this looks like a wholesale redesign rather than a targeted experiment, so differences are summarized per page region instead of element by element.</div>` : '',
+      (s.addedCount || s.removedCount || s.modifiedCount || s.styleChangedCount) ? `<div class="ab-cline rpt-muted">${s.addedCount || 0} added, ${s.removedCount || 0} removed, ${s.modifiedCount || 0} modified, ${s.styleChangedCount || 0} style-changed, ${s.unchangedCount || 0} unchanged content block${s.unchangedCount === 1 ? '' : 's'} detected.</div>` : '',
       v.pixelDiff?.flagged ? `<div class="ab-cline ab-warn">${Math.round(v.pixelDiff.ratio * 100)}% of pixels differ across the page (including any changes already described above) — review directly if this seems high relative to the findings above.</div>` : '',
       v.fullPageTruncated ? '<div class="ab-cline ab-warn">Page exceeds the 8000px capture limit — content below the cutoff was not evaluated.</div>' : '',
       abState.qaMode ? '<div class="ab-cline">QA Mode is on — its on-page badge usually shows the variant’s own name, so it may appear as a difference here even though it isn’t one.</div>' : '',
@@ -4684,12 +4721,21 @@ function rptAbVisualDiffSection(vd) {
       ${unexpected.map(f => findingRow(f, v.resumed)).join('')}
       ${unclear.map(f => findingRow(f, v.resumed)).join('')}
       ${expected.length ? `<details><summary style="cursor:pointer;font-size:11px;color:#777">${expected.length} expected difference${expected.length !== 1 ? 's' : ''}</summary>${expected.map(f => findingRow(f, v.resumed)).join('')}</details>` : ''}
-    ` : (v.overallSummary ? '' : '<p class="rpt-muted">No differences detected.</p>'));
+    ` : `<p class="rpt-muted">${shared.length
+        ? 'Nothing unique to this variant — every difference it has from ' + q(vd.baselineLabel) + ' is listed under “Common to all variants” above.'
+        : 'No differences detected.'}</p>`);
 
     return `<h3>${q(v.label)}${v.resumed ? ' <span class="rpt-muted" style="font-size:9px">(resumed)</span>' : ''}</h3>${body}`;
   });
 
-  return rptSection('Visual Diff (AI)', badge, summary, variantSections.join(''));
+  // Reported once, before the per-variant sections, because it is the same
+  // change in every variant — not a per-variant finding repeated N times.
+  const sharedHtml = shared.length ? `
+    <h3>Common to all variants <span class="rpt-muted" style="font-size:9px">(${shared.length} change${shared.length !== 1 ? 's' : ''} vs ${q(vd.baselineLabel)}, identical in ${q((shared[0].sharedAcross || []).join(', '))})</span></h3>
+    <p class="rpt-muted">These differ from ${q(vd.baselineLabel)} in exactly the same way in every variant, so they are listed once here rather than repeated under each. They are still real differences from Control — review them.</p>
+    ${shared.map(f => findingRow(f, false)).join('')}` : '';
+
+  return rptSection('Visual Diff (AI)', badge, summary, sharedHtml + variantSections.join(''));
 }
 
 function rptWcagSection(entry) {
@@ -4780,6 +4826,29 @@ function rptFunnelSection(entry) {
 
 // ── Report assembly (pure body builder) + open in a bundled tab ─────────────
 // Formats data already produced by each mode's own run — no DOM reads.
+// Everything that degraded this run, in one place, at the end of the report.
+// The per-section prose already mentions most of these individually, but
+// scattered across sections and interleaved with findings — which is how a
+// run with a truncated page, an unmatched watched selector, and 12 capped
+// findings can still read as clean. Collected here they read as what they
+// are: the limits on how much this report is worth trusting.
+function rptDiagnosticsSection(problems) {
+  const errors = problems.filter(p => p.severity === 'error');
+  const warns = problems.filter(p => p.severity === 'warn');
+  const infos = problems.filter(p => p.severity === 'info');
+  if (!problems.length) {
+    return rptSection('Run Diagnostics', rptBadge('pass', 'CLEAN'),
+      'Nothing degraded this run — every page loaded, captured, and compared in full.', '');
+  }
+  const row = (p) => `<tr><td>${esc(p.severity.toUpperCase())}</td><td>${esc(p.where)}</td><td>${esc(p.detail)}</td></tr>`;
+  const body = `<table class="rpt-table"><thead><tr><th>Level</th><th>Where</th><th>Detail</th></tr></thead>
+      <tbody>${errors.concat(warns, infos).map(row).join('')}</tbody></table>
+    <p class="rpt-muted">Download the debug log from the button at the top of this page for the underlying numbers — match tiers, reflow bands, per-finding geometry, and the unmatched residue.</p>`;
+  const badge = errors.length ? rptBadge('fail', 'DEGRADED') : rptBadge('issues', 'CAVEATS');
+  return rptSection('Run Diagnostics', badge,
+    `${errors.length} error(s), ${warns.length} warning(s), ${infos.length} note(s) affecting how much of this run completed`, body);
+}
+
 function buildReportBody(sections) {
   const { ts, pageUrls, modes, extraHtml } = sections;
   const builders = {
@@ -4787,7 +4856,9 @@ function buildReportBody(sections) {
     4: rptWcagSection, 5: rptCvaSection, 6: rptPerfSection,
     funnel: rptFunnelSection,
   };
-  const body = (extraHtml || '') + modes.map(entry => (builders[entry.mode] || (() => ''))(entry)).join('');
+  let diagnosticsHtml = '';
+  try { diagnosticsHtml = rptDiagnosticsSection(vdCollectProblems(sections)); } catch (_) {}
+  const body = (extraHtml || '') + modes.map(entry => (builders[entry.mode] || (() => ''))(entry)).join('') + diagnosticsHtml;
   const urlsHtml = pageUrls.length
     ? pageUrls.map(u => `<li>${esc(u)}</li>`).join('')
     : '<li>No page URLs recorded.</li>';
@@ -4807,6 +4878,222 @@ function buildReportBody(sections) {
     ${body}`;
 }
 
+// ── Debug log ───────────────────────────────────────────────────────────────
+// Exported alongside the report, as JSON, from a button on the report page.
+// The rendered report answers "what changed"; this answers "why should I
+// believe it", and it exists because the first real Visual Diff run couldn't
+// answer the second question from the report alone — the numbers said
+// something was wrong without saying what, and the cause had to be found by
+// reconstructing the page's geometry by hand offline.
+//
+// `problems` comes first and is the point of the file: every way this run was
+// degraded, incomplete, or working from a guess, collected in one list
+// instead of scattered across per-section prose. A clean run yields an empty
+// array, which is itself the useful signal.
+function vdCollectProblems(sections) {
+  const problems = [];
+  const add = (severity, where, detail) => problems.push({ severity, where, detail });
+
+  for (const entry of sections.modes || []) {
+    if (entry.status === 'skipped') add('info', entry.name || `mode ${entry.mode}`, `Skipped — ${entry.reason || 'no reason recorded'}`);
+    if (entry.error) add('error', entry.name || `mode ${entry.mode}`, entry.error);
+    if (entry.mode !== 2 || !entry.data) continue;
+
+    // Geometry mismatch invalidates the whole comparison, so it is checked
+    // before anything else and reported as an error, not a note. Comparing a
+    // responsive page captured at two different widths compares two layouts,
+    // not two variants — and the failure is silent by nature: the diff still
+    // completes and still reports a finding count, it is just measuring the
+    // wrong thing. A real run did exactly this (Control 1693px, variants
+    // 1470px) and read as a clean 2-finding result.
+    const baseCap = (entry.data.captures || []).find(c => c.fullPage && !c.fullPage.error);
+    for (const c of entry.data.captures || []) {
+      if (c.skipped) add('warn', `capture/${c.label}`, `Not captured — ${c.reason || 'run stopped'}`);
+      if (c.loadError) add('error', `capture/${c.label}`, `Page load failed — ${c.loadError}`);
+      if (c.fullPage?.error) add('error', `capture/${c.label}`, `Full-page capture failed — ${c.fullPage.error}`);
+      if (c.fullPage?.geometryPinFailed) {
+        add('error', `capture/${c.label}`, `Could not pin this capture to the baseline's viewport (${c.fullPage.geometryPinFailed}) — widths may differ, which would invalidate the comparison.`);
+      }
+      if (baseCap && c.fullPage && !c.fullPage.error && c !== baseCap && c.fullPage.pageW !== baseCap.fullPage.pageW) {
+        add('error', `capture/${c.label}`,
+          `Captured at ${c.fullPage.pageW}px wide but the baseline "${baseCap.label}" was captured at ${baseCap.fullPage.pageW}px. `
+          + 'On a responsive page these are different layouts, so every difference below is suspect — re-run without resizing the window or opening DevTools mid-run.');
+      }
+      // Real blind spot, not cosmetic: nothing below the cutoff is compared
+      // at all, so a regression down there cannot be reported as anything.
+      if (c.fullPage?.truncated) {
+        // The DOM walk now covers the full page, so this is no longer a
+        // comparison blind spot — only a *visual* one. Say which, precisely:
+        // reporting "never compared" when text, colors, layout and element
+        // presence were in fact all compared would understate the tool, and
+        // reporting nothing would overstate it.
+        const missedPct = Math.round((1 - c.fullPage.capturedH / c.fullPage.pageH) * 100);
+        add('info', `capture/${c.label}`,
+          `Page is ${c.fullPage.pageH}px tall; the screenshot stops at ${c.fullPage.capturedH}px. `
+          + `Text, colors, layout and element presence were still compared over the whole page — but for the bottom ${missedPct}% `
+          + 'there is no image, so the pixel backstop is skipped and findings there have no crop.');
+      }
+      for (const e of (c.errors || [])) add('warn', `page-js/${c.label}`, e);
+      for (const s of (c.selectors || [])) {
+        if (!s.exists) add('warn', `watched-selector/${c.label}`, `Selector never matched: ${s.selector}`);
+        else if (!s.visible) add('info', `watched-selector/${c.label}`, `Selector matched but was not visible: ${s.selector}`);
+      }
+    }
+
+    // visualDiffFull only exists on the standalone A/B path; a
+    // Test-Agent-queued run carries the metadata mirror instead.
+    const vd = entry.data.visualDiffFull || entry.data.visualDiff;
+    if (vd?.skipped) add('warn', 'visual-diff', `Skipped — ${vd.reason}`);
+    if (vd?.baselineWarning) add('warn', 'visual-diff', vd.baselineWarning);
+    for (const v of (vd?.perVariant || [])) {
+      const at = `visual-diff/${v.label}`;
+      if (v.skipped) { add('warn', at, `Skipped — ${v.reason || 'not captured'}`); continue; }
+      // Control-vs-Control outranks every other note about this variant: the
+      // comparison did not happen, so nothing else recorded for it means
+      // anything. Never let this degrade into a quiet aside.
+      if (v.controlDuplicate) {
+        add('error', at, `${v.error} No QA result exists for this variant — do not read the absence of findings as a pass.`);
+        continue;
+      }
+      if (v.error) { add('error', at, v.error); continue; }
+      if (v.noSpecText) add('info', at, 'No Summary of Changes was provided, so nothing was judged expected vs unexpected — every finding is "unclear" by construction.');
+      if (v.resumed) add('info', at, 'Restored from a checkpoint rather than freshly analyzed — crops unavailable.');
+      if (v.truncated) add('error', at, 'The model\'s response was cut off — some findings are incomplete.');
+      if (v.truncatedFindingCount) add('warn', at, `${v.truncatedFindingCount} finding(s) exceeded the cap and were never analyzed.`);
+      if (v.noVerdictCount) add('warn', at, `${v.noVerdictCount} finding(s) came back without a verdict.`);
+      if (v.duplicateIndexCount) add('warn', at, `The model returned inconsistent finding references for ${v.duplicateIndexCount} item(s).`);
+      if (v.diffMode === 'redesign') {
+        // A geometry mismatch produces a low match rate all by itself, so
+        // don't let the redesign verdict stand as if it were a finding about
+        // the experiment when there's a known reason to distrust it.
+        const geomBad = (entry.data.captures || []).some(c =>
+          baseCap && c.fullPage && !c.fullPage.error && c !== baseCap && c.fullPage.pageW !== baseCap.fullPage.pageW);
+        add('warn', at, `Only ${Math.round((v.matchedFraction || 0) * 100)}% of elements matched — treated as a wholesale redesign and rolled up per region, not compared element by element.`
+          + (geomBad ? ' This is most likely the capture-width mismatch above rather than a real redesign — fix that and re-run before reading anything into it.' : ''));
+      }
+
+      const d = v.diffDebug;
+      if (d) {
+        const fuzzy = d.matchTierCounts?.fuzzy || 0;
+        if (fuzzy) add('warn', at, `${fuzzy} element(s) were paired by approximate similarity rather than an exact key — those pairings may be wrong.`);
+        // The signature of broken reflow suppression: an amount that keeps
+        // showing up among reported moves but never earned a trusted cluster.
+        const trusted = new Set([...(d.shiftClusters?.vertical || []), ...(d.shiftClusters?.horizontal || [])]
+          .filter(c => c.trusted).map(c => Math.round(c.delta)));
+        const repeated = Object.entries(d.movesByDelta || {}).filter(([, n]) => n >= 3);
+        for (const [key, n] of repeated) {
+          const dy = Math.round(Number((key.match(/dy=(-?\d+)/) || [])[1] || 0));
+          const dx = Math.round(Number((key.match(/dx=(-?\d+)/) || [])[1] || 0));
+          if (!trusted.has(dy) && !trusted.has(dx)) {
+            add('warn', at, `${n} elements were each reported as moved by the same amount (${key}) with no trusted reflow band to explain it — if these are one cascade, reflow suppression is under-matching.`);
+          }
+        }
+        // The candidate walk truncates from the bottom of the page at
+        // VD_MAX_CANDIDATES. That was unreachable while the walk stopped at
+        // the screenshot's 8000px; now that it covers the whole document, a
+        // very long page can genuinely hit it — and a silent bottom-truncation
+        // is exactly the invisible blind spot this run's work removed.
+        const cap = typeof VD_MAX_CANDIDATES === 'number' ? VD_MAX_CANDIDATES : 3000;
+        if (d.counts?.controlElements >= cap || d.counts?.variantElements >= cap) {
+          add('warn', at, `The element walk hit its ${cap}-candidate ceiling, which truncates from the bottom of the page — the lowest part of this page may not have been compared at all.`);
+        }
+        if (d.belowCapture?.control) {
+          // Lead with the coverage, not the caveat: these elements used to be
+          // outside the comparison entirely, so the headline is how much of
+          // the page is now being checked that previously was not.
+          const total = d.counts?.controlElements || 0;
+          add('info', at, `${d.belowCapture.control} of ${total} elements sit below the screenshot's reach and were compared from the DOM alone`
+            + (d.belowCapture.findings
+                ? ` — ${d.belowCapture.findings} finding(s) came from there, and have no crop and were not pixel-checked.`
+                : ' — no findings came from there.'));
+        }
+        if (d.offCanvas?.control || d.offCanvas?.variant) {
+          add('info', at, `${d.offCanvas.control} control / ${d.offCanvas.variant} variant element(s) sit outside the page's horizontal bounds — `
+            + 'usually an auto-scrolling marquee resting at a different offset in each capture. They are compared from the DOM like any other element'
+            + (d.offCanvas.findings
+                ? `, and ${d.offCanvas.findings} finding(s) came from there, with no crop and no pixel check.`
+                : ', and produced no findings.'));
+        }
+        if (d.counts?.unmatchedControl > 20 || d.counts?.unmatchedVariant > 20) {
+          add('warn', at, `${d.counts.unmatchedControl} control and ${d.counts.unmatchedVariant} variant elements could not be paired at all — see unmatchedControlSample/unmatchedVariantSample.`);
+        }
+      } else {
+        add('info', at, 'No diff diagnostics recorded for this variant.');
+      }
+    }
+  }
+  return problems;
+}
+
+function buildDebugLog(sections) {
+  const abEntry = (sections.modes || []).find(m => m.mode === 2);
+  const vd = abEntry?.data?.visualDiffFull || abEntry?.data?.visualDiff;
+
+  return {
+    readme: 'Selenite QA debug log. `problems` lists everything that degraded this run — start there. '
+      + 'For Visual Diff, cross-reference each variant\'s `movesByDelta` against its `shiftClusters`: a shift amount '
+      + 'that appears repeatedly among reported moves but has no trusted cluster means reflow suppression is '
+      + 'under-matching and those findings are cascade, not real changes. A starved `path` entry in `matchTierCounts` '
+      + 'means structural identity is not surviving this page\'s experiment JS.',
+    generatedAt: new Date(sections.ts).toISOString(),
+    extensionVersion: chrome.runtime.getManifest().version,
+    userAgent: navigator.userAgent,
+    problems: vdCollectProblems(sections),
+    run: {
+      pageUrls: sections.pageUrls || [],
+      modes: (sections.modes || []).map(m => ({ mode: m.mode, name: m.name, status: m.status, reason: m.reason || null })),
+      settings: {
+        qaMode: abState?.qaMode, settleSec: abState?.settleSec, keepTabs: abState?.keepTabs,
+        visualDiff: abState?.visualDiff, visualDiffCrops: abState?.visualDiffCrops,
+        agenticTesting: abState?.agenticTesting, hasSummaryOfChanges: !!(abState?.summaryOfChanges || '').trim(),
+      },
+    },
+    captures: (abEntry?.data?.captures || []).map(c => ({
+      label: c.label, url: c.url, finalUrl: c.finalUrl, title: c.title,
+      skipped: !!c.skipped, loadError: c.loadError || null,
+      fullPage: c.fullPage || null,
+      jsErrors: c.errors || [],
+      consoleLineCount: (c.console || []).length,
+      selectors: c.selectors || [],
+    })),
+    visualDiff: !vd || vd.skipped ? { skipped: true, reason: vd?.reason || 'not run' } : {
+      baselineLabel: vd.baselineLabel, baselineWarning: vd.baselineWarning || null,
+      // Lifted out of the per-variant lists — without these the debug log would
+      // show fewer findings per variant than the diff actually produced.
+      sharedFindings: (vd.sharedFindings || []).map(f => ({
+        changeClass: f.changeClass, region: f.region || null,
+        sharedAcross: f.sharedAcross || [],
+        controlText: (f.controlBlock?.text || '').slice(0, 160) || null,
+        variantText: (f.variantBlock?.text || '').slice(0, 160) || null,
+        classification: f.classification || null, severity: f.severity || null,
+      })),
+      perVariant: (vd.perVariant || []).map(v => ({
+        label: v.label, skipped: !!v.skipped, reason: v.reason || null, error: v.error || null,
+        controlDuplicate: !!v.controlDuplicate,
+        structuralStats: v.structuralStats || null, pixelDiff: v.pixelDiff || null,
+        diffMode: v.diffMode || null, matchedFraction: v.matchedFraction ?? null,
+        suppressionAggregate: v.aggregate || null,
+        reportedFindingCount: (v.findings || []).length,
+        truncatedFindingCount: v.truncatedFindingCount || 0,
+        // The rendered report shows each finding's prose; this shows the
+        // geometry and the identity tier behind it, which is what makes a
+        // wrong finding traceable to the pass that produced it.
+        findings: (v.findings || []).map(f => ({
+          findingId: f.findingId, changeClass: f.changeClass, status: f.status,
+          region: f.region || null, matchTier: f.matchTier || null,
+          dx: f.dx ?? null, dy: f.dy ?? null, memberCount: f.memberCount || null,
+          signals: f.changeSignals || [], pixelRatio: f.pixelRatio ?? null,
+          classification: f.classification || null, severity: f.severity || null,
+          controlText: (f.controlBlock?.text || '').slice(0, 160) || null,
+          variantText: (f.variantBlock?.text || '').slice(0, 160) || null,
+          controlRect: f.controlBlock?.rect || null, variantRect: f.variantBlock?.rect || null,
+        })),
+        diagnostics: v.diffDebug || null,
+      })),
+    },
+  };
+}
+
 // Stash the rendered report body under a fresh id in session storage (a
 // non-namespaced key so the bundled qa-report.html page, which has no window
 // id, can read it — mirrors mxOpenReport), prune to the newest few, then open
@@ -4814,7 +5101,10 @@ function buildReportBody(sections) {
 async function openReportTab(sections) {
   const id = 'r_' + Date.now();
   const { taReports = {} } = await chrome.storage.session.get('taReports');
-  taReports[id] = { title: 'Selenite QA Report', bodyHtml: buildReportBody(sections) };
+  let debugLog = null;
+  // Never let a debug-log failure cost the user the actual report.
+  try { debugLog = buildDebugLog(sections); } catch (e) { debugLog = { error: 'Could not assemble debug log: ' + e.message }; }
+  taReports[id] = { title: 'Selenite QA Report', bodyHtml: buildReportBody(sections), debugLog };
   const ids = Object.keys(taReports).sort();
   while (ids.length > 5) delete taReports[ids.shift()];
   await chrome.storage.session.set({ taReports });

@@ -2,6 +2,255 @@
 
 All notable changes to Selenite are documented here.
 
+## 2026-08-24
+
+### Changed
+
+**Visual Diff: the LLM is out of parsing and diffing entirely.** The 3-stage pipeline shipped on 2026-08-21 (Sonnet scrape → local diff → Opus report) ran against a real page for the first time and produced mostly noise: a hero-copy-only A/B test reported 11 added / 5 removed / 26 modified / 2 style-changed against just 3 unchanged blocks. Opus spent its output budget explaining why its own inputs weren't real changes — *"the caption was not deleted — it was re-parsed into the template list block"*, *"replaces an em dash with a period"*, *"unchanged apart from line-break formatting and shifts up 209px"*.
+
+Three root causes, all architectural and none tunable away: Sonnet's semantic grouping is non-deterministic, so re-grouping between two runs manufactures phantom findings (and `temperature: 0` is rejected outright by the API for this model); one real change shifts everything below it, so a single edit cascades into ~25 "moved" findings; and raw text comparison flags punctuation and whitespace as content changes.
+
+The parse and diff stages are now deterministic. One model call remains, for judgment only.
+
+#### New: `extension/vd-diff.js` — the deterministic matching engine
+
+- Nine tiered exact-match passes over per-element identity keys (testid, stable id, path+text, text, href, aria, path, numeric shape) plus one narrow fuzzy fallback. Every tier except `path` is read off the element itself and cannot change because a *different* element changed. Replaces `needlemanWunschAlign` + `blockSimilarity` + the reorder pass, which existed only because Sonnet's blocks had no identity at all.
+- **Pass ordering is load-bearing, not incidental.** Text-identity passes run *before* path-only. Path-only doesn't fail cleanly on a shifted subtree — it *misfires*, confidently pairing an element with whatever unrelated content now occupies its old structural slot. Text-only can't misfire that way: a text with no matching count on the other side simply defers. Caught by hand-simulating a wrapper-div insertion; the first draft had these two swapped.
+- **Piecewise reflow suppression.** Real reflow is piecewise constant (content above a shortened hero has Δy=0, below has Δy=−259), so a single global median reports half the page as moved. `vdDeriveShiftSegments` run-length segments the Δy sequence instead. On the 39-pair simulation of the real failure: 38 suppressed into one aggregate, 1 real finding — *and* an element that moved against the local reflow still survives, which the old pipeline couldn't distinguish at all.
+- **Grouping moved to after matching.** A grouping error can now only merge or split real findings, never manufacture one. The entire "re-parsed into / split out of / merged into" noise class is gone by construction rather than by tuning.
+- Style-field comparison is now the primary CSS-change detector — free, exact, and it names the property that changed. The walk was already capturing `backgroundImage`/`border`/`boxShadow`/`opacity` and **nothing had ever compared them**. The per-block pixel check is demoted to a capped backstop for rendering differences with no style, text, or size delta at all.
+
+#### Deleted
+
+`VIS_SCRAPE_SCHEMA`, `buildVisualScrapePrompt`/`Content`, `runOneScrapeBand`, `scrapeVisualDiffPage` and its handler, all six banding constants, `diffPageScrapes`/`blockSimilarity`/`needlemanWunschAlign`/`vdChangeSignals`, the `vdDebugScrapeStability` handler and `scrapeStabilityCheck` (it measured model variance that no longer exists), and the whole cross-run Control-scrape cache including the **Force fresh Control scrape** checkbox in both panel files — that cache existed only to avoid re-paying for Sonnet calls, and parsing is now free. Per-variant round trips drop from 4 to 3, and the deleted one was the expensive one.
+
+#### Fixed
+
+- **A regression introduced by this rearchitecture's own first step, reported from a live run:** `Error: GAP_PENALTY is not defined`. Rewriting `vd-config.js` deleted the six DP-alignment constants while `diffPageScrapes`/`blockSimilarity` in `popup.js` still referenced them, so Visual Diff couldn't run at all. The earlier steps had been recorded as "ships no behavior change" — they didn't. Fixed by completing the swap-over rather than restoring the constants.
+- **Digit-group separators read as copy changes.** `$1,000` → `$1000` normalized to `"1 000"` vs `"1000"` and reported as a real text change — a steady source of phantom findings on any page with prices or stat counters. `vdNormText` now strips a separator sitting between a digit and exactly three more digits, leaving decimal commas and ordinary commas alone. Caught by the jsc suite, not on a page.
+
+#### First gate run against the real page — the cascade fix that mattered
+
+The 4-variant Zapier case was re-run against a loaded extension. The old noise classes were gone outright: added dropped 11 → 1, removed 5 → 4, the hero copy swap was correctly named as the first finding on every variant, and the entire "re-parsed into / split out of / merged into" family had disappeared. All three variants returned byte-identical counts, which is the determinism the rearchitecture was for. But ~49 "modified" findings per variant still leaked, all of them layout shifts — and the model's own notes named them as cascade: *"shifted up 35px, consistent with the removed label above it."*
+
+- **`vdDeriveShiftSegments` collapsed whenever two reflow bands overlapped in y.** It sorted by document position and broke a run the moment Δy changed. That sounds equivalent to clustering and isn't: overlapping bands are the *normal* case — a section that loses a label shifts its own children by one amount and everything after it by another — and inside the overlap, consecutive elements alternate between the two amounts, so every run terminated after one element and nothing reached the 3-element trust threshold. Measured on the real page's shape: **97 segments, 95 of them untrusted singletons**, suppressing only the bands that happened to sit alone in their y-range. Now clusters on the shift *amount* and uses position only to bound where that amount applies: **3 clusters, 0 leaked**, with a planted rogue move still correctly reported.
+- **Horizontal shifts cascade too.** The design assumed they didn't and skipped banding for them. Removing one chip from a wrapping template-link grid re-flowed every chip after it and re-wrapped the rows, producing six findings per variant reading "a row of twelve template links shifted right by 126px". Whether a shift cascades is a property of the container, not the axis — both axes now get the same clustering, and a shift is only reflow when *both* components are explained.
+- **Autoplaying video defeated capture stabilization.** `stabilizeForCapture` froze CSS animation but not video playback, so each capture caught a different frame — surfacing as `style-changed` for the hero video and, through grouping, for the button beside it. Videos are now pinned to their first frame, before and after the lazy-load scroll pass.
+
+#### Visual Diff and Agentic Testing are always on; heatmap checkbox retired
+
+Both were opt-in checkboxes that had to be ticked every session. They are now on by default with the checkboxes removed. The interaction-heatmap checkbox is also gone and its state pinned off — the feature and its code are untouched and can be revisited, it simply has no UI.
+
+The A/B options row is now just **Keep tabs open** and **Show crop images in report**. That crop checkbox was previously `disabled` until Visual Diff was ticked; with Visual Diff always on it is always enabled, and its title no longer claims a dependency that can't be unmet.
+
+- **Persisted session state is overridden, not merged.** `abState` is built as `{...defaults, ...saved}`, so a session saved before this change carries `visualDiff:false` / `agenticTesting:false` and would have beaten the new defaults — with no checkbox left to fix it, the features would look permanently broken for exactly the users who had run before. The three fields are now forced after the merge. Every other preference, including the user's crop choice, still comes from the saved session.
+- All three `addEventListener` bindings for the removed inputs were deleted along with the elements. This matters more than it sounds: the panel's init is a single unguarded `await` chain, so one `addEventListener` on a null element throws and silently kills every listener bound after it.
+
+*Verified in a browser*, not just by parsing: the panel was loaded against a stubbed `chrome` API and checked for (a) zero init errors, (b) `initAbCompare` completing — it renders the variant-target rows, which sit downstream of where the removed bindings were, so their rendering proves the chain survived, and (c) a seeded stale session with both features off and heatmap on coming out as on/on/off while its unrelated fields were preserved.
+
+Worth recording: the first run of that harness *did* throw — at `ensureOpenUrlFirst`, because the stub returned no `functions` map — and it took out `initAbCompare` several hundred lines later, leaving the target list empty. A live demonstration of the fragility described above, from an unrelated cause.
+
+#### Root-caused: the walk was dropping horizontally off-canvas elements
+
+The previous entry's `clipped` rule removed three phantom removals per variant but not all of them. The next run showed why: **"Repurpose content" sits at x=2650..2814, comfortably inside a 2847px page in Control**, so no edge test could flag it — yet it was reported removed in v1 and v3 and *not* v2. The tell was that instability. Which chips leaked was a function of where the marquee happened to stop, and the offsets differ run to run (−148/+151/+163/+250 one run, −208/+213/+230/+353 the next).
+
+`clipped` was a geometric proxy. The actual cause is that `domCandidateWalkFn` **discarded** anything outside the page's horizontal bounds. An auto-scrolling marquee pauses wherever it is, so a chip is on-canvas in one capture and past the edge in the other — discarded from only one list, with nothing left to match against, and reported as removed. The filter's premise was inverted: dropping is what manufactures the phantom findings it was written to prevent, because the two captures drop *different* elements.
+
+This is the same asymmetric-drop root cause fixed earlier on the vertical axis, and the same remedy: stop dropping, start flagging.
+
+- The walk keeps horizontally off-canvas elements and marks them `offCanvas` — a strict superset of `clipped`, which could only ever see straddlers and never an element the drop had already removed. A scrolled chip is now present on both sides, matches on text, and its dx is explained by the page's own horizontal reflow band, so it suppresses as ordinary reflow.
+- The three pixel-dependent stages skip it, mirroring `belowCapture` exactly: the per-pair backstop, the wire block, and the crop. The screenshot is clipped to the page width, so reading out there would throw or silently compare the wrong column.
+- **The `clipped` suppression is deleted rather than kept alongside.** It was a workaround for the drop; with the drop fixed it is redundant, and keeping it would hide genuine carousel changes — which a variant might legitimately make.
+- `suppression.offCanvas` is replaced by an `offCanvas` **coverage** counter next to `belowCapture` in the debug log, with the same reportable-findings-only guard that counter had to learn once already.
+
+Also closed a pre-existing test gap surfaced while tracing this: `belowCaptureStillDiffs` built its finding list without the `!c.clipped` filter production applied, so test and production could disagree silently. With the filter gone they match, and the test now asserts it.
+
+178 assertions.
+
+#### Two fixes from the first run of the shared-findings change
+
+**Text-less elements collided in the shared-finding key.** The identity was `(changeClass, control text, variant text)`, so two different removed images — both with empty text — produced `('removed','','')` and merged into a single row. Two real removals reported as one: data loss, introduced by the previous entry's change.
+
+The key now includes the **control-side rect**. Control is captured once and reused for every variant, so anything on its side is perfectly stable across them, which makes its position the ideal tiebreaker. The variant side still contributes only its *size*, never its position, because that legitimately moves — a taller hero pushes "Contact sales" 50px down in one variant and it is still the same change. Verified against the two real images from the run: distinct identities, two rows instead of one.
+
+**A horizontally-scrolling carousel manufactured phantom removals.** "Repurpose content", "Generate posts" and "Implement IT support" were reported as removed — "Repurpose content" in one variant only, which is what gave it away. All of them straddle a horizontal page edge, and the run's own horizontal shift bands (−148 / +151 / +163 / +250px, 12–14 elements each) show a template-chip carousel resting at a different offset in each capture. A chip past the edge is dropped by the candidate walk, so it looks removed; the same chip inside the edge in another capture does not.
+
+The walk now marks any element straddling a horizontal page bound as `clipped` — real page content does not hang off the side of the document, so it is a reliable marker for "visibility here depends on scroll position" — and an *unmatched* clipped element is suppressed rather than reported. Counted in the aggregate and named in the report's suppression line, never silent. On the captured run this removes 4 phantom removals from one variant and 3 from each of the others, leaving 4 real removals identical across all three.
+
+**Not claimed as fixed:** one text-less logo image in that same carousel row sits *inside* the bounds and is still reported. It is plausibly the same class of artifact — a logo strip re-ordering — but its rect is legitimately on-canvas and there is nothing in this run's data that proves it either way.
+
+#### Changes common to every variant are reported once, not once per variant
+
+On a four-variant run the report showed **27 finding rows, 15 of which were 5 changes repeated three times** — the same eyebrow removed, the same heading removed, the same CTA relocated, in each variant's section. Only 12 rows were the copy differences that actually distinguished the variants.
+
+Shared changes are now lifted into a **"Common to all variants"** section ahead of the per-variant ones. Confirmed on a live run: **33 rows becomes 7 shared + 12 variant-specific = 19**, with nothing lost — the diff produced 11 findings per variant, and 7 shared + 4 unique accounts for all of them. What survives in each variant's own section is exactly the experiment: the hero heading, the subhead, a new h2, and the body copy.
+
+- **Not suppressed, only consolidated.** A change every variant makes is still a change from Control, and "all three variants dropped the same CTA" is a regression worth seeing. Hiding it would repeat the mistake that let a run with zero findings read as a pass — so the shared findings also count toward the section's issue tally, or a run whose only findings were universal would badge PASS.
+- **Identity is `(changeClass, control text, variant text)` with no rect.** The same change lands at a different y in different variants when a taller hero pushes it down (v3's "Contact sales" sits 50px lower than v1's), and a `moved` finding varies by a few px between them — including position would defeat the grouping in exactly the cases it matters most.
+- A change must appear in **every** analysed variant to qualify; errored and skipped variants don't count as agreeing, and the same change appearing twice within one variant can't masquerade as appearing across two.
+- A variant left with nothing unique now says so explicitly rather than falling through to "No differences detected", which would have been actively misleading.
+
+*Tooling note:* the edit that introduced this landed a literal NUL byte inside a `join()` separator — the transmission artifact this project has seen before. It made `grep` treat the whole 408KB file as binary and silently return nothing, while the code itself parsed and ran fine. Worth remembering that a grep returning *no output at all* (rather than "no match") on a known-good file is the tell.
+
+#### Control-vs-Control is now an error that stops the analysis
+
+Comparing Control against itself yields zero findings, and zero findings is indistinguishable from a clean pass. That made it the most dangerous outcome the tool could produce: a misconfigured run that reports success. The pipeline used to emit exactly that, as an ordinary result — *"No differences detected against control."*
+
+Three ways it can happen, all now caught, and none of them proceed to analysis:
+
+- **Same configured URL as Control** — a duplicated target row. Caught before any work is done, comparing normalized URLs so a trailing slash or capitalized host can't hide it.
+- **Redirected onto Control's final URL** — the forced-variant parameter was dropped en route. Caught on the same pre-flight check against `finalUrl`.
+- **Rendered identically to Control** — configured correctly, but the experiment never applied. Caught after the diff: zero findings *and* nothing added, removed, changed or restyled anywhere. This is the one that used to sail through as a pass.
+
+Each stops that variant, records `Analysis stopped — …`, and is reported as an **error** in Run Diagnostics that outranks every other note for the variant, ending with *"No QA result exists for this variant — do not read the absence of findings as a pass."* If every variant resolves to Control, the run itself bails with one message rather than a list of per-variant errors.
+
+The report badge needed fixing alongside it: `variantIssueCount` returns 0 for any errored variant, so a run where the experiment never applied would have shown a green **PASS**. The section now badges **NOT COMPARED** whenever any variant was a Control duplicate, and says so in the summary line. A judgment left in place deliberately: `redesign` mode is never assessed by this rule, since a low match rate has its own diagnosis and would otherwise be double-reported.
+
+#### Confirmed on a real page: full-page coverage, and both fixes hold
+
+Same page, same width, immediately before and after — the walk went from **201 to 521 control elements**, and the deepest element it can see moved from y=7960 to y=9698 on a 15140px page. 320 of those 521 elements sit past the screenshot's 8000px line and had never been part of any comparison.
+
+It paid for itself on the first run: **two real removals that were previously invisible** — the "Repurpose content" and "Implement IT support" template links at y≈9600, gone in every variant and detectable only now.
+
+The pixel-backstop fix held too: the variant that reported 31 false `style-changed` findings now reports **zero**, and all three variants land on the same **11 findings** — every one real, no noise. The two new deep-page removals are the difference between 9 and 11.
+
+- **Fixed a miscount in the new diagnostic itself.** `belowCapture.findings` counted every below-capture pair still in the working set, unchanged ones included, so it read **281** on a variant whose true answer was **2** — purely because a page-wide 4px shift (under `VD_MOVE_MIN_PX`) leaves pairs sitting as `unchanged` rather than being suppressed as reflow. A diagnostic that swings two orders of magnitude on whether a page happened to shift 4px or 47px is worse than none. It now counts reportable findings only.
+- The note also leads with coverage rather than caveat — "320 of 521 elements sit below the screenshot's reach and were compared from the DOM alone" — since the headline is how much of the page is newly being checked, not what is missing from it.
+
+#### Fixed: the pixel backstop fired on pairs that had moved
+
+A run where one variant reported 24 findings against its siblings' 10 — the extra 14 all `style-changed`, all with identical text, none naming a style property, with pixel ratios up to **1.000** on a paragraph whose content had not changed at all.
+
+The mechanism needed two variants of the same page to straddle a threshold before it became visible. That variant's lower page shifted a uniform **4px** — below `VD_MOVE_MIN_PX` (8), so nothing counted as "moved", the reflow-suppression branch never ran, and 146 pairs stayed `unchanged` and reached the pixel check. Its siblings shifted 47px, which cleared the move floor, so their pairs were suppressed as reflow and never arrived. Same page, same code, opposite outcomes.
+
+Once there, the check compared Control at `y` against Variant at `y+4`. Rects are rounded to integers, so a true shift of 4.4px stores as 4 and leaves sub-pixel residue — and against text that re-renders nearly every antialiased pixel, which is exactly how a ratio of 1.000 arises on identical copy.
+
+The backstop now runs only on pairs that have not moved at all (`dx` and `dy` both zero). That is what it was always for: CSS changes the style-field diff cannot see — a swapped background image, a dropped shadow, a gradient — none of which move an element. Replayed against the captured run, all 15 false findings disappear and that variant reports **9**, in line with its siblings' 10. The accepted cost: a real pixel-only change on an element that also moved will now be missed by this check, leaving the style-field diff and the unsuppressible whole-page ratio as its coverage.
+
+This also retires the open question from two runs earlier — four pixel-only `style-changed` findings that could not be attributed at the time. Same class, same cause.
+
+#### The whole page is now compared, not just the screenshot
+
+Control is the reference and must be scanned in full; variants only need to be checked for deviations against it. That was not what was happening: the DOM candidate walk was clamped to `capturedH` — the screenshot's 8000px ceiling — so on a 19845px page **60% of the document was never walked on either side**. A copy change, a removed button, or a restyled section below the fold could not be reported, because those elements were never recorded as candidates at all.
+
+The clamp was never necessary. The walk reads `getBoundingClientRect` and `getComputedStyle`; it does not read the screenshot. Text, colors, layout, and element presence — every category the deterministic diff actually detects — need no image. Only two consumers genuinely need pixels: the per-pair pixel backstop and report crops.
+
+- The walk now covers the entire document. Candidates past the capture line are diffed normally and carry `belowCapture` so the two pixel-dependent stages skip them rather than reading past the bitmap (which would either throw or, worse, silently compare whatever the clamped image holds at that coordinate).
+- Genuinely off-canvas content is still dropped — a carousel slide parked beyond the page width or above the origin, which no user and no screenshot ever sees. That was the filter's real job; the vertical clamp was collateral.
+- The truncation notice was rewritten and downgraded to a note, because the old wording is now false. It no longer claims the bottom "was never compared" — it says text, colors, layout and element presence *were* compared over the whole page, and that only the pixel backstop and crops are unavailable down there.
+- Two new diagnostics: the count of findings that have no image, and a warning when the walk hits its `VD_MAX_CANDIDATES` ceiling — previously unreachable behind the 8000px clamp, now genuinely possible on a very long page, and it truncates from the bottom.
+
+#### Fourth run: diff is clean, and it caught a real defect
+
+Geometry consistent across all four captures (877×738). 93.2% element match, normal mode on every variant, 101 reflow elements suppressed, and the single reported move is genuine — a CTA that really did relocate 3856px up the page. All 14 findings per variant are real changes; none are artifacts. With a Summary of Changes supplied for the first time, spec classification worked end to end and flagged **placeholder Lorem ipsum copy shipped in v3's live body text** as `unexpected` / `high`. `style-changed` findings now name the properties that changed (`color`, `backgroundColor`, `border`, `fontWeight`, `borderRadius`) rather than reporting a bare pixel delta.
+
+- **Fixed: React 19 `useId` values were accepted as stable ids.** Zapier's MCP/SDK/CLI tab buttons carried `id="_R_84qnmlb_-MCP"` on one run and `id="_r_5_-MCP"` on another — same elements, regenerated id. Neither form was caught by the existing reject list (no leading colon, fewer than four consecutive digits), so both were used as structural path **anchors**, which poisons the path key for the entire subtree beneath them. Text-tier matching happened to cover for it here, but `path` was carrying only 3 of 110 matches. Added `_R_`/`_r_`, React's legacy `«r0»`, and MUI/Chakra/Mantine prefixes.
+- **Truncation now states the fraction missed.** "Only the top 8000px was captured" reads as a technicality; "59% of the page was never compared, so no finding below that point can exist" is the actual blind spot. When the capture is under 1200px wide it also notes that a wider window makes a responsive page shorter — this run was 877px wide and 19845px tall, which is what pushed 60% of it out of range.
+
+#### Added: committed regression suite
+
+`extension/tests/vd-diff.test.js` — 114 assertions, `jsc vd-diff.test.js` from that directory. Previously these lived in a scratch directory and were re-derived from scratch each session, having already caught four real bugs. Each assertion's comment names the real-world failure it guards, and the two functions that live in `popup.js`/`background.js` are sliced out of those files rather than copied, so a rename breaks the suite loudly instead of silently testing a stale duplicate. Not wired into `.github/workflows/run-tests.yml`, which runs pytest against a `tests/` directory that does not exist in this repo — left alone deliberately, since the Python backend is out of scope for extension work.
+
+#### Fixed: captures were never pinned to a common viewport — found by the debug log on its first use
+
+The very first exported debug log showed Control captured at **1693×1281** and all three variants at **1470×802**. The window geometry changed partway through the run, and nothing noticed. On a responsive page that is not a comparison at all — it compares two different layouts — and it fails silently in the worst way: element matching collapsed to 12–14%, all three variants were misclassified as wholesale redesigns, reflow clustering produced a "trusted" 4844px band out of the relayout, and the run still finished and still presented a tidy two-finding result per variant. `captureWidth` had been recorded in the checkpoint since 2026-08-21 and was never once compared against anything.
+
+- Every capture in a run is now pinned to the **first** capture's viewport via `Emulation.setDeviceMetricsOverride`, re-stabilizing after the override since it reflows the page. The override is cleared in a `finally` rather than relying on detach — `withVariantDebugger` reuses an already-attached console-mirror session without detaching it, so an override left behind would follow the user's own tab.
+- A residual width mismatch, or a failed pin, is now an **error** in Run Diagnostics and the debug log, worded so the reader knows the findings are suspect rather than clean.
+- A redesign verdict is cross-referenced against it: when both are present, the report says the redesign classification is most likely the geometry mismatch rather than a real change, instead of letting a capture bug read as a finding about the experiment.
+
+This is exactly the class of failure the debug log was added for, and it surfaced on the first run — the previous run's 98% match rate had made the whole failure mode invisible.
+
+#### New: exportable debug log + Run Diagnostics section
+
+Prompted directly by how the cascade bug above was found: the report said "180 suppressed as page reflow" and nothing else, which was enough to know something was wrong and not enough to say what — the cause had to be located by rebuilding the page's geometry by hand, offline, from prose in a PDF. The run already had the data; it just wasn't kept.
+
+- **Run Diagnostics** — a new report section collecting every way a run was degraded: pages truncated at the 8000px capture limit, watched selectors that never matched, page JS errors, capped or unclassified findings, redesign-mode fallback, missing spec text. Individually most of these were already mentioned somewhere in per-section prose; scattered and interleaved with findings, they read as incidental, which is how a run with a truncated page and twelve dropped findings can still look clean. A clean run badges CLEAN with an empty table.
+- **Download debug log** — a button on the report page exporting the whole run as JSON (blob + `<a download>`, no new permission). Includes per-variant match-tier counts, the derived reflow bands for both axes, per-finding geometry and originating match tier, the unmatched residue, and any fuzzy pairings.
+- **The specific thing that was missing:** `movesByDelta` beside `shiftClusters`. A shift amount appearing repeatedly among *reported* moves while having no *trusted* cluster is the exact signature of reflow suppression under-matching — the whole diagnosis, straight off the run. `vdCollectProblems` checks for that pattern itself and writes it into `problems` in plain language rather than leaving it to be noticed.
+
+Severity is about whether the run's output can be trusted, not about how bad the page is: a page JS error is a finding *about the page* and stays `warn`, while `error` is reserved for a page that never loaded, a capture that failed, or a model response cut off mid-JSON.
+
+#### Verified
+
+53 jsc assertions across the engine and the wire adapter, all passing: identity matching (including the critical wrapper-div-insertion case that defeats path-based matching), the full normalization ladder, reflow segmentation and suppression, grouping, redesign-mode rollup, ranking, framework-id rejection, and a 3000×3000 perf guard. Both panel HTML files verified in sync.
+
+Plus an end-to-end regression simulation built from the real page's measured shape — overlapping −35/−58/−68 vertical bands, a horizontally re-wrapping link grid, one link removed and one added, and a planted rogue move. It reduces to **6 findings, every one real**, with 112 vertical and 24 horizontal reflow elements suppressed and the rogue move surviving.
+
+17 further assertions cover the debug log, fed the broken-cascade shape to confirm it names the cause rather than merely recording numbers. The report page itself was rendered in a browser against a stubbed storage record: the button enables, the count line matches the payload, and the click produces a blob download named `selenite-debug-<id>.json`.
+
+#### MEASURE GATE: passed
+
+Third run of the Zapier 4-variant case, with geometry consistent across all four captures (1587px; v3's capture was actively pinned, so the fix demonstrably fired on a real drift):
+
+| | old pipeline (v2 run) | this run |
+|---|---|---|
+| non-unchanged findings | 11 added / 5 removed / 26 modified / 2 style = **44** | 1–2 added / 1 removed / 2 modified / 4 style = **8–9** |
+| unchanged blocks | 3 | 36 |
+| element match rate | n/a (semantic blocks) | **99.2–99.6%** |
+| reflow suppressed | none — it cascaded into findings | 214–217 |
+| cascade leaked as false "moved" | ~25 (v2), ~49 (first gate run) | **0** |
+
+The hero copy swap is finding `f0`/`f1` on every variant, named exactly. `matchTierCounts` is `path+text 257, path 2` — and those two `path` matches are precisely the hero heading and subheadline, which is the copy-change pass doing exactly the job it was designed for. `movesByDelta` is empty on all three variants: the piecewise clustering explains every shift on the page.
+
+**Still open.** All four remaining `style-changed` findings per variant are pixel-backstop only — no named style property fired on any of them, so the deterministic style diff sees nothing and only raw pixels differ. Three vary in ratio across variants; one (a 24×24 icon) is identical to twelve decimal places on all three, which is suspicious but not conclusive: variants sharing a real change against Control is normal in an A/B test, so "identical across variants" does not by itself prove a capture artifact. The plan's own second acceptance test — Control vs Control, expecting zero findings — measures this directly and has not been run yet. Also unchanged: crops still render blank or off-target (the crop fix is a later step, deliberately not attempted here), and the page is 14166px against an 8000px capture limit, so ~43% of it is never compared. The report prompt, crops, and renderer internals remain on the old finding shape via a temporary adapter carrying `changeClass` alongside the legacy `status`.
+
+## 2026-08-21
+
+### Changed
+
+**Gap-fill follow-on to the 2026-08-18 pipeline rearchitecture, closing the gaps it left open without adding a step to the A/B workflow.** The 3-stage design (Sonnet scrape → local diff → Opus report, plus the coarse pixel backstop) is unchanged; this closes real gaps identified against an external gap-fill proposal, corrected against the actual code before building (the proposal's item 4 targeted a block type that structurally can't be pixel-hashed, item 3's pseudocode called `pixelmatch()` on data it didn't have, and two "cheap diagnostic" items assumed a debug affordance that didn't exist — see the approved plan for the full correction).
+
+#### New: hidden diagnostics (`popup.js`, `background.js`, `vd-overlay.js`)
+
+- `window.__vdDebug` — console-only, callable from the panel's own DevTools (right-click the side panel → Inspect). No new storage key, checkbox, or settings surface: a normal user never opens DevTools on this panel, so this is a genuinely zero-footprint hidden affordance.
+- `scrapeStabilityCheck(n=3)`: captures the active tab once, then re-scrapes that SAME screenshot/candidate list `n` times (new debug message `vdDebugScrapeStability`) to isolate Stage 1's model non-determinism from capture non-determinism. Reports % of candidates whose block membership changed across passes.
+- `showCandidateOverlay()`: draws every `domCandidateWalkFn` candidate as a labeled rect on the live page (new message `vdShowCandidateOverlay`, new file `vd-overlay.js`) for eyeballing leaf-block extraction on real pages. A new sibling file rather than an edit to `picker.js` — that file is a live feature (the step-builder element picker), not overlay scaffolding.
+- Also free: `scrapeVisualDiffPage`'s block sort gained an `x` tiebreak (was `y`-only), reducing alignment-destabilizing non-determinism at zero cost. `temperature: 0` was tried on Stage 1's Sonnet call for the same reason but reverted the same day — a real run against a live page showed the API rejects it outright for this model/call shape ("`temperature` is deprecated for this model"), which broke Stage 1 entirely and skipped Visual Diff end-to-end. This model doesn't accept a temperature parameter here at all; determinism has to come from prompt tightening or the other fixes in this entry instead.
+
+#### `domCandidateWalkFn` — two new filters (`background.js`)
+
+- `position:fixed`/`sticky` elements (sticky headers, cookie banners, chat widgets) are now excluded — their rect is viewport-relative, so in a full-page beyond-viewport capture it lands at the wrong document position, and CDP only paints them once at their normal viewport position rather than repeating them down the page.
+- Candidates entirely outside the captured page bounds are now dropped — e.g. an off-screen carousel slide that exists in the DOM but was never actually visible at capture time, which previously could generate phantom findings whenever Control and Variant happened to rest on different slides.
+
+#### New: per-block pixel check (`background.js`, `popup.js`) — closes the real capability gap
+
+- New Stage 2.5, `computeUnchangedBlockPromotions` (background.js) + a new per-variant message `pixelCheckVisualDiffFindings`, inserted between `diffPageScrapes` and `rankAndCapDiffFindings` so a promotion can compete for the finding cap. For every Stage-2 `'unchanged'` pairing with a same-sized rect on both sides, compares raw pixels (`makeReadContext` → `getImageData`, no PNG round-trip) and promotes to a new status, `'style-changed'`, when the difference exceeds `VIS_BLOCK_PIXEL_RATIO` (0.02) — the only coverage for a CSS-only regression (wrong background-image, missing box-shadow, color shift) that changes neither text nor position, previously invisible to the semantic pipeline entirely.
+- This is a genuinely new per-variant round trip, not a cost-neutral consolidation — said so explicitly rather than presented as free. The coarse whole-page backstop (`computeCoarsePixelDiffRatio`) moved into this same new message (it only needs the two screenshots, already being decoded here), which in exchange lets `reportVisualDiffFindings` shrink to a single, clean Opus call with no `Promise.all`.
+- `rankAndCapDiffFindings` ranks `style-changed` below structural changes (modified/added/removed) but above literal `unchanged`. `buildVisualReportPrompt` notes explicitly, for these findings, that text/position are identical and only rendering differs. `VIS_WHOLE_PAGE_RATIO`'s role is demoted (comment-only) to a "something changed broadly enough to look closer" sanity flag now that the precise case has real coverage.
+
+#### New: capture-width recording and two cost/latency reductions
+
+- The checkpoint root and cross-run cache now record `captureWidth` (`base.fullPage.pageW`, already captured, just not previously surfaced) — provenance for cross-run/resume comparisons, where widths can actually drift (never a risk within one run, since every variant shares one capture window by construction).
+- Stage 3 (Opus) is now skipped entirely when a variant has zero non-`unchanged` findings (`kept.length === 0`) — `overallSummary` is synthesized locally. The coarse backstop already ran in the earlier pixel-check message, so it's never a casualty of this optimization.
+- Control's scrape is now cached across separate runs, not just within one run: a new `chrome.storage.local` key (`visualDiffControlScrapeCache`, TTL ~1hr, keyed by url+width+settle) extends the existing checkpoint-caching machinery rather than introducing IndexedDB — the codebase's existing IndexedDB scaffolding (screenshots/recorded sessions) turned out to be dead code with no working precedent to build on, and `controlScrape` is small JSON, not an image, so the quota pressure IndexedDB exists for doesn't apply. New checkbox **Force fresh Control scrape** (`#ab-force-rescrape-control`, both `popup.html`/`sidepanel.html`, gated alongside the crops toggle) opts out per run; a cache hit is surfaced in the report summary line, never silently load-bearing.
+
+#### Grid reorder pairing — crossing-rejection (`popup.js`)
+
+- Pass 2's reorder recovery (`diffPageScrapes`) now rejects a pairing that crosses an already-established one UNLESS it wins by a clear margin (0.1) over the best order-preserving alternative — ties resolve to document order, which is right far more often than greedy-first for a grid of near-identical siblings. Narrows, doesn't eliminate, the known sibling-mismatch risk the function's own header comment already flagged.
+- Caught by writing the test for it before shipping: the first draft rejected a crossing pairing outright whenever no non-crossing alternative existed at all, turning one strong match into a spurious remove+add pair. Fixed to only prefer an alternative when one actually exists AND is competitive — with nothing to lose to, the crossing match is strictly better than leaving both sides unmatched.
+
+#### Stage 2 sweepable thresholds (`popup.js`, `background.js`) — new shared module
+
+- New `extension/vd-config.js`, following the exact `metric-match.js`/`pixelmatch.js` global-attachment convention (loaded via `importScripts` in `background.js`, via `<script src>` in both panel HTML files). Hoists `MATCH_THRESHOLD`/`REORDER_THRESHOLD`/`GAP_PENALTY` (previously function-local consts inside `diffPageScrapes`, not module-level as an earlier account assumed) and `blockSimilarity`'s weights (previously inline numeric literals, not named constants at all) alongside the new pixel-check constants and the existing `VIS_WHOLE_PAGE_RATIO`/`VIS_BAND_HEIGHT_PX`/`VIS_PIXELMATCH_THRESHOLD`/`VIS_PIXELMATCH_INCLUDE_AA`/`VIS_CROP_PAD` (previously scattered `background.js`-only consts). Stage 2 is pure JS with no network call — this is what makes it sweepable against a saved scrape corpus with zero API cost per iteration, once such a corpus exists.
+
+#### First real runs against a loaded extension — four bugs found and fixed across several iterations
+
+The pipeline had never run against a real, loaded extension until today (unchanged caveat since 2026-08-18) — a QA report against a live page (Zapier's homepage, 4 variants), re-run several times as each bug was fixed, surfaced four real bugs within the same session that shipped them:
+
+- **`temperature: 0`** (added above for determinism) is rejected outright by the API for this model/call shape (`` `temperature` is deprecated for this model ``) — reverted. This model doesn't accept a temperature parameter on Stage 1's call at all; determinism has to come from the other fixes in this entry instead.
+- **Stage 1's `max_tokens` (now `VIS_SCRAPE_MAX_TOKENS`) was too tight for a real, content-rich page at its old value of 4096.** A run showed Control's own scrape getting cut off mid-JSON (`stop_reason: 'max_tokens'`) — masked by the generic "invalid JSON" error until `runOneScrapeBand` was taught to check `stop_reason` before surfacing that message. Raised to 8192.
+- With that fixed, a run reached Stage 2/3 for the first time ever, for 2 of 3 variants — real `style-changed` findings appeared, confirming Stage 2.5's pixel-check promotions fire correctly on a real page, and Opus's classifications read as sound. The third variant's failure looked, from the report alone, like it could still be a Stage 1 problem (same bare "invalid JSON" message) — it wasn't.
+- **Stage 3's `max_tokens` (now `VIS_REPORT_MAX_TOKENS`) had the exact same 4096 problem, one call over.** `runOneScrapeBand`'s fix makes it structurally impossible for that function to return the bare, undiagnosed error string anymore — so when a later run showed exactly that bare string again, it meant the failure had moved to `runVisualReport` (Stage 3, Opus) instead, which nothing had touched yet. A variant with up to `VIS_MAX_DIFF_FINDINGS` (60, popup.js) findings needs a `{findingId, classification, severity, note}` for every one of them plus an `overallSummary` — the same cap, undersized the same way, one stage later. Fixed identically: raised to 8192, same `stop_reason`-aware diagnostics added.
+
+Also notable, not a bug: the same live runs' Agentic Testing notes (Sonnet) correctly identified the four variants as an intentional headline/copy test on every pass, and separately flagged a "How did you hear about us?" survey widget shuffling its option order between variants as a likely-unintended side effect unrelated to the test — exactly the kind of judgment call that stage exists for. Also unresolved, not yet a bug: several template-card findings' crop thumbnails rendered blank or showed what looked like the wrong region of the page — flagged for follow-up, not fixed blind, since the actual rect/coordinate data behind them isn't visible from a rendered report.
+
+#### Verified so far — static tests plus the live run above
+
+New jsc functional tests (not committed to the repo — see the 2026-08-18 entry's own note on why; recreated each session) covering: control-vs-control yields zero non-unchanged findings, the 0.45 same-slot-text-rewrite threshold still holds after hoisting into `vd-config.js`, a genuine insertion doesn't cascade into false findings, the crossing-rejection fix (both the bug caught above and the intended margin-based override), `rankAndCapDiffFindings`'s new three-tier ranking, and `computeUnchangedBlockPromotions`'s gating logic (mocked `pixelmatch`/canvas context, since jsc has no DOM/canvas). Deferred: item 4 (pixel signature for weak-text blocks) — the plan's own premise (`blockSimilarity`'s text term is starved by empty `text`) turned out to double-count with `label`, which is always populated; building it needs a real-page check first to confirm labels don't already disambiguate.
+
+Real-page coverage as of today: Stage 2's diff, the new pixel-check promotions, and Stage 3's Opus report have now run for real (2 of 3 variants in the live run above). Not yet exercised on a real page: skip-Opus-on-zero-findings (every real variant so far has had non-`unchanged` findings), the cross-run control-scrape cache, and the crop toggle. One variant's scrape still fails with an unexplained non-truncation JSON error — see above.
+
 ## 2026-08-18
 
 ### Changed

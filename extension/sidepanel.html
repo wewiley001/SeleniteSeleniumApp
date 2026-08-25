@@ -1150,17 +1150,8 @@
         <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Leave each variant tab open for manual inspection">
           <input type="checkbox" id="ab-keep-tabs" style="accent-color:var(--brand);cursor:pointer">Keep tabs open
         </label>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Record your own walk on each kept-open variant tab and view it as a click/scroll heatmap overlay — requires Keep tabs open">
-          <input type="checkbox" id="ab-record-heatmap" disabled style="accent-color:var(--brand);cursor:pointer">Record interaction heatmap (requires keep tabs open)
-        </label>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Full-page screenshot of each variant vs Control, AI-compared for visual differences. Separate from Agentic Testing. Works standalone with the Summary of Changes below, or auto-fills from an active, reviewed ticket context.">
-          <input type="checkbox" id="ab-visual-diff" style="accent-color:var(--brand);cursor:pointer">Visual Diff (AI)
-        </label>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Show before/after crop images for each Visual Diff finding in the report — requires Visual Diff (AI). Off keeps the report text-only, smaller, and faster to build.">
-          <input type="checkbox" id="ab-visual-diff-crops" disabled style="accent-color:var(--brand);cursor:pointer">Show crop images in report
-        </label>
-        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="One viewport screenshot per variant, AI-compared for a holistic summary. Separate from Visual Diff.">
-          <input type="checkbox" id="ab-agentic-testing" style="accent-color:var(--brand);cursor:pointer">Agentic Testing (Sonnet)
+        <label class="row" style="gap:5px;font-size:11px;color:var(--fg2);cursor:pointer" title="Show before/after crop images for each Visual Diff finding in the report. Off keeps the report text-only, smaller, and faster to build.">
+          <input type="checkbox" id="ab-visual-diff-crops" style="accent-color:var(--brand);cursor:pointer">Show crop images in report
         </label>
       </div>
 
@@ -1182,6 +1173,8 @@
 </div>
 
 <script src="metric-match.js"></script>
+<script src="vd-config.js"></script>
+<script src="vd-diff.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>

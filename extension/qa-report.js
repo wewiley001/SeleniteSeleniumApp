@@ -8,6 +8,8 @@
 (async () => {
   const content = document.getElementById('qa-report-content');
   const printBtn = document.getElementById('qa-print-btn');
+  const debugBtn = document.getElementById('qa-debug-btn');
+  const debugNote = document.getElementById('qa-debug-note');
   printBtn?.addEventListener('click', () => window.print());
 
   const id = new URLSearchParams(location.search).get('k');
@@ -24,6 +26,35 @@
     }
     if (report.title) document.title = report.title;
     content.innerHTML = report.bodyHtml || '';
+
+    // The debug log is a separate download rather than a section in the page:
+    // it's JSON meant to be attached to a bug report or diffed between runs,
+    // and it must not print. A blob + <a download> works here without the
+    // "downloads" permission because this is a normal extension page.
+    if (report.debugLog) {
+      const problems = report.debugLog.problems || [];
+      const errors = problems.filter(p => p.severity === 'error').length;
+      const warns = problems.filter(p => p.severity === 'warn').length;
+      debugNote.textContent = problems.length
+        ? `Debug log: ${errors} error${errors === 1 ? '' : 's'}, ${warns} warning${warns === 1 ? '' : 's'}`
+        : 'Debug log: nothing degraded this run';
+      debugBtn.disabled = false;
+      debugBtn.addEventListener('click', () => {
+        const blob = new Blob([JSON.stringify(report.debugLog, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `selenite-debug-${id}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Revoke on the next tick, not synchronously — Chrome needs the URL
+        // to still resolve while it starts the download.
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      });
+    } else {
+      debugNote.textContent = 'No debug log recorded for this report.';
+    }
   } catch (e) {
     content.innerHTML = '<p class="rpt-muted">Could not load report: ' + (e && e.message ? e.message : String(e)) + '</p>';
   }
