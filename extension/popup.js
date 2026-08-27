@@ -5079,8 +5079,23 @@ function rptAbSection(entry) {
 // result shape ({findings, overallSummary, structuralStats, pixelDiff, ...}
 // — see runVisualDiffPipeline). Rendered as inert markup instead of live,
 // collapsible DOM — a report has no toggle state to preserve, so every
-// section renders open except the usually-uninteresting "expected" bucket,
-// kept collapsed via <details> to match the old inline version's own choice.
+// section renders open.
+//
+// Nothing is gated on `classification`. The "expected" bucket used to be
+// collapsed into a <details>, inherited from the old inline version, and two
+// runs of ENOC-97 taken 106 seconds apart showed why that cannot stand: the
+// deterministic diff was byte-identical down to a matchedFraction of
+// 0.24285714285714285 and a pixelDiff of 0.6694682506079291, and the report
+// call still graded the same seven findings 7-expected on one run and
+// 5-expected/2-unclear on the next. The run that graded 7/7 collapsed every
+// finding, so a real question — a footer that matched 11/11 against a ticket
+// asking for new disclaimer copy — was in the report only as a closed
+// triangle, while the other run surfaced it. Sampling variance cannot be
+// removed here: `temperature` is not a parameter on claude-opus-5 (it is
+// removed on the whole current family and returns a 400), so the fix is to
+// stop letting an unstable label decide VISIBILITY. It still decides order
+// and it still gets a chip; it no longer decides whether a reader sees the
+// finding at all.
 function rptAbVisualDiffSection(vd) {
   if (!vd) return '';
   if (vd.skipped) {
@@ -5102,6 +5117,21 @@ function rptAbVisualDiffSection(vd) {
     return 'other';
   };
 
+  // Inline-styled rather than a class: the grade now appears on every row
+  // instead of being implied by which bucket a row was filed under, and
+  // qa-report.html is a separate document from the two popup shells, so a
+  // chip that carries its own colour needs no third stylesheet edit.
+  const GRADE_STYLE = {
+    unexpected: 'background:#fdecea;color:#a3261a;border-color:#f2c2bb',
+    unclear: 'background:#fff6e5;color:#8a5a00;border-color:#f0dcb0',
+    expected: 'background:#f1f3f5;color:#666;border-color:#dcdfe3',
+  };
+  const gradeChip = (f) => {
+    const g = f.classification;
+    if (!g || !GRADE_STYLE[g]) return '';
+    return `<span style="display:inline-block;border:1px solid;border-radius:3px;padding:0 4px;margin-right:5px;font-size:9px;text-transform:uppercase;letter-spacing:.03em;${GRADE_STYLE[g]}">${q(g)}</span>`;
+  };
+
   const findingRow = (f, resumedVariant) => {
     const rect = f.controlBlock?.rect || f.variantBlock?.rect;
     let media;
@@ -5118,7 +5148,7 @@ function rptAbVisualDiffSection(vd) {
     const label = f.controlBlock?.label || f.variantBlock?.label || '';
     return `<div class="ab-line">
       ${media}
-      <div class="ab-cline"><span class="ab-delta">${q(findingType(f))}</span> ${q(label)}${label ? ' — ' : ''}${q(f.note || '')}</div>
+      <div class="ab-cline">${gradeChip(f)}<span class="ab-delta">${q(findingType(f))}</span> ${q(label)}${label ? ' — ' : ''}${q(f.note || '')}</div>
     </div>`;
   };
 
@@ -5162,6 +5192,15 @@ function rptAbVisualDiffSection(vd) {
     const unexpected = findings.filter(f => f.classification === 'unexpected');
     const unclear    = findings.filter(f => f.classification === 'unclear');
     const expected    = findings.filter(f => f.classification === 'expected');
+    // Anything the model returned without a usable verdict. Filtering into
+    // three named buckets and rendering only those three DROPPED these
+    // outright — v.noVerdictCount below has always told the reader such
+    // findings exist, and the report then showed none of them. That is the
+    // collapse bug in its worst form: not hidden behind a triangle, absent.
+    // Ordered above `expected` deliberately: "the model did not judge this"
+    // needs a human more than "the model judged this intended" does.
+    const GRADED = { unexpected: 1, unclear: 1, expected: 1 };
+    const ungraded = findings.filter(f => !GRADED[f.classification]);
     const s = v.structuralStats || {};
 
     const summaryHtml = v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '';
@@ -5210,7 +5249,8 @@ function rptAbVisualDiffSection(vd) {
     const body = summaryHtml + notes + (findings.length ? `
       ${unexpected.map(f => findingRow(f, v.resumed)).join('')}
       ${unclear.map(f => findingRow(f, v.resumed)).join('')}
-      ${expected.length ? `<details><summary style="cursor:pointer;font-size:11px;color:#777">${expected.length} expected difference${expected.length !== 1 ? 's' : ''}</summary>${expected.map(f => findingRow(f, v.resumed)).join('')}</details>` : ''}
+      ${ungraded.length ? `<div class="ab-cline ab-warn" style="margin-top:8px">${ungraded.length} finding${ungraded.length !== 1 ? 's' : ''} came back without a usable verdict — unjudged, not cleared. Review directly.</div>${ungraded.map(f => findingRow(f, v.resumed)).join('')}` : ''}
+      ${expected.length ? `<div class="ab-cline rpt-muted" style="margin-top:8px">${expected.length} difference${expected.length !== 1 ? 's' : ''} graded expected against the spec, shown in full. This grade is a model judgment and has been measured to move between runs on identical diff output — read them rather than trusting the grade.</div>${expected.map(f => findingRow(f, v.resumed)).join('')}` : ''}
     ` : `<p class="rpt-muted">${shared.length
         ? 'Nothing unique to this variant — every difference it has from ' + q(vd.baselineLabel) + ' is listed under “Common to all variants” above.'
         : 'No differences detected.'}</p>`);
@@ -5408,6 +5448,16 @@ function buildDesignReferenceDebug(ctx, state, hasFigmaPat) {
       present: !!summary,
       length: summary.length,
       source: summary ? (state?.summarySource || 'unknown') : null,
+      // The text itself, not just its length. Every expected/unexpected
+      // verdict in the report is relative to this string, and both model
+      // calls quote it back as justification — the agentic note and the
+      // report's own per-finding notes. Recording only `length: 11716` meant
+      // a claim like "the ticket specifies updated disclaimer footnotes"
+      // could not be checked against anything, which came up on ENOC-97 when
+      // two runs made opposite claims about the footer and the log had no way
+      // to say which one had read the ticket correctly. Uncapped on purpose:
+      // a truncated spec is exactly as unverifiable as an absent one.
+      text: summary || null,
     },
     figma: {
       urlUsed: (state?.figmaUrl || '').trim() || null,
