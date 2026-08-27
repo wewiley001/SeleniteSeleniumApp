@@ -2569,6 +2569,10 @@ function abDefaultState() {
     // still works) but has no UI and is never switched on.
     visualDiff: true, visualDiffCrops: true, agenticTesting: true, summaryOfChanges: '',
     figmaUrl: '',
+    // Off by default, deliberately. This writes the text every finding is
+    // graded against, and it writes it by reading an image — so it is opt-in
+    // rather than something that happens to a run you did not ask for.
+    figmaAutofill: false,
     targets: [
       { label: 'v0', url: '', override: '' },
       { label: 'v1', url: '', override: '' },
@@ -2614,6 +2618,11 @@ async function initAbCompare() {
   document.getElementById('ab-figma-url')?.addEventListener('input', e => {
     abState.figmaUrl = e.target.value;
     persistAbState();
+  });
+  document.getElementById('ab-figma-autofill')?.addEventListener('change', e => {
+    abState.figmaAutofill = e.target.checked;
+    persistAbState();
+    if (e.target.checked) autofillAbSummary();
   });
 
   // Board-access check. Whether view/comment access reaches the node tree is
@@ -2679,6 +2688,8 @@ function applyAbStateToInputs() {
   document.getElementById('ab-summary-of-changes').value = abState.summaryOfChanges || '';
   const abFigmaEl = document.getElementById('ab-figma-url');
   if (abFigmaEl) abFigmaEl.value = abState.figmaUrl || '';
+  const abFigmaChk = document.getElementById('ab-figma-autofill');
+  if (abFigmaChk) abFigmaChk.checked = !!abState.figmaAutofill;
 }
 
 function persistAbState() {
@@ -2919,35 +2930,68 @@ function buildSummaryFromFigmaVariants(variants) {
 //     an empty box — an empty box makes every finding "unclear" by
 //     construction.
 async function autofillAbSummaryFromFigma() {
-  if (!abState || (abState.summaryOfChanges || '').trim()) return;
+  if (!abState || !abState.figmaAutofill) return;
+  if ((abState.summaryOfChanges || '').trim()) return;
 
   const ctx = await getActiveContext().catch(() => null);
   const url = (abState.figmaUrl || '').trim() || (ctx?.reviewed ? ctx.figmaUrl : null);
-  const image = ctx?.reviewed ? await getCompImage(ctx) : null;
-  if (!url && !image) return;
+  const compDataUrl = ctx?.reviewed ? await getCompImage(ctx) : null;
+  if (!url && !compDataUrl) return;
 
-  const labels = url ? await figmaFetchVariationLabels(url) : [];
-  if (!image && !labels.length) return;
+  // Board renders are the preferred input, not an optimisation. The four-up
+  // attachment cannot carry legible fine print — see figmaRenderBoards in
+  // background.js for the arithmetic — and the comp is only the fallback for
+  // when there is no token.
+  let labels = [], boards = [];
+  if (url) {
+    const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth: 4 }).catch(() => null);
+    if (res?.ok) {
+      const c = figmaClassifyChildren(res.node?.children || []);
+      labels = c.labels || [];
+      const ids = [...new Set([...c.boards.map(b => b.variantId), ...labels.map(l => l.variantId)].filter(Boolean))].sort();
+      const picks = ids
+        .map(id => ({ id, sel: figmaSelectDesktopBoard(c.boards, id), label: labels.find(l => l.variantId === id) }))
+        .filter(p => p.sel.board);
+      if (picks.length) {
+        const rendered = await chrome.runtime.sendMessage({
+          action: 'figmaRenderBoards', url, nodeIds: picks.map(p => p.sel.board.nodeId),
+        }).catch(e => ({ ok: false, error: e.message }));
+        if (rendered?.ok) {
+          boards = picks
+            .map(p => ({ variantId: p.id, name: p.label?.changeName || p.sel.board.name, dataUrl: rendered.images[p.sel.board.nodeId] }))
+            .filter(b => b.dataUrl);
+          (rendered.failures || []).forEach(f => console.warn('[Selenite] Board render failed:', f));
+        } else {
+          console.warn('[Selenite] Board render failed —', rendered?.error);
+        }
+      }
+    }
+  }
+
+  if (!boards.length && !compDataUrl && !labels.length) return;
 
   let summary = '', source = null;
 
-  if (image) {
+  if (boards.length || compDataUrl) {
     const res = await chrome.runtime.sendMessage({
       action: 'figmaSummarizeComp',
-      payload: { dataUrl: image, labels, ticketKey: ctx?.ticketKey || null },
+      payload: { boards, compDataUrl, labels, ticketKey: ctx?.ticketKey || null },
     }).catch(e => ({ ok: false, error: e.message }));
 
     if (res?.ok) {
       summary = buildSummaryFromFigmaVariants(res.variants);
-      source = res.usedFileLabels ? 'figma-comp+labels' : 'figma-comp';
-      (res.flags || []).forEach(f => console.warn('[Selenite] Comp read flag:', f));
+      // The source string records HOW the spec was read, not just that it was
+      // — the report prompt keys "absence means unclear" off the figma- prefix,
+      // and the whole-sheet path is materially less trustworthy than per-board.
+      source = res.perBoard ? 'figma-boards' : (res.usedFileLabels ? 'figma-comp+labels' : 'figma-comp');
+      (res.flags || []).forEach(f => console.warn('[Selenite] Design read flag:', f));
     } else {
-      console.warn('[Selenite] Comp summary failed —', res?.error || 'no response');
+      console.warn('[Selenite] Design summary failed —', res?.error || 'no response');
     }
   }
 
-  // Labels-only path: no image, or the vision call failed. No model involved
-  // at all here — these are the designer's own strings.
+  // Labels-only path: no images, or the vision call failed. No model at all
+  // here — these are the designer's own strings.
   if (!summary && labels.length) {
     summary = labels
       .filter(l => l.variantId)
@@ -2957,8 +3001,8 @@ async function autofillAbSummaryFromFigma() {
   }
 
   if (!summary) return;
-  // Re-check: the vision call can take seconds, and the user may have typed
-  // into the box while it was in flight. Never clobber that.
+  // Re-check: the render + vision round trip takes seconds, and the user may
+  // have typed into the box meanwhile. Never clobber that.
   if ((abState.summaryOfChanges || '').trim()) return;
 
   abState.summaryOfChanges = summary;
@@ -2968,7 +3012,10 @@ async function autofillAbSummaryFromFigma() {
   if (el) el.value = summary;
   const note = document.getElementById('ab-figma-out');
   if (note) {
-    note.innerHTML = `<div style="color:var(--warn)">Summary of Changes was auto-written from the design comp (${esc(source)}) — read it before running, it decides how every finding is graded.</div>`;
+    const weak = source !== 'figma-boards' && source !== 'figma-labels';
+    note.innerHTML = `<div style="color:var(--warn)">Summary of Changes was written from the design (${esc(source)}) — read it before running, it decides how every finding is graded.`
+      + (weak ? ' It was read from the multi-board comp image, where small text may be illegible, so it is likely incomplete.' : '')
+      + '</div>';
   }
 }
 
@@ -3485,26 +3532,51 @@ async function vdFigmaBoards(url) {
 async function vdFigmaSummary() {
   const ctx = await getActiveContext().catch(() => null);
   const url = (abState?.figmaUrl || '').trim() || (ctx?.reviewed ? ctx.figmaUrl : null);
-  const image = ctx?.reviewed ? await getCompImage(ctx) : null;
+  const compDataUrl = ctx?.reviewed ? await getCompImage(ctx) : null;
 
-  console.log(`[vdDebug] ticket ${ctx?.ticketKey || '(none)'} — link ${url ? 'yes' : 'no'}, comp image ${image ? 'yes' : 'no'}`);
-  if (!url && !image) { console.warn('[vdDebug] Nothing to read — no Figma link and no comp attachment.'); return null; }
+  console.log(`[vdDebug] ticket ${ctx?.ticketKey || '(none)'} — link ${url ? 'yes' : 'no'}, comp image ${compDataUrl ? 'yes' : 'no'}, autofill ${abState?.figmaAutofill ? 'ON' : 'OFF'}`);
+  if (!url && !compDataUrl) { console.warn('[vdDebug] Nothing to read.'); return null; }
 
-  const labels = url ? await figmaFetchVariationLabels(url) : [];
-  console.log(`[vdDebug] ${labels.length} Variation label(s) from the file:`, labels.map(l => `${l.variantId}=${l.changeName}`));
-  if (!image) { console.warn('[vdDebug] No comp image — the autofill would use labels only, with no model call.'); return { labels }; }
+  let labels = [], boards = [];
+  if (url) {
+    const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth: 4 }).catch(() => null);
+    if (res?.ok) {
+      const c = figmaClassifyChildren(res.node?.children || []);
+      labels = c.labels || [];
+      const ids = [...new Set([...c.boards.map(b => b.variantId), ...labels.map(l => l.variantId)].filter(Boolean))].sort();
+      const picks = ids
+        .map(id => ({ id, sel: figmaSelectDesktopBoard(c.boards, id), label: labels.find(l => l.variantId === id) }))
+        .filter(p => p.sel.board);
+      console.log(`[vdDebug] ${labels.length} label(s), ${picks.length} desktop board(s) to render:`, picks.map(p => p.id + '=' + p.sel.board.nodeId));
+      if (picks.length) {
+        const rendered = await chrome.runtime.sendMessage({
+          action: 'figmaRenderBoards', url, nodeIds: picks.map(p => p.sel.board.nodeId),
+        }).catch(e => ({ ok: false, error: e.message }));
+        if (rendered?.ok) {
+          boards = picks
+            .map(p => ({ variantId: p.id, name: p.label?.changeName || p.sel.board.name, dataUrl: rendered.images[p.sel.board.nodeId] }))
+            .filter(b => b.dataUrl);
+          console.log('[vdDebug] rendered board sizes (base64 chars):', boards.map(b => b.variantId + '=' + b.dataUrl.length));
+          (rendered.failures || []).forEach(f => console.warn('[vdDebug] render failure:', f));
+        } else console.error('[vdDebug] Board render failed —', rendered?.error);
+      }
+    }
+  }
+
+  if (!boards.length && !compDataUrl) { console.warn('[vdDebug] No images — the autofill would use labels only.'); return { labels }; }
+  if (!boards.length) console.warn('[vdDebug] Falling back to the four-up comp image; small text will not be legible.');
 
   const res = await chrome.runtime.sendMessage({
     action: 'figmaSummarizeComp',
-    payload: { dataUrl: image, labels, ticketKey: ctx?.ticketKey || null },
+    payload: { boards, compDataUrl, labels, ticketKey: ctx?.ticketKey || null },
   }).catch(e => ({ ok: false, error: e.message }));
 
-  if (!res?.ok) { console.error('[vdDebug] Comp summary failed —', res?.error, res?.raw || ''); return res; }
-  console.log('[vdDebug] anchored on file labels:', res.usedFileLabels);
-  if (res.truncated) console.warn('[vdDebug] Response hit max_tokens — the summary is incomplete.');
+  if (!res?.ok) { console.error('[vdDebug] Summary failed —', res?.error, res?.raw || ''); return res; }
+  console.log(`[vdDebug] perBoard=${res.perBoard} (${res.boardCount} board image(s)), anchored on file labels=${res.usedFileLabels}`);
+  if (res.truncated) console.warn('[vdDebug] Response hit max_tokens — incomplete.');
   (res.flags || []).forEach(f => console.warn('[vdDebug] flag:', f));
   console.table(res.variants || []);
-  console.log('[vdDebug] Would write:\n' + buildSummaryFromFigmaVariants(res.variants));
+  console.log('[vdDebug] Would write (NOT written):\n' + buildSummaryFromFigmaVariants(res.variants));
   return res;
 }
 
@@ -3796,7 +3868,8 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       action: 'reportVisualDiffFindings',
       payload: {
         winId: WIN_ID, runId, baselineLabel: base.label, variantLabel: c.label,
-        findings: kept, stats: structuralStats, ticketVariantText: ticketText || null, pixelDiff,
+        findings: kept, stats: structuralStats, ticketVariantText: ticketText || null,
+        specSource: abState.summarySource || null, pixelDiff,
       },
     });
     if (!reportRes?.ok) {
