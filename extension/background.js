@@ -2064,15 +2064,38 @@ async function captureFullPageAndViewport(tabId, { captureForVision, extractDomC
             deviceScaleFactor: 0, mobile: false,
           });
           overrodeMetrics = true;
-          // Re-run stabilization: the override reflows the page, which can
-          // remount lazy content and move everything measured a moment ago.
-          await stabilizeForCapture(tabId);
-          metrics = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics');
         } catch (e) {
           geometryPinFailed = e.message;   // surfaced in meta, never thrown — a warned capture beats none
         }
       }
     }
+
+    // ── Second settle, for EVERY capture ─────────────────────────────────
+    // This used to live inside the override branch, which made settle-count a
+    // hidden covariate of geometryPinned: pinned captures got two full
+    // stabilization passes and unpinned captures got one. stabilizeForCapture
+    // scrolls to the bottom, waits 350ms, scrolls back, waits 150ms, re-pauses
+    // video and awaits document.fonts.ready — so the pinned path also got an
+    // extra lazy-load sweep, an extra ~500ms, and a second font-ready await.
+    //
+    // Five real runs showed the whole-page pixel ratio tracking geometryPinned
+    // perfectly (0.53 pinned / 0.08 not, 5/5) with a byte-identical DOM on both
+    // sides. That is equally the signature of "the variant rendered in a
+    // different geometry" and of "a webfont or lazy image resolved during the
+    // second pass" — and while the two were confounded, the data could not tell
+    // them apart. Making the count constant removes the covariate: if the
+    // correlation survives, the cause is geometry; if it vanishes, it was
+    // settle time.
+    //
+    // Running it unconditionally is also correct independent of that question.
+    // The pre-attach stabilize at the top of this function happens BEFORE
+    // withVariantDebugger, so the first getLayoutMetrics can land while the
+    // "Selenite is debugging this browser" infobar is still animating in and
+    // shrinking cssVisualViewport.clientHeight. This pass is always post-attach
+    // and post-settle, so the metrics the capture actually uses are read from a
+    // quiet page every time rather than only on pinned runs.
+    await stabilizeForCapture(tabId);
+    metrics = await chrome.debugger.sendCommand(target, 'Page.getLayoutMetrics');
 
     try {
       const pageW = Math.ceil(metrics.cssContentSize.width);
@@ -2089,6 +2112,9 @@ async function captureFullPageAndViewport(tabId, { captureForVision, extractDomC
         meta: {
           pageW, pageH, capturedH, truncated: pageH > VIS_MAX_CAPTURE_HEIGHT, viewportH,
           geometryPinned: overrodeMetrics, geometryPinFailed,
+          // Constant by construction now. Recorded so a debug log proves it
+          // rather than leaving the reader to infer it from the code version.
+          stabilizePasses: 2,
         },
       };
       if (captureForVision) {
