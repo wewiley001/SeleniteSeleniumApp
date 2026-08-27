@@ -2402,9 +2402,29 @@ function vdFindingArea(f) {
 
 function vdFindingToWire(f, findingId) {
   if (f.synthetic) {
+    // A reflow aggregate has no region and no rect, and stays imageless. A
+    // region ROLLUP now carries the union box of its members per side, so a
+    // redesign-mode report shows what changed instead of describing it in
+    // prose — that mode reports nothing but rollups, so without this it
+    // produces no images whatsoever, in exactly the case where a reviewer
+    // most needs to look at the page.
+    //
+    // Note the tension with the group comment below: a union bbox is mostly
+    // whitespace and that is why the OLD pipeline's crops came out blank. The
+    // difference is what the crop is of. For a merged group the union is an
+    // accident of which elements happened to merge, so the largest member is
+    // the honest subject. For a region the union IS the subject — the finding
+    // is a claim about the whole <section>, and cropAndDownscale bounds the
+    // result, so a tall region returns a readable thumbnail rather than a
+    // huge asset. rectSource says which of the two a reader is looking at.
+    const regionBlock = (rect) => (rect ? {
+      type: 'region', label: f.region || null, text: null, rect,
+      rectSource: 'region-union', belowCapture: false, offCanvas: false,
+    } : null);
     return {
       findingId, changeClass: f.changeClass, status: vdLegacyStatus(f.changeClass),
-      controlBlock: null, variantBlock: null, changeSignals: [f.changeClass],
+      controlBlock: regionBlock(f.controlRect), variantBlock: regionBlock(f.variantRect),
+      changeSignals: [f.changeClass],
       region: f.region || null, engineNote: f.note || null, synthetic: true,
     };
   }
@@ -2487,6 +2507,8 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
     // the one place vision genuinely earns its cost.
     reportable = vdRollupByRegion(match, controlList, variantList).map(r => ({
       changeClass: 'region-rollup', synthetic: true, region: r.region,
+      // Carried so the crop stage has something to crop at all.
+      controlRect: r.controlRect, variantRect: r.variantRect,
       note: `${r.region}: ${r.controlCount} elements in Control, ${r.variantCount} in Variant, ${r.matchedCount} matched.`
         + (r.samples.length ? ` Largest differences: ${r.samples.map(s => `${s.side} ${s.desc}`).join('; ')}.` : ''),
     }));
@@ -2496,8 +2518,8 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
 
   const { kept, truncatedCount } = rankAndCapDiffFindings(reportable, { watchedRects: watchedRects || [] });
   kept.sort((x, y) => {
-    const xr = (x.a && x.a.rect) || (x.b && x.b.rect) || (x.members && ((x.members[0].a || x.members[0].b || {}).rect));
-    const yr = (y.a && y.a.rect) || (y.b && y.b.rect) || (y.members && ((y.members[0].a || y.members[0].b || {}).rect));
+    const xr = (x.a && x.a.rect) || (x.b && x.b.rect) || x.controlRect || x.variantRect || (x.members && ((x.members[0].a || x.members[0].b || {}).rect));
+    const yr = (y.a && y.a.rect) || (y.b && y.b.rect) || y.controlRect || y.variantRect || (y.members && ((y.members[0].a || y.members[0].b || {}).rect));
     return (xr ? xr.y : Infinity) - (yr ? yr.y : Infinity);
   });
 

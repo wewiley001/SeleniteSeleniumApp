@@ -872,6 +872,46 @@ section('below-capture coverage');
      null);
 })();
 
+// ── 8b1. Region rollups must be croppable ──────────────────────────────────
+section('region rollup rects');
+(function rollupRects() {
+  // Redesign mode reports NOTHING but region rollups, and those used to carry
+  // no rect at all — so a "wholesale redesign" verdict produced seven lines of
+  // prose and zero images, in exactly the case where a reviewer most needs to
+  // look at the page. Observed on a real run: 24% element match, 7 findings,
+  // every controlRect and variantRect null.
+  function el(region, x, y, w, h, extra) {
+    var c = { region: region, rect: { x: x, y: y, w: w, h: h }, tag: 'div', text: '' };
+    return Object.assign(c, extra || {});
+  }
+  var control = [el('header', 0, 0, 1000, 80), el('main', 0, 100, 1000, 400), el('main', 0, 600, 800, 200)];
+  var variant = [el('header', 0, 0, 1000, 80), el('main', 0, 100, 1000, 900)];
+  var out = vdRollupByRegion({ pairs: [], removed: control, added: variant }, control, variant);
+  var main = out.filter(function (r) { return r.region === 'main'; })[0];
+
+  ok('a region gets a control-side box', !!main.controlRect, main);
+  eq('...unioned over every member: y', main.controlRect.y, 100);
+  eq('...and height spans to the last member', main.controlRect.h, 700);
+  eq('variant side is unioned independently', main.variantRect.h, 900);
+
+  // Elements outside the captured frame have no pixels. Unioning them would
+  // stretch the box into blank space and shrink the visible part to nothing
+  // once cropAndDownscale fits it to VIS_MAX_CROP_EDGE.
+  var withOff = [el('main', 0, 100, 1000, 400), el('main', 0, 9000, 1000, 200, { belowCapture: true }),
+                 el('main', 5000, 100, 100, 100, { offCanvas: true })];
+  var off = vdRollupByRegion({ pairs: [], removed: withOff, added: [] }, withOff, []);
+  var m2 = off.filter(function (r) { return r.region === 'main'; })[0];
+  eq('below-capture members do not stretch the box', m2.controlRect.h, 400);
+  eq('off-canvas members do not stretch it either', m2.controlRect.w, 1000);
+
+  // A side with no visible members must stay null rather than becoming a
+  // zero-size box that crops to a 1px sliver.
+  ok('an empty side yields no rect', m2.variantRect === null, m2);
+
+  eq('grow from null seeds the box', vdGrowRect(null, el('x', 5, 6, 7, 8)).x, 5);
+  ok('a member with no rect is skipped', vdGrowRect(null, { region: 'x' }) === null);
+})();
+
 // ── 8b2. CSS px vs device px ───────────────────────────────────────────────
 section('image scale');
 (function imageScale() {

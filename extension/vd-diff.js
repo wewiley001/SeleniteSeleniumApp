@@ -639,15 +639,42 @@
   }
 
   // -- Redesign-mode rollup -------------------------------------------------
+  // Grows a union box over a region's members. Elements outside the captured
+  // frame are skipped rather than unioned: no pixels exist out there, so
+  // including them would stretch the box into blank space and push the part
+  // that IS visible down to a few unreadable pixels after downscaling.
+  function vdGrowRect(acc, c) {
+    if (!c || !c.rect || c.belowCapture || c.offCanvas) return acc;
+    var r = c.rect;
+    if (!acc) return { x: r.x, y: r.y, w: r.w, h: r.h };
+    var x0 = Math.min(acc.x, r.x), y0 = Math.min(acc.y, r.y);
+    var x1 = Math.max(acc.x + acc.w, r.x + r.w), y1 = Math.max(acc.y + acc.h, r.y + r.h);
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
   function vdRollupByRegion(matchResult, controlList, variantList) {
     var regions = new Map();
     function ensure(key) {
       var r = regions.get(key);
-      if (!r) { r = { region: key, controlCount: 0, variantCount: 0, matchedCount: 0, samples: [] }; regions.set(key, r); }
+      if (!r) { r = { region: key, controlCount: 0, variantCount: 0, matchedCount: 0, samples: [], controlRect: null, variantRect: null }; regions.set(key, r); }
       return r;
     }
-    controlList.forEach(function (c) { ensure(c.region || '(unregioned)').controlCount++; });
-    variantList.forEach(function (v) { ensure(v.region || '(unregioned)').variantCount++; });
+    // Union box per region per side. Redesign mode reports nothing but these
+    // rollups, and without a rect they carry NO image at all — seven lines of
+    // prose about a wholesale redesign, which is the case where a reviewer
+    // most needs to see the page. cropAndDownscale bounds the output size, so
+    // a region spanning most of the page comes back as a readable thumbnail
+    // rather than a huge asset.
+    controlList.forEach(function (c) {
+      var r = ensure(c.region || '(unregioned)');
+      r.controlCount++;
+      r.controlRect = vdGrowRect(r.controlRect, c);
+    });
+    variantList.forEach(function (v) {
+      var r = ensure(v.region || '(unregioned)');
+      r.variantCount++;
+      r.variantRect = vdGrowRect(r.variantRect, v);
+    });
     matchResult.pairs.forEach(function (p) {
       var key = vdFindingRegion(p) || '(unregioned)';
       var r = regions.get(key);
@@ -786,6 +813,7 @@
   g.vdDescribeCandidate = vdDescribeCandidate;
   g.vdFindingRegion = vdFindingRegion;
   g.vdGroupFindings = vdGroupFindings;
+  g.vdGrowRect = vdGrowRect;
   g.vdRollupByRegion = vdRollupByRegion;
   g.validateVisualDiffGeometry = validateVisualDiffGeometry;
   g.rankAndCapDiffFindings = rankAndCapDiffFindings;
