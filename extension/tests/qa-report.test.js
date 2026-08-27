@@ -130,15 +130,43 @@ section('grade decides order and label, never visibility');
 // ── 2. the grade is still visible, and still orders the list ───────────────
 section('grade is still reported');
 
+// Parse the grade chips out in document order rather than string-matching their
+// closing tags — the chip's contents grew a severity suffix once severity
+// started rendering, and three assertions here were pinned to `grade</span>`.
+function chipTexts(h) {
+  var out = [], re = /letter-spacing:\.03em;[^>]*>([^<]*)<\/span>/g, m;
+  while ((m = re.exec(h))) out.push(m[1]);
+  return out;
+}
+
 (function gradeStillShown() {
   var h = render([rollup('section', 'unexpected'), rollup('main', 'unclear'), rollup('footer', 'expected')]);
-  ok('unexpected is labelled', /UNEXPECTED|unexpected<\/span>/i.test(h));
-  ok('unclear is labelled', /unclear<\/span>/i.test(h));
-  ok('expected is labelled', /expected<\/span>/i.test(h));
-  // Severity-first reading order: unexpected, then unclear, then expected.
-  var iu = h.indexOf('>unexpected<'), ic = h.indexOf('>unclear<'), ie = h.indexOf('>expected<');
-  ok('rows are ordered unexpected -> unclear -> expected',
-     iu !== -1 && ic !== -1 && ie !== -1 && iu < ic && ic < ie, { iu: iu, ic: ic, ie: ie });
+  var chips = chipTexts(h);
+  eq('one chip per finding', chips.length, 3);
+  // Severity-first reading order: unexpected, then unclear, then expected. The
+  // chip text carries the grade and, for the two non-expected kinds, a severity.
+  eq('rows are ordered unexpected -> unclear -> expected',
+     chips.map(function (c) { return c.split(' \u00b7 ')[0]; }).join(','),
+     'unexpected,unclear,expected');
+})();
+
+(function severityIsShown() {
+  // severity was computed by the model, exported to the debug log, and rendered
+  // nowhere — the only per-finding urgency signal the pipeline produces, thrown
+  // away. It is shown but never sorted on: runs 5 and 6 of ENOC-97 returned
+  // `low` then `medium` for the same finding from a byte-identical prompt.
+  var chips = chipTexts(render([rollup('main', 'unclear'), rollup('footer', 'expected')]));
+  eq('an unclear finding shows its severity beside the grade', chips[0], 'unclear \u00b7 low');
+  eq('an expected finding shows no severity (the model emits null there)', chips[1], 'expected');
+  // A junk severity must not reach the page, and must not cost the grade.
+  var bad = rollup('main', 'unclear');
+  bad.severity = 'catastrophic';
+  eq('an unrecognized severity is dropped, grade still shown', chipTexts(render([bad]))[0], 'unclear');
+  var none = rollup('main', 'unclear');
+  none.severity = null;
+  eq('a missing severity is dropped, grade still shown', chipTexts(render([none]))[0], 'unclear');
+  ok('the honesty line now covers severity too',
+     render([rollup('footer', 'expected')]).indexOf('severity are model judgments') !== -1);
 })();
 
 (function ungradedFindingStillRenders() {

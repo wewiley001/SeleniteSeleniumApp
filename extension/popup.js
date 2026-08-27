@@ -5126,10 +5126,20 @@ function rptAbVisualDiffSection(vd) {
     unclear: 'background:#fff6e5;color:#8a5a00;border-color:#f0dcb0',
     expected: 'background:#f1f3f5;color:#666;border-color:#dcdfe3',
   };
+  // Severity rides in the same chip rather than getting its own. The model
+  // emits it for every non-`expected` finding and it was rendered NOWHERE —
+  // computed, exported to the debug log, and dropped on the floor, so the one
+  // per-finding urgency signal the pipeline produces never reached a reader.
+  // Shown, not sorted on: measured across runs 5 and 6 of ENOC-97, the same
+  // finding came back `low` then `medium` from a BYTE-IDENTICAL prompt
+  // (engineNote, spec text and structuralStats all unchanged), so it is a
+  // label like the grade beside it and must not order or gate anything.
+  const SEV_OK = { low: 1, medium: 1, high: 1 };
   const gradeChip = (f) => {
     const g = f.classification;
     if (!g || !GRADE_STYLE[g]) return '';
-    return `<span style="display:inline-block;border:1px solid;border-radius:3px;padding:0 4px;margin-right:5px;font-size:9px;text-transform:uppercase;letter-spacing:.03em;${GRADE_STYLE[g]}">${q(g)}</span>`;
+    const sev = SEV_OK[f.severity] ? ` · ${q(f.severity)}` : '';
+    return `<span style="display:inline-block;border:1px solid;border-radius:3px;padding:0 4px;margin-right:5px;font-size:9px;text-transform:uppercase;letter-spacing:.03em;${GRADE_STYLE[g]}">${q(g)}${sev}</span>`;
   };
 
   const findingRow = (f, resumedVariant) => {
@@ -5250,7 +5260,7 @@ function rptAbVisualDiffSection(vd) {
       ${unexpected.map(f => findingRow(f, v.resumed)).join('')}
       ${unclear.map(f => findingRow(f, v.resumed)).join('')}
       ${ungraded.length ? `<div class="ab-cline ab-warn" style="margin-top:8px">${ungraded.length} finding${ungraded.length !== 1 ? 's' : ''} came back without a usable verdict — unjudged, not cleared. Review directly.</div>${ungraded.map(f => findingRow(f, v.resumed)).join('')}` : ''}
-      ${expected.length ? `<div class="ab-cline rpt-muted" style="margin-top:8px">${expected.length} difference${expected.length !== 1 ? 's' : ''} graded expected against the spec, shown in full. This grade is a model judgment and has been measured to move between runs on identical diff output — read them rather than trusting the grade.</div>${expected.map(f => findingRow(f, v.resumed)).join('')}` : ''}
+      ${expected.length ? `<div class="ab-cline rpt-muted" style="margin-top:8px">${expected.length} difference${expected.length !== 1 ? 's' : ''} graded expected against the spec, shown in full. This grade and its severity are model judgments, both measured to move between runs on a byte-identical prompt — read the findings rather than trusting the label.</div>${expected.map(f => findingRow(f, v.resumed)).join('')}` : ''}
     ` : `<p class="rpt-muted">${shared.length
         ? 'Nothing unique to this variant — every difference it has from ' + q(vd.baselineLabel) + ' is listed under “Common to all variants” above.'
         : 'No differences detected.'}</p>`);
