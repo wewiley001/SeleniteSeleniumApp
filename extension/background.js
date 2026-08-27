@@ -2045,8 +2045,12 @@ function domCandidateWalkFn(maxCandidates, pageW, capturedH) {
 // three variants were misclassified as wholesale redesigns, and the diff was
 // meaningless while reporting itself as a clean two-finding result. Nothing
 // detected it — captureWidth was recorded in the checkpoint and never
-// compared. Pinning removes the failure mode; validateVisualDiffGeometry
-// (below) still checks, because an override can fail to apply.
+// compared. Pinning reduces the failure mode; validateVisualDiffGeometry
+// (vd-diff.js, surfaced by vdCollectProblems) is what actually checks,
+// because an override can fail to apply. That function did NOT exist until
+// 2026-08-27 — this comment asserted a backstop that had never been written,
+// and the check that did exist compared pageW against pageW, the same wrong
+// quantity on both sides.
 async function captureFullPageAndViewport(tabId, { captureForVision, extractDomCandidates, pinGeometry } = {}) {
   await stabilizeForCapture(tabId);
   return await withVariantDebugger(tabId, async (target) => {
@@ -2055,6 +2059,8 @@ async function captureFullPageAndViewport(tabId, { captureForVision, extractDomC
     let geometryPinFailed = null;
 
     if (pinGeometry && pinGeometry.width) {
+      // Both sides are now cssVisualViewport measurements. pinGeometry.width
+      // is the baseline's viewportW (see captureVariant), not its pageW.
       const liveW = Math.ceil(metrics.cssVisualViewport.clientWidth || metrics.cssContentSize.width);
       const liveH = Math.ceil(metrics.cssVisualViewport.clientHeight);
       if (liveW !== pinGeometry.width || liveH !== pinGeometry.viewportH) {
@@ -2101,6 +2107,15 @@ async function captureFullPageAndViewport(tabId, { captureForVision, extractDomC
       const pageW = Math.ceil(metrics.cssContentSize.width);
       const pageH = Math.ceil(metrics.cssContentSize.height);
       const viewportH = Math.ceil(metrics.cssVisualViewport.clientHeight);
+      // The VIEWPORT width, kept distinct from pageW (the content width).
+      // Conflating the two is what broke the pin: it stored pageW and then
+      // compared it against cssVisualViewport.clientWidth, so on any page
+      // with horizontal overflow the two could never agree and the override
+      // fired on a page whose geometry had not changed at all — then set the
+      // emulated viewport to a CONTENT width, which is wider than the window
+      // and can flip responsive breakpoints. Same field, two meanings, one
+      // shared name.
+      const viewportW = Math.ceil(metrics.cssVisualViewport.clientWidth || metrics.cssContentSize.width);
       const capturedH = Math.min(pageH, VIS_MAX_CAPTURE_HEIGHT);
       const shot = await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
         format: 'png',
@@ -2110,7 +2125,7 @@ async function captureFullPageAndViewport(tabId, { captureForVision, extractDomC
       const out = {
         dataUrl: 'data:image/png;base64,' + shot.data,
         meta: {
-          pageW, pageH, capturedH, truncated: pageH > VIS_MAX_CAPTURE_HEIGHT, viewportH,
+          pageW, pageH, capturedH, truncated: pageH > VIS_MAX_CAPTURE_HEIGHT, viewportH, viewportW,
           geometryPinned: overrodeMetrics, geometryPinFailed,
           // Constant by construction now. Recorded so a debug log proves it
           // rather than leaving the reader to infer it from the code version.
@@ -2844,7 +2859,9 @@ async function captureVariant(target, { settleMs, selectors, keepTabs, captureFo
           pinGeometry: vd.captureGeometry,
         });
         if (!vd.captureGeometry) {
-          vd.captureGeometry = { width: cap.meta.pageW, viewportH: cap.meta.viewportH };
+          // viewportW, not pageW — setDeviceMetricsOverride's `width` sets the
+          // VIEWPORT, so pinning to a content width would widen it.
+          vd.captureGeometry = { width: cap.meta.viewportW, viewportH: cap.meta.viewportH };
         }
         vd.captures.set(target.label, cap.dataUrl);
         vd.domCandidates.set(target.label, cap.domCandidates || []);

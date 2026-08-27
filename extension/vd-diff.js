@@ -669,6 +669,71 @@
     return out;
   }
 
+  // -- Capture geometry validation -------------------------------------------
+  // background.js's captureFullPageAndViewport carried a comment promising
+  // that "validateVisualDiffGeometry (below) still checks, because an override
+  // can fail to apply." It did not exist -- grep found only the comment. So
+  // for the entire life of the pinning code there was no backstop at all, and
+  // the check that DID exist compared pageW against pageW: the same wrong
+  // quantity on both sides, which cannot detect a viewport mismatch and stays
+  // silent through exactly the failure it was written for.
+  //
+  // The failure being guarded is not hypothetical. A real run captured Control
+  // at 1693x1281 and its variants at 1470x802 because the window changed
+  // partway through; element matching collapsed to 12%, all three variants
+  // were called wholesale redesigns, and the run still reported itself as a
+  // tidy two-finding pass.
+  //
+  // Compares VIEWPORT dimensions, because that is what determines layout.
+  // A content-width (pageW) difference at the same viewport is reported
+  // separately and more softly: it usually means the variant genuinely
+  // renders wider, which is a finding rather than an invalid comparison --
+  // though it still makes the whole-page pixel ratio meaningless, since
+  // computeCoarsePixelDiffRatio crops to the smaller image with no alignment.
+  //
+  // Pure over plain capture metas so it is testable under jsc with no browser.
+  function validateVisualDiffGeometry(captures, baselineLabel) {
+    var list = (captures || []).filter(function (c) { return c && c.fullPage && !c.fullPage.error; });
+    if (list.length < 2) return [];
+    var base = null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].label === baselineLabel) { base = list[i]; break; }
+    }
+    if (!base) base = list[0];
+    var bf = base.fullPage;
+    var out = [];
+
+    for (var j = 0; j < list.length; j++) {
+      var c = list[j];
+      if (c === base) continue;
+      var f = c.fullPage;
+
+      // Captures written before viewportW existed simply cannot be checked on
+      // width; say so rather than silently passing them.
+      if (f.viewportW == null || bf.viewportW == null) {
+        out.push({ label: c.label, severity: 'info', field: 'viewportW',
+          detail: 'This capture predates viewport-width recording, so its layout width could not be verified against the baseline.' });
+      } else if (f.viewportW !== bf.viewportW) {
+        out.push({ label: c.label, severity: 'error', field: 'viewportW', value: f.viewportW, baseline: bf.viewportW,
+          detail: 'Laid out at ' + f.viewportW + 'px viewport width but the baseline "' + base.label + '" was laid out at ' + bf.viewportW + 'px. On a responsive page these are different layouts, so every difference reported below is suspect — re-run without resizing the window mid-run.' });
+      }
+
+      if (f.viewportH != null && bf.viewportH != null && f.viewportH !== bf.viewportH) {
+        out.push({ label: c.label, severity: 'error', field: 'viewportH', value: f.viewportH, baseline: bf.viewportH,
+          detail: 'Viewport height ' + f.viewportH + 'px vs the baseline\'s ' + bf.viewportH + 'px. Anything sized in vh, any sticky/fixed element, and any viewport-triggered lazy load resolved differently between the two captures.' });
+      }
+
+      // Same viewport, different content width. Real difference, not an
+      // invalid comparison — but the pixel ratio below it is meaningless.
+      if (f.viewportW != null && bf.viewportW != null && f.viewportW === bf.viewportW
+          && f.pageW != null && bf.pageW != null && f.pageW !== bf.pageW) {
+        out.push({ label: c.label, severity: 'warn', field: 'pageW', value: f.pageW, baseline: bf.pageW,
+          detail: 'Content is ' + f.pageW + 'px wide vs the baseline\'s ' + bf.pageW + 'px at the same viewport width. That is probably a real layout difference, but the whole-page pixel ratio crops to the narrower of the two with no alignment, so treat that number as unusable for this variant.' });
+      }
+    }
+    return out;
+  }
+
   // -- Ranking / capping -----------------------------------------------------
   // Moved from popup.js's old rankAndCapDiffFindings, re-tiered over
   // changeClass instead of status, and now runs AFTER grouping so it caps
@@ -722,6 +787,7 @@
   g.vdFindingRegion = vdFindingRegion;
   g.vdGroupFindings = vdGroupFindings;
   g.vdRollupByRegion = vdRollupByRegion;
+  g.validateVisualDiffGeometry = validateVisualDiffGeometry;
   g.rankAndCapDiffFindings = rankAndCapDiffFindings;
   g.VD_MAX_DIFF_FINDINGS = VD_MAX_DIFF_FINDINGS;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

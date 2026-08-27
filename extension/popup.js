@@ -5464,11 +5464,6 @@ function vdCollectProblems(sections) {
       if (c.fullPage?.geometryPinFailed) {
         add('error', `capture/${c.label}`, `Could not pin this capture to the baseline's viewport (${c.fullPage.geometryPinFailed}) — widths may differ, which would invalidate the comparison.`);
       }
-      if (baseCap && c.fullPage && !c.fullPage.error && c !== baseCap && c.fullPage.pageW !== baseCap.fullPage.pageW) {
-        add('error', `capture/${c.label}`,
-          `Captured at ${c.fullPage.pageW}px wide but the baseline "${baseCap.label}" was captured at ${baseCap.fullPage.pageW}px. `
-          + 'On a responsive page these are different layouts, so every difference below is suspect — re-run without resizing the window or opening DevTools mid-run.');
-      }
       // Real blind spot, not cosmetic: nothing below the cutoff is compared
       // at all, so a regression down there cannot be reported as anything.
       if (c.fullPage?.truncated) {
@@ -5488,6 +5483,18 @@ function vdCollectProblems(sections) {
         if (!s.exists) add('warn', `watched-selector/${c.label}`, `Selector never matched: ${s.selector}`);
         else if (!s.visible) add('info', `watched-selector/${c.label}`, `Selector matched but was not visible: ${s.selector}`);
       }
+    }
+
+    // Real geometry validation. Replaces a per-capture pageW-vs-pageW test
+    // that could not detect a viewport mismatch — the same wrong quantity on
+    // both sides — and stood in for a validateVisualDiffGeometry that did not
+    // exist. Compares viewport dimensions, which are what determine layout.
+    try {
+      for (const g of validateVisualDiffGeometry(entry.data.captures || [], entry.data.visualDiffFull?.baselineLabel)) {
+        add(g.severity, `capture/${g.label}`, g.detail);
+      }
+    } catch (e) {
+      add('warn', 'visual-diff', `Capture geometry could not be validated — ${e.message}`);
     }
 
     // visualDiffFull only exists on the standalone A/B path; a
@@ -5516,8 +5523,14 @@ function vdCollectProblems(sections) {
         // A geometry mismatch produces a low match rate all by itself, so
         // don't let the redesign verdict stand as if it were a finding about
         // the experiment when there's a known reason to distrust it.
+        // Viewport, not content width — same reason as the validator above.
+        // A redesign verdict caused by comparing two different LAYOUTS is the
+        // exact case this disclaimer exists for, and pageW cannot see it.
         const geomBad = (entry.data.captures || []).some(c =>
-          baseCap && c.fullPage && !c.fullPage.error && c !== baseCap && c.fullPage.pageW !== baseCap.fullPage.pageW);
+          baseCap && c.fullPage && !c.fullPage.error && c !== baseCap
+          && c.fullPage.viewportW != null && baseCap.fullPage.viewportW != null
+          && (c.fullPage.viewportW !== baseCap.fullPage.viewportW
+              || c.fullPage.viewportH !== baseCap.fullPage.viewportH));
         add('warn', at, `Only ${Math.round((v.matchedFraction || 0) * 100)}% of elements matched — treated as a wholesale redesign and rolled up per region, not compared element by element.`
           + (geomBad ? ' This is most likely the capture-width mismatch above rather than a real redesign — fix that and re-run before reading anything into it.' : ''));
       }

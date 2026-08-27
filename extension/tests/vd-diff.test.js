@@ -453,7 +453,7 @@ function capture(label, o) {
   return { label: label, url: 'https://example.com', skipped: false, loadError: null,
            errors: o.errors || [], selectors: o.selectors || [],
            fullPage: o.fullPage === undefined
-             ? { pageW: 1470, pageH: 9000, capturedH: 8000, truncated: true, viewportH: 802 }
+             ? { pageW: 1470, pageH: 9000, capturedH: 8000, truncated: true, viewportH: 802, viewportW: 1470 }
              : o.fullPage };
 }
 
@@ -547,19 +547,80 @@ function capture(label, o) {
     abSections([capture('v0', {})], [{ label: 'v1', diffMode: 'normal', structuralStats: {} }]))));
 })();
 
+(function geometryValidator() {
+  // validateVisualDiffGeometry did not exist until 2026-08-27, despite a
+  // comment in background.js asserting it was the backstop. The check that DID
+  // exist compared pageW against pageW — the same wrong quantity on both sides,
+  // structurally unable to see a viewport mismatch.
+  function cap(label, fp) { return { label: label, fullPage: fp }; }
+  var ok_ = { pageW: 1470, pageH: 9000, viewportW: 1470, viewportH: 802 };
+
+  eq('matching geometry yields nothing',
+    validateVisualDiffGeometry([cap('v0', ok_), cap('v1', ok_)], 'v0').length, 0);
+
+  var w = validateVisualDiffGeometry(
+    [cap('v0', { pageW: 1693, viewportW: 1693, viewportH: 1281 }),
+     cap('v1', { pageW: 1470, viewportW: 1470, viewportH: 1281 })], 'v0');
+  eq('viewport width mismatch is one error', w.length, 1);
+  eq('...at error severity', w[0].severity, 'error');
+  eq('...naming the field', w[0].field, 'viewportW');
+
+  var h = validateVisualDiffGeometry(
+    [cap('v0', { pageW: 1470, viewportW: 1470, viewportH: 1281 }),
+     cap('v1', { pageW: 1470, viewportW: 1470, viewportH: 802 })], 'v0');
+  eq('viewport height mismatch is caught too', h.length, 1);
+  eq('...at error severity', h[0].severity, 'error');
+
+  // Same viewport, wider content. Probably a REAL difference rather than an
+  // invalid comparison — so warn, don't error. But say the pixel ratio is
+  // unusable, because computeCoarsePixelDiffRatio crops to the narrower image
+  // with no alignment.
+  var c = validateVisualDiffGeometry(
+    [cap('v0', { pageW: 1470, viewportW: 1470, viewportH: 802 }),
+     cap('v1', { pageW: 1600, viewportW: 1470, viewportH: 802 })], 'v0');
+  eq('content-width difference at same viewport is a WARN', c[0].severity, 'warn');
+  ok('...and says the pixel ratio is unusable', /unusable/.test(c[0].detail), c);
+
+  // Old captures have no viewportW. Say they could not be checked rather than
+  // passing them silently — a silent pass is what the pageW check did.
+  var legacy = validateVisualDiffGeometry(
+    [cap('v0', { pageW: 1470, viewportH: 802 }), cap('v1', { pageW: 1470, viewportH: 802 })], 'v0');
+  eq('captures without viewportW report info, not silence', legacy[0].severity, 'info');
+
+  // The baseline is whichever label is named, not index 0.
+  var reordered = validateVisualDiffGeometry(
+    [cap('v1', { pageW: 1470, viewportW: 1470, viewportH: 802 }),
+     cap('v0', { pageW: 1470, viewportW: 1693, viewportH: 802 })], 'v0');
+  eq('baseline resolved by label, not position', reordered[0].label, 'v1');
+  eq('...and compared against v0 geometry', reordered[0].baseline, 1693);
+
+  // Degenerate inputs must not throw — this runs inside vdCollectProblems.
+  eq('single capture yields nothing', validateVisualDiffGeometry([cap('v0', ok_)], 'v0').length, 0);
+  eq('empty yields nothing', validateVisualDiffGeometry([], 'v0').length, 0);
+  eq('null yields nothing', validateVisualDiffGeometry(null, 'v0').length, 0);
+  eq('errored captures are excluded',
+    validateVisualDiffGeometry([cap('v0', ok_), { label: 'v1', fullPage: { error: 'boom' } }], 'v0').length, 0);
+})();
+
 (function geometryMismatch() {
   // The silent run-invalidating failure: Control and variants at different widths.
   var p = vdCollectProblems(abSections([
-    capture('v0', { fullPage: { pageW: 1693, pageH: 14201, capturedH: 8000, truncated: true, viewportH: 1281 } }),
-    capture('v1', { fullPage: { pageW: 1470, pageH: 15500, capturedH: 8000, truncated: true, viewportH: 802 } }),
+    capture('v0', { fullPage: { pageW: 1693, pageH: 14201, capturedH: 8000, truncated: true, viewportH: 1281, viewportW: 1693 } }),
+    capture('v1', { fullPage: { pageW: 1470, pageH: 15500, capturedH: 8000, truncated: true, viewportH: 802, viewportW: 1470 } }),
   ], [{ label: 'v1', diffMode: 'redesign', matchedFraction: 0.124, structuralStats: {} }]));
 
-  ok('width mismatch is an ERROR', p.some(function (x) {
-    return x.severity === 'error' && /1470px wide but the baseline/.test(x.detail);
+  ok('viewport width mismatch is an ERROR', p.some(function (x) {
+    return x.severity === 'error' && /1470px viewport width but the baseline/.test(x.detail);
+  }), p);
+  // Height matters as much as width and used to go entirely unchecked: vh
+  // sizing, sticky elements and viewport-triggered lazy loads all resolve
+  // differently at 1281 vs 802.
+  ok('viewport height mismatch is its own ERROR', p.some(function (x) {
+    return x.severity === 'error' && /Viewport height 802px vs the baseline's 1281px/.test(x.detail);
   }), p);
   ok('redesign verdict is blamed on the geometry', p.some(function (x) {
     return /most likely the capture-width mismatch/.test(x.detail);
-  }));
+  }), p);
   // Truncation is a VISUAL limit only, now that the DOM walk covers the full
   // page — the wording must not claim the bottom went uncompared.
   ok('truncation names the fraction with no image', p.some(function (x) {
