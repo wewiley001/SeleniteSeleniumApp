@@ -225,6 +225,81 @@ section('matching');
   eq('copy rewrite: reported as text-changed', s.findings[0].changeClass, 'text-changed');
 })();
 
+// Texted anchors that pair cleanly, so matchedFraction stays above
+// VD_REDESIGN_MATCH_FLOOR and the cases below are judged in 'normal' mode
+// rather than short-circuiting into region rollup.
+function anchors(n) {
+  var out = [];
+  for (var i = 0; i < n; i++) {
+    out.push(cand({ tag: 'p', text: 'Anchor line ' + i, y: i * 50,
+                    path: '/body[1]/main[1]/p[' + i + ']' }));
+  }
+  return out;
+}
+
+(function textlessIsNotAnIdentity() {
+  // An element with no text still has a textHash — vdHash32('') is the
+  // ordinary hash 811c9dc5 — so before keyText/keyShapePpath required real
+  // text, "textless" WAS an identity. Measured: three unrelated textless
+  // divs per side paired all three at tier `text`, across different subtrees
+  // and up to 5000px apart, because vdRunExactPass's count-equality guard is
+  // satisfied by both sides merely having the same NUMBER of textless
+  // elements. Every one of those pairs then classified as moved/resized —
+  // false findings manufactured out of the absence of evidence.
+  function spray(prefix, ys) {
+    return ys.map(function (y, i) {
+      return cand({ tag: 'div', y: y, path: '/body[1]/' + prefix + '[' + i + ']/div[1]' });
+    });
+  }
+  var m = vdMatchCandidates(anchors(10).concat(spray('a', [100, 900, 2000])),
+                            anchors(10).concat(spray('z', [3000, 5000, 7000])));
+  eq('textless: mode stays normal', m.mode, 'normal');
+  eq('textless: only the anchors pair', m.pairs.length, 10);
+  ok('textless: nothing paired on empty text',
+     m.pairs.every(function (pr) { return !!pr.a.textNorm; }),
+     m.pairs.filter(function (pr) { return !pr.a.textNorm; }).map(function (pr) { return pr.tier; }));
+  eq('textless: all three surface as removed', m.removed.length, 3);
+  eq('textless: all three surface as added', m.added.length, 3);
+})();
+
+(function textlessStillPairsOnStructure() {
+  // The complement of the case above: refusing empty text as evidence must
+  // not make textless elements unmatchable. vdFuzzyScore redistributes the
+  // text weight instead of zeroing it, so structural agreement still carries
+  // a pair — a shared 4-deep path tail at any distance (0.80), or a
+  // near-identical y (0.66) — while same-tag-and-nothing-else lands at 0.44
+  // and fails. Before the fix all three of these paired, the last two at an
+  // identical 0.759, so which textless candidates claimed each other came
+  // down to sort order inside a diff that is meant to be deterministic.
+  var a = anchors(20).concat([
+    // Wrapper inserted above it: full path differs, last four segments agree.
+    cand({ id: 'TAIL', tag: 'span', y: 700, path: '/body[1]/main[1]/section[3]/aside[1]/span[4]' }),
+    // Same slot content-wise, 5px of reflow.
+    cand({ id: 'NEARY', tag: 'div', y: 500, path: '/body[1]/main[1]/section[1]/div[2]' }),
+    // Shares nothing but its tag, 4900px away.
+    cand({ id: 'JUNK', tag: 'em', y: 100, path: '/body[1]/header[1]/nav[1]/em[3]' }),
+  ]);
+  var b = anchors(20).concat([
+    cand({ id: 'TAIL', tag: 'span', y: 6200, path: '/body[1]/wrap[1]/main[1]/section[3]/aside[1]/span[4]' }),
+    cand({ id: 'NEARY', tag: 'div', y: 505, path: '/body[1]/wrap[1]/main[1]/section[1]/div[2]' }),
+    cand({ id: 'JUNK', tag: 'em', y: 5000, path: '/body[1]/footer[1]/aside[7]/em[9]' }),
+  ]);
+  var m = vdMatchCandidates(a, b);
+  function pairedTags(tier) {
+    return m.pairs.filter(function (pr) { return pr.tier === tier; })
+             .map(function (pr) { return pr.a.tag; }).sort().join(',');
+  }
+  eq('textless structure: shared path tail and near-y both pair, junk does not',
+     pairedTags('fuzzy'), 'div,span');
+  eq('textless structure: the evidence-free pair is the only removal', m.removed.length, 1);
+  eq('textless structure: and the only addition', m.added.length, 1);
+  // Guarded rather than indexed: when this regresses, removed[] is EMPTY,
+  // and a throw here would abort the suite before the 200-odd cases below it.
+  ok('textless structure: removed is the junk element',
+     m.removed.length === 1 && m.removed[0].tag === 'em',
+     m.removed.map(function (c) { return c.tag; }));
+})();
+
 // ── 4. reflow suppression — the cascade bug ─────────────────────────────────
 section('reflow clustering');
 (function overlappingBands() {

@@ -140,6 +140,8 @@
     String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(function (t) { if (t) set.add(t); });
     return set;
   }
+  // NB the both-empty case returns 1, which is the conventional Jaccard
+  // answer and NOT a licence to read it as evidence -- see vdFuzzyScore.
   function vdTokenSimilarity(a, b) {
     var setA = vdNormalizeTokens(a), setB = vdNormalizeTokens(b);
     if (!setA.size && !setB.size) return 1;
@@ -232,14 +234,31 @@
   }
 
   function vdFuzzyScore(a, b) {
-    var textSim = vdTokenSimilarity(a.textNorm, b.textNorm);
     var tagMatch = a.tag === b.tag ? 1 : 0;
     var tailA = (a.path || '').split('/').slice(-4).join('/');
     var tailB = (b.path || '').split('/').slice(-4).join('/');
     var pathTailOverlap = tailA && tailA === tailB ? 1 : 0;
     var ay = a.rect ? a.rect.y : 0, by = b.rect ? b.rect.y : 0;
     var proximity = 1 / (1 + Math.abs(ay - by) / 500);
-    return 0.55 * textSim + 0.20 * tagMatch + 0.15 * pathTailOverlap + 0.10 * proximity;
+    var structural = 0.20 * tagMatch + 0.15 * pathTailOverlap + 0.10 * proximity;
+    // Two textless elements aren't alike, they're both silent -- so the text
+    // term has nothing to say about them and must not be scored as if it
+    // did. Handing them vdTokenSimilarity's conventional 1 put an unrelated
+    // textless pair at 0.759 against a 0.62 threshold: over the line before
+    // structure was consulted at all, and tied with every other textless
+    // candidate, so which ones paired came down to sort order -- pairing by
+    // coin flip inside a diff that is supposed to be deterministic.
+    // Redistribute the text weight across the terms that did measure
+    // something, rather than either granting it or (returning 0) making
+    // textless elements permanently unmatchable. Measured against the 0.62
+    // threshold, that leaves exactly three outcomes for a textless pair:
+    // same tag and nothing else scores 0.44 and correctly fails; a shared
+    // 4-deep path tail (the wrapper-insertion case) scores 0.78 and pairs at
+    // any distance; proximity alone pairs only within |dy| <= ~133px. All
+    // three only ever apply to elements the eight exact passes -- path-only
+    // included -- have already declined.
+    if (!a.textNorm && !b.textNorm) return structural / 0.45;
+    return 0.55 * vdTokenSimilarity(a.textNorm, b.textNorm) + structural;
   }
 
   // Deliberately narrow: only reached for whatever the exact passes
@@ -283,13 +302,29 @@
     function keyTestid(c) { return (c.attrs && c.attrs.testid) ? (c.tag + ' ' + c.attrs.testid) : null; }
     function keyStableId(c) { return c.stableId ? (c.tag + ' ' + c.stableId) : null; }
     function keyPathText(c) { return c.path ? (c.tag + ' ' + c.path + ' ' + c.textHash) : null; }
-    function keyText(c) { return c.textHash ? (c.tag + ' ' + c.textHash) : null; }
+    // An element with no text has textNorm '' -- and vdHash32('') is a
+    // perfectly ordinary hash (811c9dc5), so textHash is truthy for it. Any
+    // key whose ONLY discriminator is that hash therefore reads "textless"
+    // as a shared identity. Measured before this guard: two unrelated
+    // textless divs 4900px apart in different subtrees paired at tier
+    // `text`, and 3-vs-3 of them paired all three by document order --
+    // vdRunExactPass's count-equality guard passes happily when both sides
+    // merely have the same NUMBER of textless elements, which is no
+    // evidence about which corresponds to which. keyPathText/keyHrefText/
+    // keyAriaText are deliberately left alone: there the text hash
+    // corroborates a discriminator that already stands on its own, and
+    // degrading to path-/href-/aria-only is what the very next pass does
+    // anyway.
+    function hasRealText(c) { return !!c.textNorm; }
+    function keyText(c) { return hasRealText(c) ? (c.tag + ' ' + c.textHash) : null; }
     function keyHrefText(c) { return c.hrefKey ? (c.tag + ' ' + c.hrefKey + ' ' + c.textHash) : null; }
     function keyHref(c) { return c.hrefKey ? (c.tag + ' ' + c.hrefKey) : null; }
     function keyAriaText(c) { var v = ariaOrAlt(c); return v ? (c.tag + ' ' + v + ' ' + c.textHash) : null; }
     function keyAria(c) { var v = ariaOrAlt(c); return v ? (c.tag + ' ' + v) : null; }
     function keyPath(c) { return c.path ? (c.tag + ' ' + c.path) : null; }
-    function keyShapePpath(c) { return c.shapeHash ? (c.tag + ' ' + c.shapeHash + ' ' + (c.ppath || '')) : null; }
+    // Same reasoning, one tier narrower: textShape('') is '', so without the
+    // guard this pairs any two textless siblings under one parent slot.
+    function keyShapePpath(c) { return (hasRealText(c) && c.shapeHash) ? (c.tag + ' ' + c.shapeHash + ' ' + (c.ppath || '')) : null; }
 
     // 1: stable per-element attribute, cheapest and least ambiguous.
     vdRunExactPass(unmatchedA, unmatchedB, pairs, 'testid', keyTestid);
