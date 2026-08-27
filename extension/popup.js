@@ -358,7 +358,7 @@ function showTab(name) {
   // fire-and-forget since showTab itself is synchronous. Same reasoning for
   // the Summary of Changes auto-fill: a ticket committed in Initialize after
   // the A/B tab was already visited should still populate it on return.
-  if (name === 'abtest') { checkForResumableVisualDiff(); autofillAbSummaryFromTicket(); syncAbDesignReference(); }
+  if (name === 'abtest') { checkForResumableVisualDiff(); autofillAbSummary(); syncAbDesignReference(); }
 }
 
 // ── Test Agent ───────────────────────────────────────────────────────────────
@@ -2662,7 +2662,7 @@ async function initAbCompare() {
 
   initVisualDiffResumeBanner();
   checkForResumableVisualDiff();
-  autofillAbSummaryFromTicket();
+  autofillAbSummary();
   syncAbDesignReference();
 
   renderAbTargets();
@@ -2879,6 +2879,107 @@ function buildSummaryFromTicketVariants(ctx) {
 // two call sites: showTab('abtest') and initAbCompare's panel-load), so a
 // ticket committed in Initialize after the A/B tab was already visited
 // still fills the box the next time the user switches back to this tab.
+// Reads the Variation labels off the board, when a link and a token are both
+// available. Returns [] rather than throwing on any failure — a summary that
+// falls back to the image alone is a degraded result, not a broken run.
+async function figmaFetchVariationLabels(url) {
+  if (!url || !figmaParseUrl(url)) return [];
+  const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth: 4 })
+    .catch(() => null);
+  if (!res?.ok) return [];
+  return figmaClassifyChildren(res.node?.children || []).labels || [];
+}
+
+// Same shape buildSummaryFromTicketVariants produces, so the report prompt
+// sees one format regardless of which source filled the box.
+function buildSummaryFromFigmaVariants(variants) {
+  return (variants || [])
+    .filter(v => (v.changes || '').trim())
+    .map(v => {
+      const isControl = String(v.id || '').toLowerCase() === 'v0';
+      const name = (v.name || '').trim();
+      return `${v.id}${isControl ? ' (Control)' : ''}: ${name ? name + ' — ' : ''}${v.changes.trim()}`;
+    })
+    .join('\n\n');
+}
+
+// Fills Summary of Changes from the design comp, but ONLY when the box is
+// still empty after the ticket has had its turn. Ticket text keeps precedence
+// deliberately: it quotes the ticket verbatim, whereas this puts a model's
+// reading of an image into the box that decides expected vs unexpected for
+// every finding in the report. That is a real trade, so it runs second, it
+// never overwrites, and it records itself as the source in the debug log.
+//
+// Two sources, and the cheaper one is not the fallback:
+//   * Variation labels from the node tree are EXACT strings, so when they are
+//     available they anchor the read rather than leaving the model to work
+//     the variant ids out of the pixels.
+//   * The comp image carries the detail. Labels alone give a name per variant
+//     and no description of what changed, which is thin but still better than
+//     an empty box — an empty box makes every finding "unclear" by
+//     construction.
+async function autofillAbSummaryFromFigma() {
+  if (!abState || (abState.summaryOfChanges || '').trim()) return;
+
+  const ctx = await getActiveContext().catch(() => null);
+  const url = (abState.figmaUrl || '').trim() || (ctx?.reviewed ? ctx.figmaUrl : null);
+  const image = ctx?.reviewed ? await getCompImage(ctx) : null;
+  if (!url && !image) return;
+
+  const labels = url ? await figmaFetchVariationLabels(url) : [];
+  if (!image && !labels.length) return;
+
+  let summary = '', source = null;
+
+  if (image) {
+    const res = await chrome.runtime.sendMessage({
+      action: 'figmaSummarizeComp',
+      payload: { dataUrl: image, labels, ticketKey: ctx?.ticketKey || null },
+    }).catch(e => ({ ok: false, error: e.message }));
+
+    if (res?.ok) {
+      summary = buildSummaryFromFigmaVariants(res.variants);
+      source = res.usedFileLabels ? 'figma-comp+labels' : 'figma-comp';
+      (res.flags || []).forEach(f => console.warn('[Selenite] Comp read flag:', f));
+    } else {
+      console.warn('[Selenite] Comp summary failed —', res?.error || 'no response');
+    }
+  }
+
+  // Labels-only path: no image, or the vision call failed. No model involved
+  // at all here — these are the designer's own strings.
+  if (!summary && labels.length) {
+    summary = labels
+      .filter(l => l.variantId)
+      .map(l => `${l.variantId}${l.variantId === 'v0' ? ' (Control)' : ''}: ${l.changeName || '(unnamed board)'}`)
+      .join('\n\n');
+    source = summary ? 'figma-labels' : null;
+  }
+
+  if (!summary) return;
+  // Re-check: the vision call can take seconds, and the user may have typed
+  // into the box while it was in flight. Never clobber that.
+  if ((abState.summaryOfChanges || '').trim()) return;
+
+  abState.summaryOfChanges = summary;
+  abState.summarySource = source;
+  persistAbState();
+  const el = document.getElementById('ab-summary-of-changes');
+  if (el) el.value = summary;
+  const note = document.getElementById('ab-figma-out');
+  if (note) {
+    note.innerHTML = `<div style="color:var(--warn)">Summary of Changes was auto-written from the design comp (${esc(source)}) — read it before running, it decides how every finding is graded.</div>`;
+  }
+}
+
+// Ticket first, comp second — both only fill an empty box, so the order IS
+// the precedence. Awaited in sequence rather than fired in parallel: run
+// concurrently they would both see an empty box and race to write it.
+async function autofillAbSummary() {
+  await autofillAbSummaryFromTicket();
+  await autofillAbSummaryFromFigma();
+}
+
 // ── Design reference (A/B tab) ──────────────────────────────────────────────
 // The Figma board URL and the comp attachment both come off the ticket during
 // Initialize and both describe the ticket as a whole, not a single variant —
@@ -3376,10 +3477,42 @@ async function vdFigmaBoards(url) {
   return { node, boards: c.boards, labels: c.labels, rejected: c.rejected, picks };
 }
 
+// Dry-run of the Summary of Changes autofill: performs the read and returns
+// everything it produced WITHOUT writing to the box. The point is to be able
+// to inspect what the model said about the comp before that text becomes the
+// thing every finding is graded against — once it is in the box, the report
+// treats it as fact.
+async function vdFigmaSummary() {
+  const ctx = await getActiveContext().catch(() => null);
+  const url = (abState?.figmaUrl || '').trim() || (ctx?.reviewed ? ctx.figmaUrl : null);
+  const image = ctx?.reviewed ? await getCompImage(ctx) : null;
+
+  console.log(`[vdDebug] ticket ${ctx?.ticketKey || '(none)'} — link ${url ? 'yes' : 'no'}, comp image ${image ? 'yes' : 'no'}`);
+  if (!url && !image) { console.warn('[vdDebug] Nothing to read — no Figma link and no comp attachment.'); return null; }
+
+  const labels = url ? await figmaFetchVariationLabels(url) : [];
+  console.log(`[vdDebug] ${labels.length} Variation label(s) from the file:`, labels.map(l => `${l.variantId}=${l.changeName}`));
+  if (!image) { console.warn('[vdDebug] No comp image — the autofill would use labels only, with no model call.'); return { labels }; }
+
+  const res = await chrome.runtime.sendMessage({
+    action: 'figmaSummarizeComp',
+    payload: { dataUrl: image, labels, ticketKey: ctx?.ticketKey || null },
+  }).catch(e => ({ ok: false, error: e.message }));
+
+  if (!res?.ok) { console.error('[vdDebug] Comp summary failed —', res?.error, res?.raw || ''); return res; }
+  console.log('[vdDebug] anchored on file labels:', res.usedFileLabels);
+  if (res.truncated) console.warn('[vdDebug] Response hit max_tokens — the summary is incomplete.');
+  (res.flags || []).forEach(f => console.warn('[vdDebug] flag:', f));
+  console.table(res.variants || []);
+  console.log('[vdDebug] Would write:\n' + buildSummaryFromFigmaVariants(res.variants));
+  return res;
+}
+
 window.__vdDebug = {
   showCandidateOverlay: vdShowCandidateOverlay,
   figmaFile: vdFigmaFile,
   figmaBoards: vdFigmaBoards,
+  figmaSummary: vdFigmaSummary,
 };
 
 // ── Pipeline orchestrator ────────────────────────────────────────────────────
