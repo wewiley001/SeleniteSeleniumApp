@@ -5761,6 +5761,40 @@ async function renderIncognitoGuard() {
 }
 
 // ── Jira field resolution (dynamic — resolved per fetch from `names`) ───────
+// Resolves a rich-text (ADF) custom field by its DISPLAY NAME and returns the
+// document itself.
+//
+// This exists because ticket bodies on these projects do not live in the
+// description at all. WOW-1160 and ENOC-97 both return `description: null`
+// while carrying a populated "Test Specifications" custom field
+// (customfield_10041 on this site) — so parsing only the description found
+// zero variants on every real ticket, which left Summary of Changes empty and
+// made every Visual Diff finding "unclear" by construction. Preview links kept
+// working the whole time because those come from the AI pass, which reads the
+// RENDERED page where custom fields are visible. That asymmetry was the
+// symptom; this is the cause.
+//
+// By name rather than id, the same way Platform Experiment ID and QA Test Plan
+// already resolve, because custom field ids differ per Jira site.
+//
+// Prefers a field with content: this site has TWO fields named "Goals"
+// (customfield_10040 populated, customfield_10821 empty). Taking the first
+// name match by object iteration order would silently pick whichever came
+// first, and an empty pick is indistinguishable from a ticket that genuinely
+// has nothing to say.
+function resolveJiraAdfField(names, fields, label) {
+  const want = label.trim().toLowerCase();
+  let empty = null;
+  for (const [key, name] of Object.entries(names || {})) {
+    if ((name || '').trim().toLowerCase() !== want) continue;
+    const v = (fields || {})[key];
+    if (!v || typeof v !== 'object' || v.type !== 'doc') continue;
+    if ((v.content || []).length) return v;
+    if (!empty) empty = v;
+  }
+  return empty;
+}
+
 function resolveJiraFieldKey(names, label) {
   const want = label.trim().toLowerCase();
   for (const [key, name] of Object.entries(names || {})) {
@@ -6029,18 +6063,30 @@ function extractTestContext(issue, origin, ticketKeyFromPage, links) {
   if (experimentIdKey && !experimentId) warnings.push('"Platform Experiment ID" field is empty on this ticket.');
 
   const adf = (f.description && typeof f.description === 'object') ? f.description : null;
-  if (!adf) warnings.push('Ticket has no description — no sections to extract from.');
 
-  // Step 3 — variants from "Test Specifications"
-  const specNodes = adf ? adfSectionNodes(adf, 'Test Specifications') : null;
-  if (adf && specNodes === null) warnings.push('"Test Specifications" heading not found in the ticket description.');
+  // Step 3 — variants from "Test Specifications".
+  //
+  // Two shapes, and the custom field wins because it is what real tickets
+  // actually use. When the section is its own field the WHOLE field is the
+  // section — there is no heading to locate inside it, so its content is used
+  // directly rather than being handed to adfSectionNodes.
+  const specField = resolveJiraAdfField(names, f, 'Test Specifications');
+  const specNodes = specField ? (specField.content || [])
+    : adf ? adfSectionNodes(adf, 'Test Specifications')
+    : null;
+
+  // Only complain about a missing description when it was the last resort.
+  // A ticket with a populated Test Specifications FIELD and no description is
+  // normal here, and warning about it trained the reader to ignore the line.
+  if (!adf && !specField) warnings.push('Ticket has no description and no "Test Specifications" field — no sections to extract from.');
+  if (!specField && adf && specNodes === null) warnings.push('"Test Specifications" heading not found in the ticket description, and no field of that name exists on this ticket.');
   const variants = splitVariantBlocks(adfSectionLines(specNodes || [])).map(b => ({
     id: b.id,
     // v0 is control by convention, always — never inferred from content.
     isControl: b.id === 'v0',
     rawDescription: b.texts.join('\n').trim(),   // verbatim; no summarization
   }));
-  if (specNodes && !variants.length) warnings.push('"Test Specifications" section found, but no v0/v1/… markers inside it.');
+  if (specNodes && !variants.length) warnings.push(`"Test Specifications" ${specField ? 'field' : 'section'} found, but no v0/v1/… markers inside it.`);
 
   // Step 3b/3c — Softcoded Tests / Concurrent Tests. Deterministic like
   // variants above — never AI, never fetched. `{prefix:true}` because the
