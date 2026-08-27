@@ -3609,14 +3609,33 @@ function vdNormalizeTargetUrl(u) {
 
 // (1) Configuration: this target IS Control — same URL, or it redirected onto
 // Control's final URL (a forced-variant parameter silently dropped en route).
+// Returns { hard, reason } or null. `hard` decides whether this is a reason to
+// refuse the comparison outright or merely a reason to be suspicious of it.
+//
+// The distinction is not cosmetic — treating both as hard produced a false
+// stop on a real ticket. ENOC-97's preview links are Optimizely PREVIEW-TOKEN
+// URLs: the token establishes a session, then an http -> https/www redirect
+// strips the whole query string, so both targets legitimately settle on the
+// same final URL while the forced variant persists via the session. The two
+// captures came back 4590px and 6698px tall — a 46% difference at an identical
+// viewport, so the variant plainly applied — and the run was refused anyway.
+//
+// A matching CONFIGURED url is still hard: the two targets are literally the
+// same address, nothing has been captured yet, and there is nothing a
+// comparison could discover.
+//
+// A matching FINAL url is soft. By the time it can be evaluated both captures
+// already exist, and vdRenderedAsControlReason answers the same question from
+// far better evidence — the diff itself — while still running BEFORE the model
+// call, so deferring to it costs local compute and no spend.
 function vdControlDuplicateReason(base, c) {
   const bu = vdNormalizeTargetUrl(base.url), cu = vdNormalizeTargetUrl(c.url);
   if (bu && cu && bu === cu) {
-    return `it is configured with the same URL as Control ("${base.label}"), so this would compare Control against itself`;
+    return { hard: true, reason: `it is configured with the same URL as Control ("${base.label}"), so this would compare Control against itself` };
   }
   const bf = vdNormalizeTargetUrl(base.finalUrl), cf = vdNormalizeTargetUrl(c.finalUrl);
   if (bf && cf && bf === cf) {
-    return `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter was probably dropped on redirect`;
+    return { hard: false, reason: `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter may have been dropped on redirect. Forced-variant state can also survive as a session (Optimizely preview tokens do this), so the comparison was run anyway and judged on what actually rendered` };
   }
   return null;
 }
@@ -3785,15 +3804,18 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       continue;
     }
 
-    // Stop before spending anything on a comparison that cannot be valid.
-    const dupReason = vdControlDuplicateReason(base, c);
-    if (dupReason) {
+    // Stop before spending anything on a comparison that cannot be valid —
+    // but only when it CANNOT be. A shared final URL is suspicious, not
+    // disqualifying; it is carried forward and reported, and the diff decides.
+    const dup = vdControlDuplicateReason(base, c);
+    if (dup?.hard) {
       perVariant.push({
         label: c.label, controlDuplicate: true,
-        error: `Analysis stopped — ${dupReason}.`,
+        error: `Analysis stopped — ${dup.reason}.`,
       });
       continue;
     }
+    const sameUrlNote = dup ? dup.reason : null;
 
     const prior = resumeCheckpoint?.perVariant?.[c.label];
     if (prior?.status === 'done') {
@@ -3839,8 +3861,10 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     const sameAsControl = vdRenderedAsControlReason(diffRes);
     if (sameAsControl) {
       perVariant.push({
-        label: c.label, controlDuplicate: true,
-        error: `Analysis stopped — ${sameAsControl}.`,
+        label: c.label, controlDuplicate: true, sameUrlNote,
+        // When both signals agree the URL one is the explanation, so lead with
+        // the render evidence and append the cause.
+        error: `Analysis stopped — ${sameAsControl}${sameUrlNote ? `. Note: ${sameUrlNote}` : ''}.`,
         structuralStats, pixelDiff, aggregate, diffMode: mode, matchedFraction,
         matchTierCounts, diffDebug, fullPageTruncated: !!c.fullPage.truncated,
       });
@@ -3854,7 +3878,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     // is never a casualty of this optimization.
     if (kept.length === 0) {
       perVariant.push({
-        label: c.label, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
+        label: c.label, sameUrlNote, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
         noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
         noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
         aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
@@ -3894,7 +3918,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     }
 
     perVariant.push({
-      label: c.label, findings, overallSummary: reportRes.overallSummary,
+      label: c.label, sameUrlNote, findings, overallSummary: reportRes.overallSummary,
       noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
       noVerdictCount: reportRes.noVerdictCount, duplicateIndexCount: reportRes.duplicateIndexCount,
       truncated: reportRes.truncated, pixelDiff: reportRes.pixelDiff,
@@ -5505,6 +5529,10 @@ function vdCollectProblems(sections) {
     for (const v of (vd?.perVariant || [])) {
       const at = `visual-diff/${v.label}`;
       if (v.skipped) { add('warn', at, `Skipped — ${v.reason || 'not captured'}`); continue; }
+      // A shared final URL no longer stops the run, so it has to be said out
+      // loud — it is the leading explanation if this variant turns out to be
+      // Control in disguise.
+      if (v.sameUrlNote) add('warn', at, v.sameUrlNote + '.');
       // Control-vs-Control outranks every other note about this variant: the
       // comparison did not happen, so nothing else recorded for it means
       // anything. Never let this degrade into a quiet aside.

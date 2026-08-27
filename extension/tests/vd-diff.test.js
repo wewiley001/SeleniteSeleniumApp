@@ -878,17 +878,39 @@ section('control-vs-control');
      vdControlDuplicateReason(base, { label: 'v1', url: 'https://zapier.com/?optimizely_x=BBB', finalUrl: 'https://zapier.com/?optimizely_x=BBB' }),
      null);
 
-  ok('same configured URL is caught',
-     /same URL as Control/.test(vdControlDuplicateReason(base,
-       { label: 'v1', url: 'https://zapier.com/?optimizely_x=AAA', finalUrl: 'https://zapier.com/?optimizely_x=AAA' }) || ''));
+  var sameConfigured = vdControlDuplicateReason(base,
+    { label: 'v1', url: 'https://zapier.com/?optimizely_x=AAA', finalUrl: 'https://zapier.com/?optimizely_x=AAA' });
+  ok('same configured URL is caught', /same URL as Control/.test(sameConfigured.reason));
+  // HARD: the two targets are literally the same address and nothing has been
+  // captured yet, so no comparison could discover anything.
+  eq('...and is a HARD stop', sameConfigured.hard, true);
 
   ok('trailing-slash / case differences do not hide a duplicate',
      !!vdControlDuplicateReason(base,
        { label: 'v1', url: 'https://Zapier.com/?optimizely_x=AAA/', finalUrl: 'x' }));
 
-  ok('a variant that redirects ONTO control is caught',
-     /same final URL as Control/.test(vdControlDuplicateReason(base,
-       { label: 'v1', url: 'https://zapier.com/?optimizely_x=BBB', finalUrl: 'https://zapier.com/?optimizely_x=AAA' }) || ''));
+  // SOFT, and this distinction came from a real false stop. ENOC-97's preview
+  // links are Optimizely preview-TOKEN urls: the token sets a session, an
+  // http -> https/www redirect strips the query string, and both targets
+  // legitimately settle on the same final URL while the variant persists via
+  // the session. Its two captures came back 4590px and 6698px tall — a 46%
+  // difference at an identical viewport — and the run was refused anyway.
+  var sameFinal = vdControlDuplicateReason(base,
+    { label: 'v1', url: 'https://zapier.com/?optimizely_x=BBB', finalUrl: 'https://zapier.com/?optimizely_x=AAA' });
+  ok('a variant that redirects ONTO control is caught', /same final URL as Control/.test(sameFinal.reason));
+  eq('...but is SOFT — the diff decides, not the URL', sameFinal.hard, false);
+  ok('...and the reason says the comparison was run anyway',
+     /judged on what actually rendered/.test(sameFinal.reason), sameFinal);
+
+  // Both signals present: the configured-URL check must win, because it is
+  // the one that can be evaluated before spending a capture.
+  eq('configured match outranks final match',
+     vdControlDuplicateReason(base,
+       { label: 'v1', url: 'https://zapier.com/?optimizely_x=AAA', finalUrl: 'https://zapier.com/?optimizely_x=AAA' }).hard, true);
+
+  // A missing finalUrl must not be read as a match against a present one.
+  ok('absent finalUrl is not a duplicate',
+     vdControlDuplicateReason(base, { label: 'v1', url: 'https://zapier.com/?x=B', finalUrl: '' }) === null);
 
   // The dangerous one: configured correctly, but the variant never applied.
   var identical = { mode: 'normal', findings: [],
