@@ -2202,6 +2202,13 @@ function vdImageScale(img, pageW) {
   return (s >= 0.5 && s <= 4) ? s : 1;
 }
 
+// makeReadContext sizes its canvas to the bitmap, so the canvas IS the bounds.
+function vdRectInsideCanvas(ctx, x, y, w, h) {
+  const cw = ctx?.canvas?.width, ch = ctx?.canvas?.height;
+  if (!cw || !ch) return false;
+  return x >= 0 && y >= 0 && x + w <= cw && y + h <= ch;
+}
+
 function vdScaleRect(rect, scale) {
   if (!rect) return null;
   if (scale === 1) return rect;
@@ -2298,7 +2305,17 @@ const VIS_BLOCK_PIXEL_MIN_AREA = 400;   // px² — skip slivers, not worth the 
 // its result back across sendMessage to popup.js, and that constraint is gone
 // now that matching and this check run in the same function in the same
 // context.
-function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings, scale) {
+// controlScale/variantScale are per-side on purpose. They were one shared
+// scalar until a measured run proved the two sides can disagree: on ENOC-97 the
+// variant bitmap came back 5372x13396 (scale 2) while the control stayed
+// 2686x4590 (scale 1), same page, same window, 64 seconds after a run where
+// both were 1. c4b0aef derived both scales and the crop path has used them per
+// side ever since; this function was the one place that took only the
+// control's. That mattered here more than in the crop path, because this
+// function can only PROMOTE: read the variant at half its true scale, compare
+// unrelated content, get a ratio near 1.0, and invent a `pixels-changed`
+// style-changed finding out of nothing.
+function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings, controlScale, variantScale) {
   const eligible = (findings || []).filter(f => {
     if (f.changeClass !== 'unchanged') return false;
     // No pixels exist for either side outside the captured frame — the DOM walk
@@ -2336,15 +2353,27 @@ function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings, scale) {
   eligible.sort((x, y) => (y.a.rect.w * y.a.rect.h) - (x.a.rect.w * x.a.rect.h));
 
   for (const f of eligible.slice(0, VD_PIXEL_CHECK_MAX)) {
-    // Image space, not CSS space — see vdImageScale.
-    const a = vdScaleRect(f.a.rect, scale || 1), b = vdScaleRect(f.b.rect, scale || 1);
+    // Image space, not CSS space — see vdImageScale. Each side scaled by its
+    // OWN measured factor; they are not always equal.
+    const a = vdScaleRect(f.a.rect, controlScale || 1), b = vdScaleRect(f.b.rect, variantScale || 1);
     const w = Math.min(a.w, b.w), h = Math.min(a.h, b.h);
     if (w <= 0 || h <= 0) continue;
+    // Explicit bounds check, because the try/catch below does NOT catch this.
+    // The old comment here claimed a rect outside the decoded bitmap would
+    // throw; Canvas2D getImageData does not — it returns transparent-black
+    // padding for any region outside the source and throws only on zero or
+    // non-finite dimensions, which the w/h guard above already covers. So an
+    // out-of-bounds read silently compared real pixels against transparent
+    // black, scored a ratio near 1.0, and promoted the pair. belowCapture and
+    // offCanvas are per-element flags and do not cover a rect that merely
+    // straddles the frame edge.
+    if (!vdRectInsideCanvas(controlCtx, a.x, a.y, w, h)) continue;
+    if (!vdRectInsideCanvas(variantCtx, b.x, b.y, w, h)) continue;
     let da, db;
     try {
       da = controlCtx.getImageData(a.x, a.y, w, h).data;
       db = variantCtx.getImageData(b.x, b.y, w, h).data;
-    } catch (_) { continue; }   // rect outside the decoded bitmap — leave it alone, don't throw
+    } catch (_) { continue; }   // genuinely degenerate geometry only
     const ratio = pixelmatch(da, db, null, w, h, { threshold: VIS_PIXELMATCH_THRESHOLD, includeAA: VIS_PIXELMATCH_INCLUDE_AA }) / (w * h);
     if (ratio > VIS_BLOCK_PIXEL_RATIO) {
       f.changeClass = 'style-changed';
@@ -2475,8 +2504,17 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
       controlImage: { w: bi.width, h: bi.height }, variantImage: { w: ci.width, h: ci.height },
       pageW: { control: basePageW ?? null, variant: variantPageW ?? null },
     };
-    vdPixelCheckMatchedPairs(makeReadContext(bi), makeReadContext(ci), paired, imageScale.control);
-    pixelDiff = await computeCoarsePixelDiffRatio(bi, ci).catch(() => null);
+    vdPixelCheckMatchedPairs(makeReadContext(bi), makeReadContext(ci), paired, imageScale.control, imageScale.variant);
+    // computeCoarsePixelDiffRatio crops both bitmaps to min(width)/min(height),
+    // which is a SIZE guard and not a scale guard: at control scale 1 and
+    // variant scale 2 it compared the control's whole page against the
+    // variant's top-left corner at 2x magnification and reported 0.679 with
+    // exactly the same confidence as the three matched-scale runs' 0.669. A
+    // number that is wrong for a knowable reason is worse than no number, so
+    // withhold it and let vdCollectProblems say why.
+    pixelDiff = imageScale.control === imageScale.variant
+      ? await computeCoarsePixelDiffRatio(bi, ci).catch(() => null)
+      : null;
   } catch (_) {}
 
   // No off-canvas special-casing here. It used to suppress unmatched clipped
@@ -2502,9 +2540,12 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
   let reportable;
   if (match.mode === 'redesign') {
     // Below the match floor an element-by-element list is meaningless — most
-    // elements have no counterpart at all. Roll up per page region instead;
-    // step 6 attaches both full-page screenshots to the report call, which is
-    // the one place vision genuinely earns its cost.
+    // elements have no counterpart at all. Roll up per page region instead.
+    // NOT YET IMPLEMENTED, despite what this comment used to assert: the plan
+    // is for step 6 to attach both full-page screenshots here, which is the
+    // one place vision would genuinely earn its cost, but the report request
+    // still sends a single text block and no images. A rollup's entire model
+    // input is its engineNote string.
     reportable = vdRollupByRegion(match, controlList, variantList).map(r => ({
       changeClass: 'region-rollup', synthetic: true, region: r.region,
       // Carried so the crop stage has something to crop at all.
@@ -4911,9 +4952,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
 
   } else if (msg.action === 'reportVisualDiffFindings') {
-    // Stage 3 (Opus). pixelDiff arrives from the earlier
-    // pixelCheckVisualDiffFindings call (popup.js) and is only relayed
-    // through here so the checkpoint's diffAndReport shape stays unchanged.
+    // Stage 3 (Opus). pixelDiff is produced by diffVisualDiffVariant (see
+    // computeCoarsePixelDiffRatio) and is only relayed through here so the
+    // checkpoint's diffAndReport shape stays unchanged. It never reaches the
+    // model: buildVisualReportPrompt takes no such parameter. (The previous
+    // comment credited a `pixelCheckVisualDiffFindings` action, which does not
+    // exist anywhere in this extension.)
     (async () => {
       const { winId, runId, baselineLabel, variantLabel, findings, stats, ticketVariantText, specSource, pixelDiff } = msg.payload || {};
       const vd = vdState(winId);

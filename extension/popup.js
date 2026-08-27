@@ -5622,6 +5622,23 @@ function vdCollectProblems(sections) {
 
       const d = v.diffDebug;
       if (d) {
+        // A capture-scale mismatch between the two sides corrupts every
+        // pixel-space read and was completely invisible until now: on ENOC-97
+        // the variant came back at device scale 2 and the control at 1, and
+        // `problems` was byte-identical to the run 64 seconds earlier where
+        // both were 1. Compare the RAW ratios, not the two scalars —
+        // vdImageScale clamps anything outside [0.5, 4] to 1, so two genuinely
+        // divergent bitmaps can both report a tidy 1.
+        const sc = d.imageScale;
+        if (sc) {
+          const rawC = sc.controlImage?.w && sc.pageW?.control ? sc.controlImage.w / sc.pageW.control : null;
+          const rawV = sc.variantImage?.w && sc.pageW?.variant ? sc.variantImage.w / sc.pageW.variant : null;
+          const mismatch = (sc.control !== sc.variant)
+            || (rawC != null && rawV != null && Math.abs(rawC - rawV) > 0.01);
+          if (mismatch) {
+            add('error', at, `The two screenshots came back at different pixel scales — Control ${sc.controlImage?.w}px wide for a ${sc.pageW?.control}px page (${rawC != null ? rawC.toFixed(2) : '?'}x), Variant ${sc.variantImage?.w}px for ${sc.pageW?.variant}px (${rawV != null ? rawV.toFixed(2) : '?'}x). Nothing that reads pixels can be trusted across that gap: the whole-page pixel percentage is withheld for this variant, and any crop or per-block pixel check is comparing regions at different magnifications. Re-run before reading anything into the pixel figures.`);
+          }
+        }
         const fuzzy = d.matchTierCounts?.fuzzy || 0;
         if (fuzzy) add('warn', at, `${fuzzy} element(s) were paired by approximate similarity rather than an exact key — those pairings may be wrong.`);
         // The signature of broken reflow suppression: an amount that keeps
@@ -5736,6 +5753,14 @@ function buildDebugLog(sections) {
           controlText: (f.controlBlock?.text || '').slice(0, 160) || null,
           variantText: (f.variantBlock?.text || '').slice(0, 160) || null,
           controlRect: f.controlBlock?.rect || null, variantRect: f.variantBlock?.rect || null,
+          // For a synthetic finding — every finding in redesign mode — this
+          // string IS the entire model input (buildVisualReportPrompt emits it
+          // as the finding's only content). Without it here, two logs cannot
+          // establish whether the grader was even asked the same question
+          // twice, which is exactly what four ENOC-97 runs grading the same
+          // seven findings four different ways needed to distinguish
+          // "unseeded sampling" from "the prompt string actually changed".
+          engineNote: f.engineNote || null,
         })),
         diagnostics: v.diffDebug || null,
       })),

@@ -39,6 +39,9 @@ load('../vd-diff.js');
 var _pu = readFile('../popup.js');
 eval(_pu.slice(_pu.indexOf('function vdCollectProblems(sections)'),
                 _pu.indexOf('function buildDebugLog(sections)')));
+// buildDebugLog carries the findings projection that becomes the exported JSON.
+eval(_pu.slice(_pu.indexOf('function buildDebugLog(sections)'),
+                _pu.indexOf('\n// Stash the rendered report body')));
 // Control-vs-Control detectors and shared-finding extraction, sliced from the
 // pipeline they guard.
 eval(_pu.slice(_pu.indexOf('function vdFindingIdentity(f)'),
@@ -52,6 +55,16 @@ eval(_bg.slice(_bg.indexOf('const VD_DEBUG_SAMPLE_CAP'),
 
 // The two pixel-dependent stages, sliced out for the below-capture guards.
 // Stubs stand in for the browser-only bits they call.
+// buildDebugLog (sliced above, for the findings projection) reads three browser
+// globals. They must be declared at FILE scope, not inside the test's IIFE:
+// the sliced functions are eval'd here at global scope and resolve their free
+// variables there, so a `var chrome` inside a test function is invisible to
+// them. Nothing else in this suite depends on these.
+var chrome = { runtime: { getManifest: function () { return { version: '1.0.0' }; } } };
+var navigator = { userAgent: 'jsc' };
+var abState = { qaMode: false, settleSec: '3', keepTabs: false, visualDiff: true,
+                visualDiffCrops: true, agenticTesting: true, summaryOfChanges: '' };
+
 var VIS_BLOCK_PIXEL_MIN_AREA = 400, VIS_CROP_PAD = 12;
 function pixelmatch() { throw new Error('pixelmatch should not be reached in these tests'); }
 function clampBox(box, w, h) {
@@ -850,6 +863,77 @@ function capture(label, o) {
 })();
 
 // ── 8b. full-page coverage past the screenshot limit ───────────────────────
+(function scaleMismatchIsReported() {
+  // ENOC-97, two runs 64 seconds apart: the variant bitmap came back at device
+  // scale 2 and the control at 1, and `problems` was BYTE-IDENTICAL to the run
+  // where both were 1. A mismatch corrupts every pixel-space read, so it has to
+  // be an error in its own right rather than something a reader infers.
+  function probs(imageScale) {
+    return vdCollectProblems(abSections(
+      [capture('v0', { fullPage: null }), capture('v1', { fullPage: null })],
+      [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.99, structuralStats: {},
+         diffDebug: { imageScale: imageScale, counts: {} } }]));
+  }
+  function scaleHits(list) {
+    return list.filter(function (x) { return /different pixel scales/.test(x.detail); });
+  }
+  var matched = probs({ control: 1, variant: 1, controlImage: { w: 2686, h: 4590 },
+                        variantImage: { w: 2686, h: 6698 }, pageW: { control: 2686, variant: 2686 } });
+  eq('matched scales report no scale problem', scaleHits(matched).length, 0);
+
+  // run3's real numbers.
+  var mixed = probs({ control: 1, variant: 2, controlImage: { w: 2686, h: 4590 },
+                      variantImage: { w: 5372, h: 13396 }, pageW: { control: 2686, variant: 2686 } });
+  var hit = scaleHits(mixed);
+  eq('a 1x/2x mismatch is reported exactly once', hit.length, 1);
+  eq('  at error severity, not warn', hit.length ? hit[0].severity : null, 'error');
+  ok('  and names both measured scales',
+     hit.length > 0 && /1\.00x/.test(hit[0].detail) && /2\.00x/.test(hit[0].detail),
+     hit.length ? hit[0].detail : null);
+
+  // vdImageScale clamps anything outside [0.5, 4] to 1, so two genuinely
+  // divergent bitmaps can BOTH report a tidy scale of 1. Comparing only the
+  // clamped scalars would wave this through; the raw ratios must be compared.
+  var laundered = probs({ control: 1, variant: 1, controlImage: { w: 2686, h: 4590 },
+                          variantImage: { w: 26860, h: 66980 }, pageW: { control: 2686, variant: 2686 } });
+  eq('a laundered mismatch (both clamp to 1) is still caught', scaleHits(laundered).length, 1);
+
+  // No imageScale at all (an older checkpoint, or a decode failure) must not throw.
+  ok('a missing imageScale is tolerated', Array.isArray(probs(null)));
+})();
+
+(function engineNoteIsExported() {
+  // A redesign-mode finding's engineNote IS its entire model input
+  // (buildVisualReportPrompt emits it as the finding's only content), and it was
+  // absent from the export — so no comparison of two logs could establish
+  // whether the grader was even asked the same question twice. Four ENOC-97
+  // runs graded the same seven findings four different ways with nothing in the
+  // logs to separate unseeded sampling from a changed prompt string.
+  var note = 'footer: 11 elements in Control, 11 in Variant, 11 matched.';
+  var log = buildDebugLog(abSections([capture('v0', { fullPage: null })], [{
+    label: 'v1', diffMode: 'redesign', matchedFraction: 0.24, structuralStats: {},
+    findings: [{
+      findingId: 'f5', changeClass: 'region-rollup', status: 'modified', region: 'footer',
+      classification: 'unclear', severity: 'low', synthetic: true, engineNote: note,
+      controlBlock: { type: 'region', label: 'footer', text: null, rect: { x: 695, y: 3912, w: 1296, h: 614 } },
+      variantBlock: { type: 'region', label: 'footer', text: null, rect: { x: 695, y: 6020, w: 1296, h: 614 } },
+    }],
+  }]));
+  var f = log.visualDiff.perVariant[0].findings[0];
+  eq('engineNote survives the export projection', f.engineNote, note);
+  eq('  alongside the fields already there', f.findingId, 'f5');
+  eq('  and the rect', f.controlRect && f.controlRect.y, 3912);
+
+  // A non-synthetic finding has no engineNote; it must export null rather than
+  // undefined so the JSON shape stays stable across finding kinds.
+  var log2 = buildDebugLog(abSections([capture('v0', { fullPage: null })], [{
+    label: 'v1', diffMode: 'normal', matchedFraction: 0.99, structuralStats: {},
+    findings: [{ findingId: 'f0', changeClass: 'text-changed', status: 'modified' }],
+  }]));
+  eq('a finding with no engineNote exports null, not undefined',
+     log2.visualDiff.perVariant[0].findings[0].engineNote, null);
+})();
+
 section('below-capture coverage');
 (function belowCaptureStillDiffs() {
   // Control is scanned in its entirety; the screenshot stops at 8000px. A copy
@@ -905,7 +989,31 @@ section('below-capture coverage');
   // whose shift cleared the move floor and was suppressed as reflow, reported
   // none.
   var reads = 0;
-  var ctx = { getImageData: function () { reads++; return { data: new Uint8Array(4) }; } };
+  // The stub carries a `canvas` because the real makeReadContext always does —
+  // it sizes an OffscreenCanvas to the bitmap. vdPixelCheckMatchedPairs now
+  // bounds-checks against those dimensions instead of trusting getImageData to
+  // throw (Canvas2D returns transparent-black padding out of bounds and throws
+  // only on degenerate w/h), so a context without them models nothing real.
+  function mkCtx(w, h) {
+    return {
+      canvas: { width: w || 4000, height: h || 20000 },
+      reads: [],
+      getImageData: function (x, y, gw, gh) {
+        reads++; this.reads.push({ x: x, y: y, w: gw, h: gh });
+        return { data: new Uint8Array(Math.max(4, gw * gh * 4)) };
+      },
+    };
+  }
+  var ctx = mkCtx();
+  // The suite stubs pixelmatch to throw (line ~56) as a tripwire for tests that
+  // must never reach it. The cases below deliberately DO reach it, and what
+  // they assert is the getImageData coordinates, which are recorded before
+  // pixelmatch is called. Swallow only that sentinel.
+  function reachingPixelmatch(fn) {
+    try { fn(); } catch (e) {
+      if (!/pixelmatch should not be reached/.test(String(e))) throw e;
+    }
+  }
 
   var shifted = { changeClass: 'unchanged', dx: 0, dy: 4,
                   a: cand({ text: 'Same text', y: 4756, w: 480, h: 48 }),
@@ -928,6 +1036,58 @@ section('below-capture coverage');
   var threw = false;
   try { vdPixelCheckMatchedPairs(ctx, ctx, [stationary]); } catch (e) { threw = true; }
   ok('a stationary pair IS still pixel-checked', reads > 0 || threw);
+
+  // Per-side scales. Measured on ENOC-97: the variant bitmap came back at
+  // device scale 2 while the control stayed at 1, same page, 64 seconds after
+  // a run where both were 1. This function took ONE scalar and applied it to
+  // both sides, so the variant was read at half its true coordinates —
+  // comparing unrelated content, scoring near 1.0, and promoting an
+  // 'unchanged' pair to style-changed. It can only promote, so a wrong read
+  // here fabricates a finding rather than losing one.
+  var cc = mkCtx(2686, 4590), vc = mkCtx(5372, 13396);
+  var pair = { changeClass: 'unchanged', dx: 0, dy: 0,
+               a: cand({ text: 'Same', x: 100, y: 200, w: 480, h: 48 }),
+               b: cand({ text: 'Same', x: 100, y: 200, w: 480, h: 48 }) };
+  reachingPixelmatch(function () { vdPixelCheckMatchedPairs(cc, vc, [pair], 1, 2); });
+  ok('control side read at its own scale (1x)',
+     cc.reads.length === 1 && cc.reads[0].x === 100 && cc.reads[0].y === 200, cc.reads);
+  ok('variant side read at ITS scale (2x), not the control\'s',
+     vc.reads.length === 1 && vc.reads[0].x === 200 && vc.reads[0].y === 400, vc.reads);
+
+  // Same call with one shared scale is what shipped before — kept as a guard
+  // that the two arguments are actually independent.
+  var cc2 = mkCtx(2686, 4590), vc2 = mkCtx(5372, 13396);
+  var pair2 = { changeClass: 'unchanged', dx: 0, dy: 0,
+                a: cand({ text: 'Same', x: 100, y: 200, w: 480, h: 48 }),
+                b: cand({ text: 'Same', x: 100, y: 200, w: 480, h: 48 }) };
+  reachingPixelmatch(function () { vdPixelCheckMatchedPairs(cc2, vc2, [pair2], 1, 1); });
+  ok('passing 1/1 reads the variant at 1x (arguments are independent)',
+     vc2.reads.length === 1 && vc2.reads[0].x === 100, vc2.reads);
+
+  // Bounds. A rect that straddles the frame edge is not covered by
+  // belowCapture/offCanvas (those are per-element flags), and getImageData
+  // would have returned transparent-black padding rather than throwing — a
+  // ratio near 1.0 and another fabricated promotion.
+  var edgeC = mkCtx(2686, 4590), edgeV = mkCtx(2686, 4590);
+  var straddler = { changeClass: 'unchanged', dx: 0, dy: 0,
+                    a: cand({ text: 'Edge', x: 2400, y: 4560, w: 480, h: 48 }),
+                    b: cand({ text: 'Edge', x: 2400, y: 4560, w: 480, h: 48 }) };
+  // Wrapped like the others even though a correct implementation never reaches
+  // pixelmatch here — that is the assertion. Unwrapped, this line THROWS
+  // against a build without the bounds check and takes the remaining ~90 cases
+  // down with it instead of reporting one clean failure.
+  reachingPixelmatch(function () { vdPixelCheckMatchedPairs(edgeC, edgeV, [straddler], 1, 1); });
+  eq('a rect past the bitmap edge is skipped, not compared to blank padding', edgeC.reads.length, 0);
+  eq('  and the pair is left unchanged rather than promoted', straddler.changeClass, 'unchanged');
+
+  // The in-bounds twin of the same geometry must still be checked, so the
+  // guard is a bounds check and not a blanket skip of large-y rects.
+  var okC = mkCtx(2686, 4590), okV = mkCtx(2686, 4590);
+  var inside = { changeClass: 'unchanged', dx: 0, dy: 0,
+                 a: cand({ text: 'Edge', x: 2200, y: 4500, w: 480, h: 48 }),
+                 b: cand({ text: 'Edge', x: 2200, y: 4500, w: 480, h: 48 }) };
+  reachingPixelmatch(function () { vdPixelCheckMatchedPairs(okC, okV, [inside], 1, 1); });
+  eq('an in-bounds rect at the same depth still IS checked', okC.reads.length, 1);
 })();
 
 (function pixelStagesSkipBelowCapture() {
