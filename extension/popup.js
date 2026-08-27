@@ -187,9 +187,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.error('Selenite: Metric Tracker tab failed to load —', e);
   }
 
-  // Test Agent tab
-  const { anthropicApiKey } = await chrome.storage.sync.get('anthropicApiKey');
-  if (anthropicApiKey) document.getElementById('ta-api-key').value = anthropicApiKey;
+  // Credentials — both live in the settings overlay, not in any tab.
+  // Guarded element lookups on purpose: this sits in the same unguarded await
+  // chain as everything below, so a missing node would take out every
+  // listener bound after this point rather than failing locally.
+  const { anthropicApiKey, figmaPat } = await chrome.storage.sync.get(['anthropicApiKey', 'figmaPat']);
+  const anthropicInput = document.getElementById('set-anthropic-key');
+  if (anthropicInput && anthropicApiKey) anthropicInput.value = anthropicApiKey;
+  const figmaPatInput = document.getElementById('set-figma-pat');
+  if (figmaPatInput && figmaPat) figmaPatInput.value = figmaPat;
   const { funnelState: savedFunnel } = await sessionNS.get('funnelState');
   if (savedFunnel) funnelState = { start: '', middles: [], end: '', supplementalPrompt: '', ...savedFunnel };
 
@@ -205,9 +211,61 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.error('Selenite: fill targets failed to initialize —', e);
   }
 
-  document.getElementById('btn-ta-save-key').addEventListener('click', () => {
-    chrome.storage.sync.set({ anthropicApiKey: document.getElementById('ta-api-key').value.trim() });
+  // ── Settings overlay ─────────────────────────────────────────────────────
+  // Credentials are not a workflow step, so they are not a tab — a tab would
+  // give them the same visual rank as the modes and bury them behind whichever
+  // one happened to own them. The gear is in the header, so this is reachable
+  // from anywhere.
+  const settingsOverlay = document.getElementById('settings-overlay');
+  const openSettings = () => { if (settingsOverlay) settingsOverlay.hidden = false; };
+  const closeSettings = () => { if (settingsOverlay) settingsOverlay.hidden = true; };
+  document.getElementById('btn-settings')?.addEventListener('click', openSettings);
+  document.getElementById('btn-settings-close')?.addEventListener('click', closeSettings);
+  document.getElementById('settings-backdrop')?.addEventListener('click', closeSettings);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && settingsOverlay && !settingsOverlay.hidden) closeSettings();
   });
+
+  // Shared by both credential rows: same empty-clears-it contract, same
+  // status line, so neither can drift into behaving differently from the
+  // other.
+  function bindCredential({ btnId, inputId, statusId, storageKey, verify }) {
+    const status = document.getElementById(statusId);
+    const setStatus = (msg, color) => { if (status) { status.textContent = msg; status.style.color = color; } };
+    document.getElementById(btnId)?.addEventListener('click', async () => {
+      const value = (document.getElementById(inputId)?.value || '').trim();
+      if (!value) {
+        await chrome.storage.sync.remove(storageKey);
+        setStatus('Cleared.', 'var(--fg3)');
+        return;
+      }
+      await chrome.storage.sync.set({ [storageKey]: value });
+      if (!verify) { setStatus('Saved.', 'var(--ok)'); return; }
+      setStatus('Saved — verifying…', 'var(--fg3)');
+      const res = await verify().catch(e => ({ ok: false, error: e.message }));
+      if (res?.ok) setStatus('Verified — ' + (res.handle || 'ok'), 'var(--ok)');
+      else setStatus('Saved, but not verified: ' + (res?.error || 'unknown error'), 'var(--err)');
+    });
+  }
+
+  // No verify for Anthropic: every endpoint that would prove the key works
+  // also bills for it, and a save that silently costs money is worse than a
+  // save that just says "Saved."
+  bindCredential({
+    btnId: 'btn-set-anthropic-save', inputId: 'set-anthropic-key',
+    statusId: 'set-anthropic-status', storageKey: 'anthropicApiKey',
+  });
+
+  // Figma does have a free identity endpoint, so the round trip is worth it —
+  // and because the call is made by the worker, a green line here also proves
+  // the worker's Figma path is wired end to end. It does NOT prove any given
+  // file is readable; that is what the A/B tab's Check button is for.
+  bindCredential({
+    btnId: 'btn-set-figma-save', inputId: 'set-figma-pat',
+    statusId: 'set-figma-status', storageKey: 'figmaPat',
+    verify: () => chrome.runtime.sendMessage({ action: 'figmaVerifyToken' }),
+  });
+
   document.getElementById('ta-primary-select').addEventListener('change', taShowPrimary);
   document.getElementById('ta-multi-list').addEventListener('change', e => {
     const chk = e.target.closest('.ta-extra-chk');
@@ -300,7 +358,7 @@ function showTab(name) {
   // fire-and-forget since showTab itself is synchronous. Same reasoning for
   // the Summary of Changes auto-fill: a ticket committed in Initialize after
   // the A/B tab was already visited should still populate it on return.
-  if (name === 'abtest') { checkForResumableVisualDiff(); autofillAbSummaryFromTicket(); }
+  if (name === 'abtest') { checkForResumableVisualDiff(); autofillAbSummaryFromTicket(); syncAbDesignReference(); }
 }
 
 // ── Test Agent ───────────────────────────────────────────────────────────────
@@ -2510,6 +2568,7 @@ function abDefaultState() {
     // checkboxes; recordHeatmap stays in the state (and the code behind it
     // still works) but has no UI and is never switched on.
     visualDiff: true, visualDiffCrops: true, agenticTesting: true, summaryOfChanges: '',
+    figmaUrl: '',
     targets: [
       { label: 'v0', url: '', override: '' },
       { label: 'v1', url: '', override: '' },
@@ -2547,8 +2606,21 @@ async function initAbCompare() {
   });
   document.getElementById('ab-summary-of-changes').addEventListener('input', e => {
     abState.summaryOfChanges = e.target.value;
+    // Which source wrote the spec is invisible once the text is in the box,
+    // and the whole report is graded against it — so record it.
+    abState.summarySource = e.target.value.trim() ? 'manual' : null;
     persistAbState();
   });
+  document.getElementById('ab-figma-url')?.addEventListener('input', e => {
+    abState.figmaUrl = e.target.value;
+    persistAbState();
+  });
+
+  // Board-access check. Whether view/comment access reaches the node tree is
+  // the question that decides what the design reference can be built from,
+  // and it is per-FILE — the token check in Settings only proves the token
+  // itself is live, so it cannot answer this.
+  document.getElementById('btn-ab-figma-check')?.addEventListener('click', abFigmaCheck);
 
   document.getElementById('btn-ab-add-target').addEventListener('click', () => {
     // Default labels continue the v0/v1/v2/… sequence used by the ticket
@@ -2591,6 +2663,7 @@ async function initAbCompare() {
   initVisualDiffResumeBanner();
   checkForResumableVisualDiff();
   autofillAbSummaryFromTicket();
+  syncAbDesignReference();
 
   renderAbTargets();
   renderAbSelectors();
@@ -2604,6 +2677,8 @@ function applyAbStateToInputs() {
   document.getElementById('ab-keep-tabs').checked = !!abState.keepTabs;
   document.getElementById('ab-visual-diff-crops').checked = abState.visualDiffCrops !== false;
   document.getElementById('ab-summary-of-changes').value = abState.summaryOfChanges || '';
+  const abFigmaEl = document.getElementById('ab-figma-url');
+  if (abFigmaEl) abFigmaEl.value = abState.figmaUrl || '';
 }
 
 function persistAbState() {
@@ -2804,6 +2879,94 @@ function buildSummaryFromTicketVariants(ctx) {
 // two call sites: showTab('abtest') and initAbCompare's panel-load), so a
 // ticket committed in Initialize after the A/B tab was already visited
 // still fills the box the next time the user switches back to this tab.
+// ── Design reference (A/B tab) ──────────────────────────────────────────────
+// The Figma board URL and the comp attachment both come off the ticket during
+// Initialize and both describe the ticket as a whole, not a single variant —
+// one comp covers every board on it.
+//
+// The URL is editable and persisted here rather than in the Initialize review
+// step, because this is where it gets used and where a wrong board is noticed.
+// Same only-when-empty contract as the Summary of Changes autofill: an
+// extracted value fills an empty box and never overwrites a manual edit.
+//
+// The comp is deliberately READ-ONLY here. Re-fetching a different attachment
+// needs the Jira session cookie, and by the time a comparison runs the context
+// is incognito with no session — so a picker in this tab could offer choices
+// it cannot actually retrieve. Ambiguity is surfaced instead, and resolved by
+// re-extracting in Initialize.
+async function syncAbDesignReference() {
+  const urlEl = document.getElementById('ab-figma-url');
+  const compEl = document.getElementById('ab-figma-comp');
+  if (!urlEl && !compEl) return;
+
+  const ctx = await getActiveContext().catch(() => null);
+
+  if (urlEl && !(abState.figmaUrl || '').trim() && ctx?.reviewed && ctx.figmaUrl) {
+    abState.figmaUrl = ctx.figmaUrl;
+    urlEl.value = ctx.figmaUrl;
+    persistAbState();
+  }
+
+  if (!compEl) return;
+  const line = (t, color) => `<div style="color:${color || 'var(--fg3)'}">${esc(t)}</div>`;
+
+  if (!ctx?.reviewed) { compEl.innerHTML = line('No active ticket context — extract one in Initialize to pick up the comp automatically.'); return; }
+
+  if (ctx.compAttachment) {
+    const c = ctx.compAttachment;
+    const img = await getCompImage(ctx);
+    compEl.innerHTML = line(`Comp: ${c.filename} — ${c.w}×${c.h}${c.srcW ? ` (from ${c.srcW}×${c.srcH})` : ''}`, 'var(--ok)')
+      + (img ? `<img src="${esc(img)}" alt="Comp preview" style="max-width:100%;max-height:120px;border:1px solid var(--stroke);border-radius:4px;margin-top:4px">` : line('Stored image could not be read back.', 'var(--warn)'));
+    return;
+  }
+
+  const n = (ctx.compCandidates || []).length;
+  compEl.innerHTML = n
+    ? line(`No attachment matched ${ctx.ticketKey}_comp. ${n} other image(s) are attached — rename the comp on the ticket and re-extract to pick it up.`, 'var(--warn)')
+    : line('No image attachments on this ticket — the Figma link is the only design reference.');
+}
+
+// Reads the board and reports what it found, inline. Runs against whatever is
+// currently in the box, not the saved context, so a pasted board can be
+// checked before it is committed to anything.
+async function abFigmaCheck() {
+  const out = document.getElementById('ab-figma-out');
+  const url = (document.getElementById('ab-figma-url')?.value || '').trim();
+  if (!out) return;
+  const line = (t, color) => `<div style="color:${color || 'var(--fg3)'}">${esc(t)}</div>`;
+
+  if (!url) { out.innerHTML = line('Paste a Figma board link first.', 'var(--warn)'); return; }
+  if (!figmaParseUrl(url)) { out.innerHTML = line('That is not a Figma design link — expected figma.com/design/… or /file/….', 'var(--err)'); return; }
+
+  out.innerHTML = line('Checking…');
+  const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth: 4 })
+    .catch(e => ({ ok: false, error: e.message }));
+  if (!res?.ok) { out.innerHTML = line(res?.error || 'No response from the background worker.', 'var(--err)'); return; }
+
+  const node = res.node || {};
+  const c = figmaClassifyChildren(node.children || []);
+  const rows = [line(`Read "${res.fileName || '(unnamed file)'}" — access role: ${res.role || 'unknown'}`, 'var(--ok)')];
+  rows.push(line(`Node "${node.name || node.id}" (${node.type}) — ${(node.children || []).length} children`));
+
+  if (!c.boards.length) {
+    // The actionable case. A comp whose boards don't follow the v{n}
+    // convention looks identical to a comp with no boards unless the rejects
+    // are shown, and that distinction is the whole fix.
+    rows.push(line('No boards matched the v{n} naming convention.', 'var(--warn)'));
+    (c.rejected || []).slice(0, 8).forEach(r => rows.push(line(`  · ${r.name} (${r.type}) — ${r.reason}`)));
+  } else {
+    c.boards.forEach(b => rows.push(line(
+      `  · ${b.name} → ${b.variantId}/${b.breakpoint || 'no breakpoint'}, measured ${b.measuredWidth}px`
+        + (b.widthDisagrees ? `  ⚠ name says ${b.nominalWidth}px` : ''),
+      b.widthDisagrees ? 'var(--warn)' : 'var(--fg2)')));
+  }
+
+  if (c.labels.length) c.labels.forEach(l => rows.push(line(`  · label "${l.text}" → ${l.variantId || 'unmapped'}`, 'var(--fg2)')));
+  else rows.push(line('No Variation label blocks found — board→variant mapping falls back to board names.', 'var(--warn)'));
+
+  out.innerHTML = rows.join('');
+}
+
 async function autofillAbSummaryFromTicket() {
   if (!abState || (abState.summaryOfChanges || '').trim()) return;
   const ctx = await getActiveContext().catch(() => null);
@@ -2811,6 +2974,7 @@ async function autofillAbSummaryFromTicket() {
   const summary = buildSummaryFromTicketVariants(ctx);
   if (!summary) return;
   abState.summaryOfChanges = summary;
+  abState.summarySource = 'ticket';
   persistAbState();
   const el = document.getElementById('ab-summary-of-changes');
   if (el) el.value = summary;
@@ -2991,12 +3155,14 @@ async function runAbComparison(opts = {}) {
       // the LIVE runVisualDiffPipeline result, crops included, and is only
       // ever read by rptAbVisualDiffSection on this standalone path.
       setAbStatus('Building report…');
+      const { figmaPat: _figmaPat } = await chrome.storage.sync.get('figmaPat');
       await openReportTab({
         ts: Date.now(), pageUrls: [],
         modes: [{
           mode: 2, name: 'A/B Variant Comparison', status: 'ran',
           data: { captures, metricsList, selectors, agenticNote: res.agenticNote || null, visualDiffFull: visualDiffResult },
         }],
+        designReference: buildDesignReferenceDebug(ctx, abState, _figmaPat),
         extraHtml: '',
       });
       setAbStatus('Done — report opened in a new tab.');
@@ -3132,8 +3298,88 @@ async function vdShowCandidateOverlay() {
   return res;
 }
 
+// ── Figma reference diagnostics ────────────────────────────────────────────
+// Same console-only contract as showCandidateOverlay above — no storage flag,
+// no checkbox, no settings surface. Both take the Figma URL as an argument
+// rather than reading it from the active context, so a board can be probed
+// before Phase 0 extraction exists to supply one, and so a board that ISN'T
+// on the current ticket can be checked when a convention is in doubt.
+//
+// figmaFile is the go/no-go on PAT file access. figmaVerifyToken (the Save
+// button in Test Agent → Figma Access) deliberately cannot answer this: it
+// calls /v1/me, which proves the token is live and says nothing about whether
+// any particular file is readable at view/comment access.
+async function vdFigmaFile(url, depth) {
+  const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth });
+  if (!res?.ok) { console.error('[vdDebug] Figma fetch failed —', res?.error || 'no response from worker'); return res; }
+  const n = res.node || {};
+  const b = n.absoluteBoundingBox;
+  const kids = n.children || [];
+  console.log(`[vdDebug] file "${res.fileName || '(unnamed)'}" — modified ${res.lastModified || '?'} — role ${res.role || 'unknown'} — editor ${res.editorType || 'unknown'}`);
+  console.log(`[vdDebug] node ${n.id} "${n.name}" (${n.type})${b ? ` ${Math.round(b.width)}\u00d7${Math.round(b.height)}` : ''} — ${kids.length} direct children at depth=${res.depth}`);
+  console.table(kids.map(c => ({
+    id: c.id, name: c.name, type: c.type,
+    w: c.absoluteBoundingBox ? Math.round(c.absoluteBoundingBox.width) : null,
+    h: c.absoluteBoundingBox ? Math.round(c.absoluteBoundingBox.height) : null,
+    visible: c.visible !== false,
+    kids: (c.children || []).length,
+  })));
+  return res;
+}
+
+// Board classification over those children. Prints the rejects too, with the
+// reason on each: a comp whose boards don't match the v{n} convention looks
+// identical to a comp with no boards unless the filter says what it dropped.
+async function vdFigmaBoards(url) {
+  const res = await chrome.runtime.sendMessage({ action: 'figmaFetchNodes', url, depth: 4 });
+  if (!res?.ok) { console.error('[vdDebug] Figma fetch failed —', res?.error || 'no response from worker'); return res; }
+
+  const node = res.node || {};
+  const c = figmaClassifyChildren(node.children || []);
+  console.log(`[vdDebug] "${node.name}" — ${c.boards.length} board(s), ${c.labels.length} Variation label(s), ${c.rejected.length} other child node(s)`);
+
+  console.table(c.boards.map(b => ({
+    nodeId: b.nodeId, name: b.name, variant: b.variantId, breakpoint: b.breakpoint || '(none)',
+    measuredW: b.measuredWidth, nominalW: b.nominalWidth,
+    // Flagged rather than reconciled. A board named 1440px that measures 1280
+    // means every scale factor derived from the name is off by 12%, and the
+    // measured number is the only one anything is allowed to use.
+    widthDisagrees: b.widthDisagrees,
+  })));
+
+  if (c.labels.length) {
+    console.table(c.labels.map(l => ({ nodeId: l.nodeId, text: l.text, variant: l.variantId, changeName: l.changeName })));
+  } else {
+    console.warn('[vdDebug] No Variation label blocks found — board→variant mapping and the link-sourced summary both read from these.');
+  }
+
+  const unmapped = c.labels.filter(l => !l.variantId);
+  if (unmapped.length) console.warn(`[vdDebug] ${unmapped.length} label(s) don't match the "V0 CONTROL" format — mapping falls back to board names for those.`);
+
+  if (c.rejected.length) console.table(c.rejected.map(r => ({ name: r.name, type: r.type, reason: r.reason })));
+
+  // What board selection would actually pick, per variant id seen on any
+  // board or label — the question the caller is really asking.
+  const ids = [...new Set([...c.boards.map(b => b.variantId), ...c.labels.map(l => l.variantId)].filter(Boolean))].sort();
+  const picks = ids.map(id => {
+    const sel = figmaSelectDesktopBoard(c.boards, id);
+    const label = c.labels.find(l => l.variantId === id);
+    return {
+      variant: id,
+      board: sel.board ? sel.board.name : '(none — desktop board missing)',
+      via: sel.via || '-',
+      changeName: label ? (label.changeName || '(label has no name)') : '(no label)',
+    };
+  });
+  if (picks.length) console.table(picks);
+
+  return { node, boards: c.boards, labels: c.labels, rejected: c.rejected, picks };
+}
+
 window.__vdDebug = {
   showCandidateOverlay: vdShowCandidateOverlay,
+  figmaFile: vdFigmaFile,
+  figmaBoards: vdFigmaBoards,
 };
 
 // ── Pipeline orchestrator ────────────────────────────────────────────────────
@@ -3664,10 +3910,17 @@ let _idb = null;
 function idb() {
   if (_idb) return Promise.resolve(_idb);
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
+    // v2 added the `figma` store for downscaled comp images. Both creates are
+    // guarded by contains(), so an install at v1 gains only `figma` and an
+    // install from scratch gets both — onupgradeneeded runs for every version
+    // it steps through, and `sessions` must survive untouched either way.
+    const req = indexedDB.open(IDB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
+      // Out-of-line keys: the caller supplies the ticket key, so a re-extract
+      // of the same ticket replaces its comp rather than accumulating copies.
+      if (!db.objectStoreNames.contains('figma')) db.createObjectStore('figma');
     };
     req.onsuccess = () => { _idb = req.result; resolve(_idb); };
     req.onerror = () => reject(req.error);
@@ -4890,9 +5143,100 @@ function buildReportBody(sections) {
 // degraded, incomplete, or working from a guess, collected in one list
 // instead of scattered across per-section prose. A clean run yields an empty
 // array, which is itself the useful signal.
+// ── Design reference diagnostics ───────────────────────────────────────────
+// Everything about WHY the spec text and the Control resolution came out the
+// way they did. Both are ticket-derived, both fail silently, and both failures
+// look identical from the outside — "no Summary of Changes" reads the same
+// whether no ticket was active, the ticket had no variant descriptions, or the
+// user simply didn't type one. Two debugging rounds were spent on exactly that
+// ambiguity before this existed.
+function buildDesignReferenceDebug(ctx, state, hasFigmaPat) {
+  const variants = ctx?.variants || [];
+  const previewLinks = ctx?.previewLinks || [];
+  const summary = (state?.summaryOfChanges || '').trim();
+  return {
+    ticketContext: !ctx ? null : {
+      ticketKey: ctx.ticketKey || null,
+      reviewed: !!ctx.reviewed,
+      variantCount: variants.length,
+      // The two fields the autofill and the baseline resolver actually read.
+      // A context can be present and reviewed and still be useless to both.
+      variantsWithDescription: variants.filter(v => (v.rawDescription || '').trim()).length,
+      controlVariantId: (variants.find(v => v.isControl) || {}).id || null,
+      variantIds: variants.map(v => v.id),
+      previewLinkCount: previewLinks.length,
+      previewLinkIds: previewLinks.map(l => l.id),
+    },
+    summaryOfChanges: {
+      present: !!summary,
+      length: summary.length,
+      source: summary ? (state?.summarySource || 'unknown') : null,
+    },
+    figma: {
+      urlUsed: (state?.figmaUrl || '').trim() || null,
+      urlFromTicket: ctx?.figmaUrl || null,
+      nodeId: ctx?.figmaNodeId || null,
+      tokenConfigured: !!hasFigmaPat,
+      comp: ctx?.compAttachment
+        ? { filename: ctx.compAttachment.filename, w: ctx.compAttachment.w, h: ctx.compAttachment.h }
+        : null,
+      compCandidateCount: (ctx?.compCandidates || []).length,
+    },
+  };
+}
+
 function vdCollectProblems(sections) {
   const problems = [];
   const add = (severity, where, detail) => problems.push({ severity, where, detail });
+
+  // Spec text and Control resolution first — both are ticket-derived, both
+  // degrade the entire report rather than one finding, and both are invisible
+  // in the findings themselves.
+  const dr = sections.designReference;
+  if (dr) {
+    const tc = dr.ticketContext;
+    if (!dr.summaryOfChanges.present) {
+      add('error', 'summary-of-changes',
+        'Empty, so every finding is "unclear" — nothing was judged expected vs unexpected. '
+        + (!tc ? 'No ticket context was active, and nothing was typed manually.'
+              : tc.variantCount === 0
+                // Zero variants and zero-with-descriptions are different
+                // failures with different fixes, and the count of preview
+                // links separates them: links come from the AI extraction,
+                // variants from the deterministic Test Specifications parse,
+                // so links-without-variants localises the fault precisely.
+                ? `Ticket ${tc.ticketKey} is active but NO variants were parsed from it`
+                  + (tc.previewLinkCount ? ` (though ${tc.previewLinkCount} preview link(s) were found)` : '')
+                  + ". Its Test Specifications section is missing or in a shape the parser doesn't recognise — check the ticket, or type a summary by hand."
+                : tc.variantsWithDescription === 0
+                  ? `Ticket ${tc.ticketKey} parsed ${tc.variantCount} variant(s) but none carry a description, so the auto-fill had nothing to write. Check the ticket's Test Specifications section, or type a summary by hand.`
+                  : 'The ticket has variant descriptions, so the auto-fill should have run — it only fills an EMPTY box, so a stale empty value may have been persisted.'));
+    } else {
+      add('info', 'summary-of-changes', `Spec text came from: ${dr.summaryOfChanges.source} (${dr.summaryOfChanges.length} chars). Every expected/unexpected verdict below is relative to it.`);
+    }
+
+    if (tc && tc.variantCount && !tc.controlVariantId) {
+      add('warn', 'ticket-context',
+        `Ticket ${tc.ticketKey} has no variant flagged as Control (ids: ${tc.variantIds.join(', ') || 'none'}), so Control could not be resolved from it and the first target was used instead.`);
+    }
+    if (tc && tc.variantCount && !tc.previewLinkCount) {
+      add('warn', 'ticket-context', `Ticket ${tc.ticketKey} parsed ${tc.variantCount} variant(s) but no preview links, so tested URLs cannot be mapped back to ticket variants.`);
+    }
+    if (tc && !tc.variantCount && tc.previewLinkCount) {
+      add('warn', 'ticket-context', `Ticket ${tc.ticketKey} parsed ${tc.previewLinkCount} preview link(s) but no variants. Those come from different parsers — the links are AI-extracted, the variants are read deterministically from Test Specifications — so this points at that section specifically, not at the ticket as a whole.`);
+    }
+
+    // Figma reference state — absent is normal and silent; present-but-unusable is not.
+    if (dr.figma.urlFromTicket && !dr.figma.tokenConfigured) {
+      add('warn', 'design-reference', 'The ticket has a Figma link but no Figma token is configured — add one in Settings to read the board.');
+    }
+    if (dr.figma.urlFromTicket && !dr.figma.nodeId) {
+      add('warn', 'design-reference', 'The ticket\'s Figma link points at the whole file rather than a specific board (no node-id).');
+    }
+    if (!dr.figma.comp && dr.figma.compCandidateCount) {
+      add('info', 'design-reference', `No attachment matched the {TICKET}_comp convention; ${dr.figma.compCandidateCount} other image(s) are attached.`);
+    }
+  }
 
   for (const entry of sections.modes || []) {
     if (entry.status === 'skipped') add('info', entry.name || `mode ${entry.mode}`, `Skipped — ${entry.reason || 'no reason recorded'}`);
@@ -5039,6 +5383,7 @@ function buildDebugLog(sections) {
     extensionVersion: chrome.runtime.getManifest().version,
     userAgent: navigator.userAgent,
     problems: vdCollectProblems(sections),
+    designReference: sections.designReference || null,
     run: {
       pageUrls: sections.pageUrls || [],
       modes: (sections.modes || []).map(m => ({ mode: m.mode, name: m.name, status: m.status, reason: m.reason || null })),
@@ -5272,6 +5617,93 @@ async function initPageExtractorFn(overrideKey) {
   }
 }
 
+// Runs INSIDE the open Jira tab, same as initPageExtractorFn above — and for
+// the same reason: the attachment endpoint needs the tab's session cookie.
+//
+// The downscale happens HERE rather than in the worker on purpose. A four-up
+// comp at full resolution is several MB, and doing it page-side means that
+// payload crosses a process boundary once, already small, instead of twice at
+// full size. The run-time context is incognito with no Jira session, so this
+// is also the only moment the bytes are reachable at all.
+//
+// JPEG rather than PNG: at 2000px the text stays legible for a vision read,
+// and a PNG of a four-up contact sheet is large enough to be worth avoiding.
+async function initFetchAttachmentFn(contentUrl, maxEdge) {
+  try {
+    const res = await fetch(contentUrl, { credentials: 'same-origin' });
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' fetching the attachment' };
+    const blob = await res.blob();
+    if (!/^image\//i.test(blob.type || '')) return { ok: false, error: 'Attachment is not an image (' + (blob.type || 'unknown type') + ')' };
+
+    const bmp = await createImageBitmap(blob);
+    const scale = Math.min(1, maxEdge / Math.max(bmp.width, bmp.height));
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    // Comps are exported on white; without this a transparent PNG flattens to
+    // black and every text read off it fails.
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bmp, 0, 0, w, h);
+    bmp.close?.();
+    return { ok: true, dataUrl: canvas.toDataURL('image/jpeg', 0.85), w, h, srcW: bmp.width, srcH: bmp.height };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+// Longest edge for the stored comp. 2000 keeps body copy legible on a
+// four-up sheet while staying well inside what a vision call will accept.
+const COMP_MAX_EDGE = 2000;
+
+// Pulls the matched comp into IndexedDB and rewrites _initDraft.compAttachment
+// to point at it. Best-effort by design: a missing comp degrades the design
+// reference, it does not invalidate the ticket context, so every failure path
+// records a warning and returns rather than throwing.
+async function fetchCompAttachment(tabId) {
+  if (!_initDraft) return;
+  const pending = _initDraft.compPending;
+  _initDraft.compPending = null;
+  if (!pending?.content) return;
+
+  let injected;
+  try {
+    [injected] = await chrome.scripting.executeScript({
+      target: { tabId }, func: initFetchAttachmentFn, args: [pending.content, COMP_MAX_EDGE],
+    });
+  } catch (e) {
+    _initWarnings.push(`Comp: could not run the attachment fetch on the ticket tab — ${e?.message || e}`);
+    return;
+  }
+
+  const r = injected?.result;
+  if (!r?.ok) {
+    _initWarnings.push(`Comp: "${pending.filename}" could not be downloaded — ${r?.error || 'no result'}. The design reference will fall back to the Figma link.`);
+    return;
+  }
+
+  const idbKey = 'comp:' + _initDraft.ticketKey;
+  try {
+    await idbPut('figma', { dataUrl: r.dataUrl, filename: pending.filename, storedAt: Date.now() }, idbKey);
+  } catch (e) {
+    _initWarnings.push(`Comp: "${pending.filename}" downloaded but could not be stored — ${e?.message || e}`);
+    return;
+  }
+
+  _initDraft.compAttachment = {
+    filename: pending.filename, mimeType: 'image/jpeg', idbKey,
+    w: r.w, h: r.h, srcW: r.srcW, srcH: r.srcH,
+  };
+}
+
+async function getCompImage(ctx) {
+  const key = ctx?.compAttachment?.idbKey;
+  if (!key) return null;
+  try { return (await idbGet('figma', key))?.dataUrl || null; } catch (_) { return null; }
+}
+
 // ── Extraction pipeline (deterministic fetch/parse, then AI field merge) ────
 async function extractFromActiveTab() {
   const statusEl = document.getElementById('init-fetch-status');
@@ -5302,7 +5734,11 @@ async function extractFromActiveTab() {
       if (r.error === 'SESSION_EXPIRED') throw new Error('Your Jira session looks expired — open/refresh the ticket tab, log in, and try again.');
       throw new Error(r.detail || `Fetch failed (${r.status || 'error'})`);
     }
-    extractTestContext(r.issue, r.origin, r.ticketKey);
+    extractTestContext(r.issue, r.origin, r.ticketKey, r.links);
+    if (_initDraft?.compPending) {
+      setStatus(`Extracting… downloading ${_initDraft.compPending.filename}…`);
+      await fetchCompAttachment(tab.id);
+    }
     setStatus('Extracting… asking AI to fill in Platform, Preview Links, ITW Link, and Goals…');
     const aiRes = await runAiFieldExtraction(r, _initDraft).catch(e => ({ ok: false, error: e?.message || String(e) }));
     mergeAiFieldsIntoDraft(aiRes);
@@ -5350,7 +5786,7 @@ function extractConvertMetricId(text) {
   return { id: candidates.size === 1 ? [...candidates][0] : null, candidates: [...candidates] };
 }
 
-function extractTestContext(issue, origin, ticketKeyFromPage) {
+function extractTestContext(issue, origin, ticketKeyFromPage, links) {
   const f = issue.fields || {};
   const names = issue.names || {};
   const warnings = [];
@@ -5414,10 +5850,52 @@ function extractTestContext(issue, origin, ticketKeyFromPage) {
   // by mergeAiFieldsIntoDraft — the cross-check between the final
   // previewLinks and these (always deterministic) variants also runs there,
   // once, on final state.
+  // ── Figma design reference ────────────────────────────────────────────────
+  // Deterministic on purpose — NOT part of INIT_FIELD_EXTRACTION_SCHEMA. A
+  // host match needs no judgment, and routing it through the AI call would
+  // make the design reference disappear whenever no Anthropic key is set,
+  // which is exactly when a user is least likely to notice.
+  //
+  // The link inventory is the primary source and costs nothing new: Jira
+  // renders pasted Figma smart-links as real <a href>, so initPageExtractorFn
+  // already captured them. The ADF description is the fallback for a link
+  // that never rendered as an anchor.
+  const figmaUrlPool = (links || []).map(l => l && l.url).filter(Boolean);
+  adfCollectUrls(f.description, figmaUrlPool);
+  const { pick: figmaPick, candidates: figmaCandidates } = figmaPickDesignUrl(figmaUrlPool);
+  const figmaUrl = figmaPick ? figmaPick.url : null;
+  const figmaNodeId = figmaPick ? figmaPick.nodeId : null;
+
+  if (figmaCandidates.length > 1) {
+    warnings.push(`Figma: ${figmaCandidates.length} different design links found on this ticket — using ${figmaUrl}. Change it in the A/B tab if that's the wrong board.`);
+  }
+  if (figmaPick && !figmaNodeId) {
+    // A bare file link resolves to the whole file. For a shared master file
+    // that is every ticket's boards at once, which is never what was meant.
+    warnings.push('Figma: the link points at the whole file rather than a specific board (no node-id). Open the comp frame in Figma, copy the link from there, and paste it in the A/B tab.');
+  }
+
+  // Attachment metadata is already in hand — the extractor fetches the issue
+  // with no `fields=` filter, so this costs no request. Only the binary needs
+  // fetching, and that happens later, in the Jira tab, where the session
+  // cookie lives.
+  const comp = figmaMatchCompAttachment(f.attachment, ticketKey);
+  if (!comp.match && comp.matches.length > 1) {
+    warnings.push(`Comp: ${comp.matches.length} attachments match ${ticketKey}_comp — none was selected. Pick one in the A/B tab.`);
+  } else if (!comp.match && comp.candidates.length) {
+    warnings.push(`Comp: no attachment named ${ticketKey}_comp — ${comp.candidates.length} other image(s) are attached. Pick one in the A/B tab if the comp is among them.`);
+  }
+
   _initDraft = {
     ticketKey, ticketUrl, summary, platform: null, experimentId,
     variants, previewLinks: [], itwLink: null, goals: [], qaTestPlanUrl,
     softcodedTests, concurrentTests,
+    figmaUrl, figmaNodeId,
+    // Set by fetchCompAttachment() after this returns — it needs the Jira tab
+    // and an await, and this function is deliberately synchronous.
+    compAttachment: null,
+    compCandidates: comp.candidates,
+    compPending: comp.match || null,
     extractedAt: new Date().toISOString(),
     reviewed: false,
   };
@@ -5474,6 +5952,32 @@ function adfSectionNodes(doc, headingText, { prefix = false } = {}) {
 // Flatten one block node into logical lines. Each line keeps the URLs of any
 // links inside it (link marks, inline/block cards) — preview links are often
 // authored as clickable links whose href is the real URL, not the shown text.
+// Every URL anywhere in an ADF document, appended to `out`. Both places a URL
+// can hide: a `link` mark on a text node, and the card nodes Jira turns pasted
+// links into. Used as the FALLBACK source for the Figma reference — the
+// rendered-page link inventory is preferred because it also catches links that
+// only exist in Jira app panels, but the inventory's clone drops
+// comments/activity, so a link that lives only in the description still needs
+// this path.
+function adfCollectUrls(node, out) {
+  const acc = out || [];
+  (function walk(n) {
+    if (!n) return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    if (n.type === 'text') {
+      const href = (n.marks || []).find(m => m.type === 'link')?.attrs?.href;
+      if (href) acc.push(href);
+      return;
+    }
+    if (n.type === 'inlineCard' || n.type === 'blockCard' || n.type === 'embedCard') {
+      if (n.attrs?.url) acc.push(n.attrs.url);
+      return;
+    }
+    walk(n.content);
+  })(node);
+  return acc;
+}
+
 function adfBlockLines(node) {
   const lines = [];
   let cur = { text: '', urls: [] };

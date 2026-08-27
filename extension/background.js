@@ -18,7 +18,7 @@
 // captureFullPageAndViewport/vdShowCandidateOverlay below (a separate
 // executeScript call, not this importScripts) — see domCandidateWalkFn's
 // own header comment for why.
-importScripts('metric-match.js', 'pixelmatch.js', 'vd-config.js', 'vd-diff.js');
+importScripts('metric-match.js', 'pixelmatch.js', 'vd-config.js', 'vd-diff.js', 'figma.js');
 
 // ── Open side panel when toolbar icon is clicked ──────────────────────────
 chrome.sidePanel
@@ -4382,6 +4382,109 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await ns(_pickWin).set({ pickerResult: { selector: msg.selector, ts: Date.now() } });
     })();
     sendResponse({ ok: true });
+
+  } else if (msg.action === 'figmaVerifyToken') {
+    // Figma PAT round-trip check. Lives in the worker for the same reason
+    // every future Figma call will: api.figma.com is not same-origin with
+    // the panel, and the token must never be handed to a content script on
+    // whatever page the user happens to be sitting on.
+    //
+    // GET /v1/me is the cheapest endpoint that proves the token is live. It
+    // deliberately does NOT prove file-level read access — that depends on
+    // the sharing level of each individual file, and answering it needs a
+    // real /v1/files/{key}/nodes pull against a real board. Do not let a
+    // green check here be read as "the node tree is reachable."
+    (async () => {
+      const { figmaPat } = await chrome.storage.sync.get('figmaPat');
+      if (!figmaPat) { sendResponse({ ok: false, error: 'No Figma token saved' }); return; }
+      try {
+        const res = await fetch('https://api.figma.com/v1/me', {
+          headers: { 'X-Figma-Token': figmaPat },
+        });
+        if (res.status === 401 || res.status === 403) {
+          sendResponse({ ok: false, error: 'Token rejected (' + res.status + ') — expired, revoked, or missing the file_read scope' });
+          return;
+        }
+        if (!res.ok) { sendResponse({ ok: false, error: 'Figma returned ' + res.status + ' ' + res.statusText }); return; }
+        const me = await res.json().catch(() => null);
+        if (!me) { sendResponse({ ok: false, error: 'Unreadable response from Figma' }); return; }
+        sendResponse({ ok: true, handle: me.handle || me.email || '(unnamed account)' });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+
+  } else if (msg.action === 'figmaFetchNodes') {
+    // Reads a node subtree for the Figma REFERENCE path — the design context
+    // that seeds Summary of Changes, which is what the report prompt judges
+    // findings against. Produces no findings of its own and never touches the
+    // diff engine.
+    //
+    // Worker-side for the same two reasons as figmaVerifyToken: api.figma.com
+    // is not same-origin with the panel, and the token must never be handed
+    // to a content script running on whatever page the user is sitting on.
+    //
+    // `depth` is a real cost control, not a tidiness knob. The round-1
+    // container is 4177x2537 and holds three full boards; pulling it
+    // undepthed returns every leaf of every board when all the caller wanted
+    // was a list of board names. Default 4 reaches container -> child ->
+    // group -> TEXT, which is exactly deep enough to read the Variation
+    // labels and no deeper.
+    (async () => {
+      const { figmaPat } = await chrome.storage.sync.get('figmaPat');
+      if (!figmaPat) { sendResponse({ ok: false, error: 'No Figma token saved — add one in Test Agent → Figma Access.' }); return; }
+
+      const parsed = figmaParseUrl(msg.url || '');
+      if (!parsed) { sendResponse({ ok: false, error: 'Not a Figma design URL: ' + (msg.url || '(empty)') }); return; }
+
+      const depth = Number.isFinite(msg.depth) ? Math.max(1, Math.min(24, msg.depth)) : 4;
+      const nodeId = msg.nodeId || parsed.nodeId;
+      const base = 'https://api.figma.com/v1/files/' + encodeURIComponent(parsed.fileKey);
+      const url = nodeId
+        ? base + '/nodes?ids=' + encodeURIComponent(nodeId) + '&depth=' + depth
+        : base + '?depth=' + depth;
+
+      try {
+        const res = await fetch(url, { headers: { 'X-Figma-Token': figmaPat } });
+        if (res.status === 401 || res.status === 403) {
+          // The distinction that answers round-1 open question #3. A token
+          // that passes /v1/me but 403s here means the PAT is fine and the
+          // FILE is not readable at this access level — a different fix
+          // (get access to the file) than "the token is wrong".
+          sendResponse({ ok: false, status: res.status, error: 'Figma refused this file (' + res.status + '). The token itself may be fine — check that this account can open the file, and that the token has the file_read scope.' });
+          return;
+        }
+        if (res.status === 404) { sendResponse({ ok: false, status: 404, error: 'Figma returned 404 — file key or node id not found (' + parsed.fileKey + (nodeId ? ' / ' + nodeId : '') + ')' }); return; }
+        if (!res.ok) { sendResponse({ ok: false, status: res.status, error: 'Figma returned ' + res.status + ' ' + res.statusText }); return; }
+
+        const body = await res.json().catch(() => null);
+        if (!body) { sendResponse({ ok: false, error: 'Unreadable response from Figma' }); return; }
+
+        // Both endpoints normalized to one shape so callers never branch on
+        // which one ran.
+        const node = nodeId
+          ? (body.nodes && body.nodes[nodeId] && body.nodes[nodeId].document) || null
+          : body.document || null;
+        if (!node) {
+          sendResponse({ ok: false, error: nodeId
+            ? 'Figma returned no node for id ' + nodeId + ' — the link may point at a node that was deleted or moved.'
+            : 'Figma returned no document for this file.' });
+          return;
+        }
+
+        sendResponse({
+          ok: true,
+          fileKey: parsed.fileKey, nodeId: nodeId || null, depth,
+          fileName: body.name || null, lastModified: body.lastModified || null,
+          role: body.role || null, editorType: body.editorType || null,
+          node,
+        });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
 
   } else if (msg.action === 'vdShowCandidateOverlay') {
     // Diagnostic only (window.__vdDebug in popup.js) — draws every

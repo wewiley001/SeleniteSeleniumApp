@@ -457,6 +457,96 @@ function capture(label, o) {
              : o.fullPage };
 }
 
+(function designReferenceDiagnostics() {
+  // Two real debugging rounds were spent on the WOW-1160 runs because the
+  // debug log said "no Summary of Changes" without saying WHY, and the three
+  // causes need three different fixes. Each is asserted to name its own cause.
+  function withDr(dr) {
+    var base = abSections([capture('v0', {}), capture('v1', {})],
+      [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.84, structuralStats: {} }]);
+    base.designReference = dr;
+    return vdCollectProblems(base);
+  }
+  var empty = { present: false, length: 0, source: null };
+  var noFigma = { urlUsed: null, urlFromTicket: null, nodeId: null, tokenConfigured: false, comp: null, compCandidateCount: 0 };
+
+  // Cause 1 — no ticket at all.
+  ok('no context names the missing context', withDr({
+    ticketContext: null, summaryOfChanges: empty, figma: noFigma,
+  }).some(function (x) { return x.severity === 'error' && /No ticket context was active/.test(x.detail); }));
+
+  // Cause 2 — the one the real runs hit: context present and reviewed, but
+  // its variants carry no descriptions, so the auto-fill had nothing to write.
+  // Indistinguishable from cause 1 without this.
+  var p2 = withDr({
+    ticketContext: { ticketKey: 'WOW-1160', reviewed: true, variantCount: 2, variantsWithDescription: 0,
+      controlVariantId: null, variantIds: ['v0', 'v1'], previewLinkCount: 0, previewLinkIds: [] },
+    summaryOfChanges: empty, figma: noFigma,
+  });
+  ok('empty descriptions are named as the cause', p2.some(function (x) {
+    return x.severity === 'error' && /parsed 2 variant\(s\) but none carry a description/.test(x.detail);
+  }), p2);
+  ok('missing Control variant is its own warning', p2.some(function (x) {
+    return x.severity === 'warn' && /no variant flagged as Control/.test(x.detail);
+  }), p2);
+
+  // The case WOW-1160 actually hit: zero variants, but preview links present.
+  // Zero-variants and zero-descriptions are different failures with different
+  // fixes, and saying "none of its 0 variants carry a description" describes
+  // neither.
+  var pz = withDr({
+    ticketContext: { ticketKey: 'WOW-1160', reviewed: true, variantCount: 0, variantsWithDescription: 0,
+      controlVariantId: null, variantIds: [], previewLinkCount: 2, previewLinkIds: ['v0', 'v1'] },
+    summaryOfChanges: empty, figma: noFigma,
+  });
+  ok('zero variants is named as zero, not as "no descriptions"', pz.some(function (x) {
+    return x.severity === 'error' && /NO variants were parsed/.test(x.detail) && /2 preview link\(s\) were found/.test(x.detail);
+  }), pz);
+  ok('links-without-variants localises the fault to Test Specifications', pz.some(function (x) {
+    return x.where === 'ticket-context' && /points at that section specifically/.test(x.detail);
+  }), pz);
+  // One cause, one line: the Control warning would just restate it.
+  ok('no redundant Control warning when nothing parsed', !pz.some(function (x) {
+    return /no variant flagged as Control/.test(x.detail);
+  }), pz);
+  ok('missing preview links is its own warning', p2.some(function (x) {
+    return x.severity === 'warn' && /no preview links/.test(x.detail);
+  }), p2);
+
+  // A filled box records its SOURCE — the whole report is graded against it,
+  // and once the text is in the box there is no other way to tell whether a
+  // human wrote it or a model did.
+  var p3 = withDr({
+    ticketContext: { ticketKey: 'WOW-1160', reviewed: true, variantCount: 2, variantsWithDescription: 2,
+      controlVariantId: 'v0', variantIds: ['v0', 'v1'], previewLinkCount: 2, previewLinkIds: ['v0', 'v1'] },
+    summaryOfChanges: { present: true, length: 140, source: 'ticket' }, figma: noFigma,
+  });
+  ok('spec source is recorded', p3.some(function (x) { return /came from: ticket/.test(x.detail); }), p3);
+  ok('a healthy context raises no context warnings',
+    !p3.some(function (x) { return x.where === 'ticket-context'; }), p3);
+
+  // Figma present-but-unusable is worth saying; Figma absent is silent.
+  ok('figma link without a token warns', withDr({
+    ticketContext: null, summaryOfChanges: empty,
+    figma: { urlUsed: null, urlFromTicket: 'https://figma.com/design/A/B?node-id=1-2', nodeId: '1:2',
+      tokenConfigured: false, comp: null, compCandidateCount: 0 },
+  }).some(function (x) { return x.severity === 'warn' && /no Figma token is configured/.test(x.detail); }));
+
+  ok('bare file link warns', withDr({
+    ticketContext: null, summaryOfChanges: empty,
+    figma: { urlUsed: null, urlFromTicket: 'https://figma.com/design/A/B', nodeId: null,
+      tokenConfigured: true, comp: null, compCandidateCount: 0 },
+  }).some(function (x) { return /whole file rather than a specific board/.test(x.detail); }));
+
+  ok('no figma at all stays silent', !withDr({
+    ticketContext: null, summaryOfChanges: empty, figma: noFigma,
+  }).some(function (x) { return x.where === 'design-reference'; }));
+
+  // Absent block must not throw — Test-Agent-queued runs don't build one.
+  ok('missing designReference is tolerated', Array.isArray(vdCollectProblems(
+    abSections([capture('v0', {})], [{ label: 'v1', diffMode: 'normal', structuralStats: {} }]))));
+})();
+
 (function geometryMismatch() {
   // The silent run-invalidating failure: Control and variants at different widths.
   var p = vdCollectProblems(abSections([
