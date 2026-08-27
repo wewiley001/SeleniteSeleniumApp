@@ -2179,6 +2179,38 @@ function makeReadContext(bitmap) {
   return ctx;
 }
 
+// Every rect in this pipeline is CSS px, straight from getBoundingClientRect.
+// The screenshots are NOT: Page.captureScreenshot returns a bitmap at the
+// host's device pixel ratio, so on a Retina Mac a page clipped to
+// {width: pageW} comes back 2*pageW wide. Reading a CSS rect into that bitmap
+// lands at half the position and half the size — crops show the wrong region
+// (usually whitespace, which is exactly why they have always read as "blank")
+// and the per-block pixel check compares the wrong content on both sides,
+// self-consistently enough to look like it works.
+//
+// DERIVED, never assumed. The capture clip is known to span [0, pageW], so the
+// bitmap's own width divided by pageW IS the factor, whatever the host is. A
+// 1x host yields 1 and every call below becomes a no-op, so this correction
+// cannot make a working setup worse.
+//
+// Out-of-band values mean the capture and the DOM walk disagree about the page
+// rather than that the display is unusual, and scaling by a number derived
+// from that disagreement would be worse than not scaling at all.
+function vdImageScale(img, pageW) {
+  if (!img || !pageW || pageW <= 0) return 1;
+  const s = img.width / pageW;
+  return (s >= 0.5 && s <= 4) ? s : 1;
+}
+
+function vdScaleRect(rect, scale) {
+  if (!rect) return null;
+  if (scale === 1) return rect;
+  return {
+    x: Math.round(rect.x * scale), y: Math.round(rect.y * scale),
+    w: Math.round(rect.w * scale), h: Math.round(rect.h * scale),
+  };
+}
+
 function clampBox(box, imgW, imgH) {
   const x = Math.max(0, Math.min(box.x, imgW));
   const y = Math.max(0, Math.min(box.y, imgH));
@@ -2266,7 +2298,7 @@ const VIS_BLOCK_PIXEL_MIN_AREA = 400;   // px² — skip slivers, not worth the 
 // its result back across sendMessage to popup.js, and that constraint is gone
 // now that matching and this check run in the same function in the same
 // context.
-function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings) {
+function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings, scale) {
   const eligible = (findings || []).filter(f => {
     if (f.changeClass !== 'unchanged') return false;
     // No pixels exist for either side outside the captured frame — the DOM walk
@@ -2304,7 +2336,8 @@ function vdPixelCheckMatchedPairs(controlCtx, variantCtx, findings) {
   eligible.sort((x, y) => (y.a.rect.w * y.a.rect.h) - (x.a.rect.w * x.a.rect.h));
 
   for (const f of eligible.slice(0, VD_PIXEL_CHECK_MAX)) {
-    const a = f.a.rect, b = f.b.rect;
+    // Image space, not CSS space — see vdImageScale.
+    const a = vdScaleRect(f.a.rect, scale || 1), b = vdScaleRect(f.b.rect, scale || 1);
     const w = Math.min(a.w, b.w), h = Math.min(a.h, b.h);
     if (w <= 0 || h <= 0) continue;
     let da, db;
@@ -2402,7 +2435,7 @@ function vdFindingToWire(f, findingId) {
   };
 }
 
-async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects }) {
+async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW }) {
   const match = vdMatchCandidates(controlList, variantList);
   const { findings: paired, segments, aggregate, shiftClusters } = vdSuppressFindings(match.pairs);
 
@@ -2412,9 +2445,17 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
   // the deterministic diff stands on its own without either backstop, and a
   // decode failure must never fail the variant.
   let pixelDiff = null;
+  let imageScale = null;
   try {
     const [bi, ci] = await Promise.all([decodeDataUrl(baseDataUrl), decodeDataUrl(curDataUrl)]);
-    vdPixelCheckMatchedPairs(makeReadContext(bi), makeReadContext(ci), paired);
+    // Measured, and recorded in the debug log so the value is visible rather
+    // than assumed. 1 on a standard display, 2 on Retina.
+    imageScale = {
+      control: vdImageScale(bi, basePageW), variant: vdImageScale(ci, variantPageW),
+      controlImage: { w: bi.width, h: bi.height }, variantImage: { w: ci.width, h: ci.height },
+      pageW: { control: basePageW ?? null, variant: variantPageW ?? null },
+    };
+    vdPixelCheckMatchedPairs(makeReadContext(bi), makeReadContext(ci), paired, imageScale.control);
     pixelDiff = await computeCoarsePixelDiffRatio(bi, ci).catch(() => null);
   } catch (_) {}
 
@@ -2467,7 +2508,7 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
     structuralStats, truncatedCount, pixelDiff, aggregate,
     mode: match.mode, matchedFraction: match.matchedFraction, matchTierCounts,
     controlCount: controlList.length, variantCount: variantList.length,
-    debug: buildVisualDiffDebug({ match, matchTierCounts, all, shiftClusters, aggregate, truncatedCount }),
+    debug: Object.assign(buildVisualDiffDebug({ match, matchTierCounts, all, shiftClusters, aggregate, truncatedCount }), { imageScale }),
   };
 }
 
@@ -2649,13 +2690,18 @@ async function runVisualReport(findings, stats, ticketVariantText, apiKey, signa
 // content, not a pixel-diff blob needing centering room. A block with
 // rectSource:'unmatched-visual' (no DOM anchor at all) yields no crop on
 // that side; the renderer already handles a single-sided crop.
-function cropVisualDiffBlock(img, block) {
+function cropVisualDiffBlock(img, block, scale) {
   if (!block?.rect) return null;
   // Outside the captured frame there is no image to crop — clampBox would
   // happily return a zero-size or edge-hugging box and produce a misleading
   // sliver of whatever the last captured row or column happens to be.
   if (block.belowCapture || block.offCanvas) return null;
-  const padded = { x: block.rect.x - VIS_CROP_PAD, y: block.rect.y - VIS_CROP_PAD, w: block.rect.w + VIS_CROP_PAD * 2, h: block.rect.h + VIS_CROP_PAD * 2 };
+  // Scale into image space first; the pad is a CSS-px allowance and scales
+  // with it, or a 2x crop would get half the visual margin it asks for.
+  const k = scale || 1;
+  const r = vdScaleRect(block.rect, k);
+  const pad = Math.round(VIS_CROP_PAD * k);
+  const padded = { x: r.x - pad, y: r.y - pad, w: r.w + pad * 2, h: r.h + pad * 2 };
   const box = clampBox(padded, img.width, img.height);
   if (box.w <= 0 || box.h <= 0) return null;
   return cropAndDownscale(img, box);
@@ -4818,7 +4864,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // keepalive heartbeat, and Stop is handled by the caller's own loop
     // between variants.
     (async () => {
-      const { winId, baselineLabel, variantLabel, watchedRects } = msg.payload || {};
+      const { winId, baselineLabel, variantLabel, watchedRects, basePageW, variantPageW } = msg.payload || {};
       const vd = vdState(winId);
       const baseDataUrl = vd.captures.get(baselineLabel);
       const curDataUrl = vd.captures.get(variantLabel);
@@ -4835,7 +4881,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       try {
-        sendResponse({ ok: true, ...(await diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects })) });
+        sendResponse({ ok: true, ...(await diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW })) });
       } catch (e) {
         sendResponse({ ok: false, error: e.message });
       }
@@ -4893,17 +4939,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // side(s) — a finding with no rect on a side (an unmatched-visual block)
     // simply gets no crop for that side.
     (async () => {
-      const { winId, baselineLabel, variantLabel, findings } = msg.payload || {};
+      const { winId, baselineLabel, variantLabel, findings, basePageW, variantPageW } = msg.payload || {};
       const vd = vdState(winId);
       const baseDataUrl = vd.captures.get(baselineLabel);
       const curDataUrl = vd.captures.get(variantLabel);
       if (!baseDataUrl || !curDataUrl) { sendResponse({ ok: false, error: 'Captures no longer available — re-run.' }); return; }
       try {
         const [bi, ci] = await Promise.all([decodeDataUrl(baseDataUrl), decodeDataUrl(curDataUrl)]);
+        // Rects are CSS px, the bitmaps are device px — see vdImageScale.
+        // Without this a crop on a 2x display reads the wrong region entirely.
+        const bScale = vdImageScale(bi, basePageW), cScale = vdImageScale(ci, variantPageW);
         const crops = {};
         for (const f of (findings || [])) {
-          const baselineCrop = await cropVisualDiffBlock(bi, f.controlBlock);
-          const variantCrop = await cropVisualDiffBlock(ci, f.variantBlock);
+          const baselineCrop = await cropVisualDiffBlock(bi, f.controlBlock, bScale);
+          const variantCrop = await cropVisualDiffBlock(ci, f.variantBlock, cScale);
           if (baselineCrop || variantCrop) crops[f.findingId] = { baselineCrop, variantCrop };
         }
         sendResponse({ ok: true, crops });

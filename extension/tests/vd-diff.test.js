@@ -65,6 +65,9 @@ eval(_bg.slice(_bg.indexOf('function vdPixelCheckMatchedPairs'),
                   : _bg.indexOf('\n// ──', _bg.indexOf('function vdPixelCheckMatchedPairs'))));
 eval(_bg.slice(_bg.indexOf('function cropVisualDiffBlock'),
                 _bg.indexOf('\n// ──', _bg.indexOf('function cropVisualDiffBlock'))));
+// CSS-px rects vs device-px bitmaps — the correction both stages depend on.
+eval(_bg.slice(_bg.indexOf('function vdImageScale'),
+                _bg.indexOf('function clampBox')));
 
 // ── harness ────────────────────────────────────────────────────────────────
 var pass = 0, fail = 0, failures = [];
@@ -867,6 +870,52 @@ section('below-capture coverage');
   eq('crop declines a below-capture block',
      cropVisualDiffBlock({ width: 1470, height: 8000 }, { rect: { x: 0, y: 12000, w: 100, h: 50 }, belowCapture: true }),
      null);
+})();
+
+// ── 8b2. CSS px vs device px ───────────────────────────────────────────────
+section('image scale');
+(function imageScale() {
+  // Every rect here is CSS px from getBoundingClientRect; Page.captureScreenshot
+  // returns a bitmap at the host's device pixel ratio. On a Retina Mac a page
+  // clipped to {width: 2581} comes back 5162 wide, so reading a CSS rect
+  // straight into it lands at half position and half size — which is why
+  // report crops have always come out blank: they were cropping whitespace
+  // from the wrong part of the page.
+  eq('1x host is a no-op', vdImageScale({ width: 2581 }, 2581), 1);
+  eq('2x Retina host is detected', vdImageScale({ width: 5162 }, 2581), 2);
+  eq('fractional DPR is preserved', vdImageScale({ width: 3225 }, 2580), 1.25);
+
+  // Derived, so a disagreement between the capture and the walk must not be
+  // laundered into a plausible-looking scale factor.
+  eq('absurd ratio falls back to 1', vdImageScale({ width: 100000 }, 2581), 1);
+  eq('missing pageW falls back to 1', vdImageScale({ width: 5162 }, null), 1);
+  eq('zero pageW falls back to 1', vdImageScale({ width: 5162 }, 0), 1);
+  eq('missing image falls back to 1', vdImageScale(null, 2581), 1);
+
+  eq('scaling is identity at 1x', vdScaleRect({ x: 10, y: 20, w: 30, h: 40 }, 1).x, 10);
+  var r = vdScaleRect({ x: 10, y: 20, w: 30, h: 40 }, 2);
+  eq('2x scales x', r.x, 20);
+  eq('2x scales y', r.y, 40);
+  eq('2x scales w', r.w, 60);
+  eq('2x scales h', r.h, 80);
+  ok('null rect stays null', vdScaleRect(null, 2) === null);
+  // Fractional DPRs must land on whole pixels — getImageData rejects
+  // non-integers and a silent throw would drop the finding.
+  var f = vdScaleRect({ x: 10, y: 10, w: 33, h: 33 }, 1.5);
+  eq('fractional scale rounds x', f.x, 15);
+  eq('fractional scale rounds w', f.w, 50);
+
+  // End to end through the crop: at 2x the box must be taken from the doubled
+  // coordinates, and the pad — a CSS-px allowance — has to double with it or
+  // the crop gets half the visual margin it asked for.
+  var seen = null;
+  var realClamp = clampBox;
+  clampBox = function (box, w, h) { seen = box; return realClamp(box, w, h); };
+  cropVisualDiffBlock({ width: 5162, height: 10000 }, { rect: { x: 100, y: 200, w: 50, h: 60 } }, 2);
+  clampBox = realClamp;
+  eq('crop x is scaled and padded in image space', seen.x, 200 - 24);
+  eq('crop y is scaled and padded in image space', seen.y, 400 - 24);
+  eq('crop w includes the doubled pad', seen.w, 100 + 48);
 })();
 
 // ── 8c. Control-vs-Control must stop the analysis ──────────────────────────

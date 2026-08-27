@@ -3842,6 +3842,10 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       payload: {
         winId: WIN_ID, runId, baselineLabel: base.label, variantLabel: c.label,
         watchedRects: (base.selectors || []).map(s => s.rect).filter(Boolean),
+        // The capture clip spans [0, pageW] in CSS px, so the worker divides
+        // the decoded bitmap's width by this to recover the device pixel ratio
+        // and read rects at the right coordinates. See vdImageScale.
+        basePageW: base.fullPage?.pageW ?? null, variantPageW: c.fullPage?.pageW ?? null,
       },
     });
     if (!diffRes?.ok) {
@@ -3912,7 +3916,10 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       onStatus?.(`Cropping ${c.label}…`);
       const cropRes = await chrome.runtime.sendMessage({
         action: 'cropVisualDiffFindings',
-        payload: { winId: WIN_ID, baselineLabel: base.label, variantLabel: c.label, findings },
+        payload: {
+          winId: WIN_ID, baselineLabel: base.label, variantLabel: c.label, findings,
+          basePageW: base.fullPage?.pageW ?? null, variantPageW: c.fullPage?.pageW ?? null,
+        },
       });
       if (cropRes?.ok) findings = findings.map(f => ({ ...f, ...(cropRes.crops[f.findingId] || {}) }));
     }
