@@ -439,19 +439,55 @@
   // per distinct shift amount. p0/p1 are the positional span over which that
   // amount was observed, kept so a lone element far outside the band that
   // produced an amount isn't waved through on a coincidence.
+  // Two conditions, and both are load-bearing.
+  //
+  // CHAIN against the previous member, not against the cluster's minimum. The
+  // first version fixed `ref` to sorted[i].delta and never re-chained, so a
+  // cluster spanned at most tolPx measured from its LOWEST member -- while
+  // vdExplainsShift compares against the cluster MEDIAN. A band with 3px of
+  // spread therefore split into two sub-minRun fragments, earned no trusted
+  // cluster at all, and every member leaked as a false "moved" finding.
+  // Measured against that code: [100,101,102] -> 0 false findings, but
+  // [100,101,103] -> 3 of 3, and [100,101,103,104] -> 4 of 4 with perfectly
+  // stable rects and no jitter anywhere. That is the SAME bug shape this
+  // function was written to replace -- the original segmented by y and broke a
+  // run as soon as dy changed; clustering by amount moved the problem to "as
+  // soon as dy drifts 3px from the band's minimum" rather than removing it.
+  //
+  // BOUND the total span at 2*tolPx, because chaining alone is single-linkage
+  // and would swallow an arbitrarily wide staircase: 2px steps from 100 to 160
+  // become one cluster with median 130, which then explains almost none of its
+  // own members. 2*tolPx is the widest a cluster can be while its median has
+  // any chance of covering every member within tolPx.
+  //
+  // Not fully solved, deliberately: a SKEWED distribution inside a legal span
+  // can still put one member outside tolPx of the median ([100,100,100,102,104]
+  // medians to 100, so 104 is 4 away and leaks). That leaks one member instead
+  // of all of them, and spanPx below is what makes it visible rather than
+  // silent. Fixing it properly means centring the cluster on its midpoint
+  // instead of its median, which trades outlier robustness for coverage -- not
+  // worth it without a measured case.
   function vdClusterShifts(samples, tolPx, minRun) {
     var sorted = samples.slice().sort(function (x, y) { return x.delta - y.delta; });
     var out = [];
     var i = 0;
     while (i < sorted.length) {
-      var ref = sorted[i].delta;
+      var lo = sorted[i].delta, prev = lo;
       var members = [sorted[i]];
       var j = i + 1;
-      while (j < sorted.length && Math.abs(sorted[j].delta - ref) <= tolPx) { members.push(sorted[j]); j++; }
+      while (j < sorted.length
+             && Math.abs(sorted[j].delta - prev) <= tolPx
+             && Math.abs(sorted[j].delta - lo) <= 2 * tolPx) {
+        members.push(sorted[j]); prev = sorted[j].delta; j++;
+      }
       var positions = members.map(function (m) { return m.pos; });
+      var deltas = members.map(function (m) { return m.delta; });
       out.push({
         p0: Math.min.apply(null, positions), p1: Math.max.apply(null, positions),
-        delta: vdMedian(members.map(function (m) { return m.delta; })),
+        delta: vdMedian(deltas),
+        // How wide the chain actually got. Without it, a runaway merge is
+        // indistinguishable in the debug log from a tight band.
+        spanPx: Math.max.apply(null, deltas) - Math.min.apply(null, deltas),
         count: members.length, trusted: members.length >= minRun,
       });
       i = j;

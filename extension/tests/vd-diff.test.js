@@ -315,6 +315,94 @@ function anchors(n) {
 
 // ── 4. reflow suppression — the cascade bug ─────────────────────────────────
 section('reflow clustering');
+
+// A single pure-reflow band: every pair content-identical (so it feeds the
+// clusterer) and shifted past VD_MOVE_MIN_PX (so an unsuppressed one surfaces).
+// Any "moved" finding out of this is FALSE by construction.
+function reflowBand(deltas, y0) {
+  return deltas.map(function (d, i) {
+    var y = (y0 || 3400) + i * 40;
+    return { a: cand({ text: 'Footer row ' + i, y: y, w: 300, h: 40 }),
+             b: cand({ text: 'Footer row ' + i, y: y + d, w: 300, h: 40 }), tier: 'path+text' };
+  });
+}
+function falseMoves(deltas, y0) {
+  var s = vdSuppressFindings(reflowBand(deltas, y0));
+  return s.findings.filter(function (f) {
+    return (f.signals || []).some(function (g) { return String(g).indexOf('moved') === 0; });
+  }).length;
+}
+
+(function clusterMustNotPartitionFromItsMinimum() {
+  // vdClusterShifts used to fix `ref` to each cluster's LOWEST member and never
+  // re-chain, so a cluster spanned at most VD_SHIFT_TOL_PX (2) measured from
+  // its minimum — while vdExplainsShift compares against the cluster MEDIAN.
+  // A band with 3px of spread therefore earned no trusted cluster at all and
+  // every member leaked. Measured against the shipping code before the fix:
+  //   [100,101,102]         -> 0 false      (one cluster, trusted)
+  //   [100,101,103]         -> 3 of 3 FALSE (chain broke, two untrusted pairs)
+  //   [100,101,103,104]     -> 4 of 4 FALSE (no jitter at all)
+  //   [100,101,102,103,104] -> 1 of 5 FALSE (partial re-absorption at 5+)
+  // This is the same bug shape the clusterer was written to fix: the original
+  // defect broke a run as soon as dy changed (sorted by y); clustering by
+  // amount moved the problem rather than removing it.
+  eq('contiguous band, spread 2', falseMoves([100, 101, 102]), 0);
+  eq('band with 3px spread', falseMoves([100, 101, 103]), 0);
+  eq('band with 4px spread and NO jitter', falseMoves([100, 101, 103, 104]), 0);
+  eq('five-member band, spread 4', falseMoves([100, 101, 102, 103, 104]), 0);
+  eq("ENOC-97's real band (23 at one exact delta)",
+     falseMoves(Array.apply(null, Array(23)).map(function () { return 2108; })), 0);
+})();
+
+(function chainingMustNotRunAway() {
+  // Re-chaining alone is single-linkage, which can swallow an arbitrarily wide
+  // staircase into one cluster whose median then explains almost none of its
+  // own members. A 2px-step staircase spanning 100px must NOT become one band.
+  var staircase = [];
+  for (var d = 100; d <= 160; d += 2) staircase.push(d);
+  var samples = staircase.map(function (d, i) { return { pos: 3400 + i * 40, delta: d }; });
+  var clusters = vdClusterShifts(samples, VD_SHIFT_TOL_PX, VD_SHIFT_MIN_RUN);
+  ok('a 60px staircase is split, not merged into one band', clusters.length > 1, clusters.length);
+  ok('every cluster stays narrow enough for its own median to explain it',
+     clusters.every(function (c) { return (c.spanPx || 0) <= 2 * VD_SHIFT_TOL_PX; }),
+     clusters.map(function (c) { return c.spanPx; }));
+  // Two genuinely distinct bands far apart must still be two clusters.
+  var twoBands = vdClusterShifts(
+    [{ pos: 100, delta: 0 }, { pos: 140, delta: 0 }, { pos: 180, delta: 0 },
+     { pos: 3400, delta: -259 }, { pos: 3440, delta: -259 }, { pos: 3480, delta: -259 }],
+    VD_SHIFT_TOL_PX, VD_SHIFT_MIN_RUN);
+  eq('two well-separated bands stay two clusters', twoBands.length, 2);
+  ok('  and both are trusted', twoBands.every(function (c) { return c.trusted; }));
+})();
+
+(function skewedClusterLeaksOneNotAll() {
+  // The residual the fix deliberately does NOT close, pinned so the comment in
+  // vdClusterShifts stays honest. Inside a legal span, a distribution weighted
+  // to one end pulls the median off centre and the far member falls outside
+  // vdExplainsShift's tolerance. Which end is heavy decides whether it leaks:
+  eq('bottom-heavy skew leaks exactly one member', falseMoves([100, 100, 100, 102, 104]), 1);
+  eq('top-heavy skew leaks none', falseMoves([100, 100, 102, 104, 104]), 0);
+  // What matters is that it is ONE, not all five — the pre-fix behaviour for a
+  // band this shape was every member leaking. And a 2px staircase spanning
+  // 60px now leaks only its unpaired tail.
+  var staircase = [];
+  for (var d = 100; d <= 160; d += 2) staircase.push(d);
+  eq('a 31-member staircase leaks only the trailing singleton', falseMoves(staircase), 1);
+})();
+
+(function spanIsReported() {
+  // The diagnostic that makes residual leakage visible: a cluster that chained
+  // has to say how wide it got, or a runaway merge is indistinguishable in the
+  // debug log from a tight band.
+  var c = vdClusterShifts([{ pos: 0, delta: 100 }, { pos: 40, delta: 101 }, { pos: 80, delta: 103 }],
+                          VD_SHIFT_TOL_PX, VD_SHIFT_MIN_RUN);
+  eq('one cluster', c.length, 1);
+  eq('  reports its span', c[0].spanPx, 3);
+  eq('  and still reports the median as its delta', c[0].delta, 101);
+  eq('  and its member count', c[0].count, 3);
+  var single = vdClusterShifts([{ pos: 0, delta: 7 }], VD_SHIFT_TOL_PX, VD_SHIFT_MIN_RUN);
+  eq('a lone sample has span 0', single[0].spanPx, 0);
+})();
 (function overlappingBands() {
   // Three shift amounts whose y-ranges OVERLAP — the shape that collapsed the
   // old position-first segmentation into 97 segments / 95 untrusted singletons.
