@@ -256,35 +256,85 @@ var m = figmaMatchCompAttachment(atts, 'WOW-1160');
 eq('exact convention matches', m.match && m.match.filename, 'WOW-1160_comp.png');
 eq('non-images excluded from candidates', m.candidates.length, 2);
 
-// Separator-agnostic, because the convention is a habit rather than a rule.
-['WOW-1160_comp.png', 'WOW-1160-comp.png', 'WOW-1160 comp.jpg', 'wow1160comp.PNG', 'WOW1160_Comp.webp']
-  .forEach(function (fn) {
-    eq('matches ' + fn,
-      (figmaMatchCompAttachment([{ filename: fn, mimeType: 'image/png' }], 'WOW-1160').match || {}).filename, fn);
-  });
+// Order-agnostic and format-agnostic: the name must carry BOTH the ticket id
+// and "comp", and nothing else about the shape matters. The original rule
+// required the name to START with the key and be immediately followed by
+// "comp" — that described one team's habit, and ENOC-97 matched none of its 17
+// image attachments.
+[
+  'WOW-1160_comp.png',            // the original convention
+  'WOW-1160-comp.png',
+  'WOW-1160 comp.jpg',
+  'wow1160comp.PNG',              // run together, no separators at all
+  'WOW1160_Comp.webp',
+  'comp_WOW-1160.png',            // reversed
+  'comp-wow-1160.jpg',
+  'WOW-1160_comp_v2.png',         // suffixed
+  'WOW-1160 comp final.png',
+  'desktop_WOW-1160_comp.png',    // prefixed
+  'old-WOW-1160_comp.png',        // was explicitly rejected before; now valid
+  'v1 comp WOW-1160 desktop.jpeg',
+  'WOW-1160_COMP.HEIC',
+].forEach(function (fn) {
+  eq('matches ' + fn,
+    (figmaMatchCompAttachment([{ filename: fn, mimeType: 'image/png' }], 'WOW-1160').match || {}).filename, fn);
+});
 
-// Strict about everything else. A wrong comp is worse than no comp, because
-// it looks like it worked — so anything not fitting the pattern is never
-// auto-selected.
+// Both tokens are required — either alone is not a comp.
 ok('bare ticket key does not match', figmaMatchCompAttachment([{ filename: 'WOW-1160.png' }], 'WOW-1160').match === null);
+ok('bare comp does not match', figmaMatchCompAttachment([{ filename: 'comp.png' }], 'WOW-1160').match === null);
 ok('another ticket does not match', figmaMatchCompAttachment([{ filename: 'WOW-1161_comp.png' }], 'WOW-1160').match === null);
-ok('comp without the key does not match', figmaMatchCompAttachment([{ filename: 'comp.png' }], 'WOW-1160').match === null);
-ok('key appearing mid-name does not match', figmaMatchCompAttachment([{ filename: 'old-WOW-1160_comp.png' }], 'WOW-1160').match === null);
+ok('unrelated image does not match', figmaMatchCompAttachment([{ filename: 'qa-screenshot.png' }], 'WOW-1160').match === null);
 
-// Ambiguity is reported, never resolved by guessing — the caller lists every
-// image with none pre-selected.
+// "comp" must be its own token. These are the words that would otherwise be
+// swept in by a plain substring test.
+['WOW-1160_component.png', 'WOW-1160-comparison.jpg', 'WOW-1160_composite.png',
+ 'WOW-1160_compressed.png', 'WOW-1160-competitor-audit.png'].forEach(function (fn) {
+  ok('"comp" inside a longer word does not match: ' + fn,
+    figmaMatchCompAttachment([{ filename: fn, mimeType: 'image/png' }], 'WOW-1160').match === null);
+});
+
+// The ticket number must not match a LONGER one. WOW-1160 vs WOW-11605 is a
+// realistic collision once a project passes ten thousand tickets, and substring
+// matching would silently take the wrong file.
+ok('1160 does not match 11605', figmaMatchCompAttachment([{ filename: 'WOW-11605_comp.png' }], 'WOW-1160').match === null);
+eq('...but 11605 matches itself',
+  (figmaMatchCompAttachment([{ filename: 'WOW-11605_comp.png' }], 'WOW-11605').match || {}).filename, 'WOW-11605_comp.png');
+// A digit AFTER comp is fine — that is a version suffix, not another ticket.
+eq('run-together with a version digit still matches',
+  (figmaMatchCompAttachment([{ filename: 'wow1160comp2.png' }], 'WOW-1160').match || {}).filename, 'wow1160comp2.png');
+ok('run-together into a longer word does not match',
+  figmaMatchCompAttachment([{ filename: 'wow1160component.png' }], 'WOW-1160').match === null);
+
+// mimeType is the gate, not the extension — an attachment can be image/png
+// with no extension at all, and any format list is an incomplete guess.
+eq('extensionless image/* is accepted',
+  (figmaMatchCompAttachment([{ filename: 'WOW-1160 comp', mimeType: 'image/png' }], 'WOW-1160').match || {}).filename,
+  'WOW-1160 comp');
+ok('a PDF named like a comp is not an image',
+  figmaMatchCompAttachment([{ filename: 'WOW-1160_comp.pdf', mimeType: 'application/pdf' }], 'WOW-1160').match === null);
+// The extension must not be able to satisfy the pattern on its own.
+ok('a .comp extension is not the token', figmaMatchCompAttachment([{ filename: 'WOW-1160.comp', mimeType: 'image/png' }], 'WOW-1160').match === null);
+
+// The real ENOC-97 shape: 17 images, none carrying the ticket id.
+var enoc = figmaMatchCompAttachment(
+  ['hero.png', 'nav-desktop.png', 'card-1.jpg', 'footer.png'].map(function (f) {
+    return { filename: f, mimeType: 'image/png' };
+  }), 'ENOC-97');
+ok('a ticket whose images are all generic matches none', enoc.match === null);
+eq('...but every image is still offered as a candidate', enoc.candidates.length, 4);
+
+// Ambiguity is reported, never resolved by guessing.
 var multi = figmaMatchCompAttachment([
   { filename: 'WOW-1160_comp.png', mimeType: 'image/png' },
-  { filename: 'WOW-1160_comp_v2.png', mimeType: 'image/png' },
+  { filename: 'comp_WOW-1160_v2.png', mimeType: 'image/png' },
 ], 'WOW-1160');
 ok('two matches yield no auto-selection', multi.match === null);
 eq('but both are reported as matches', multi.matches.length, 2);
 
-eq('no attachments yields no match and no candidates', figmaMatchCompAttachment([], 'WOW-1160').candidates.length, 0);
+eq('no attachments yields no candidates', figmaMatchCompAttachment([], 'WOW-1160').candidates.length, 0);
 ok('null attachments handled', figmaMatchCompAttachment(null, 'WOW-1160').match === null);
-// A trailing suffix after `comp` is still the comp — `_comp_final`, `comp-2`.
-eq('suffix after comp still matches',
-  (figmaMatchCompAttachment([{ filename: 'WOW-1160_comp_final.png' }], 'WOW-1160').match || {}).filename, 'WOW-1160_comp_final.png');
+ok('empty ticket key never matches', figmaMatchCompAttachment([{ filename: 'comp.png' }], '').match === null);
 
 // ── report ─────────────────────────────────────────────────────────────────
 print('');

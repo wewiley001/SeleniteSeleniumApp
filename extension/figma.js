@@ -111,12 +111,64 @@
   // fit the pattern: that is exactly how a QA screenshot ends up driving the
   // comparison, and a wrong comp is worse than no comp because it looks like
   // it worked.
-  var COMP_IMAGE_RE = /\.(png|jpe?g|gif|webp|avif)$/i;
+  // Any image whose name carries BOTH the ticket id and "comp", in any order
+  // and any format. The original rule required the name to START with the
+  // ticket key and be immediately followed by "comp", which turned out to
+  // describe one team's habit rather than a house convention — ENOC-97 has 17
+  // image attachments and matched none of them.
+  //
+  // Extension is not the gate; mimeType is. An attachment can be `image/png`
+  // with no extension at all, and the format list would only ever be an
+  // incomplete guess.
+  var COMP_IMAGE_RE = /\.(png|jpe?g|gif|webp|avif|bmp|tiff?|heic)$/i;
+
+  // "comp" as its own token, so component / compare / composite / compressed
+  // do not qualify. Matched against the ORIGINAL filename, before separators
+  // are normalized away — that is the only place word boundaries still exist.
+  var COMP_TOKEN_RE = /(^|[^a-z0-9])comp([^a-z0-9]|$)/i;
 
   function figmaNormalizeFilename(name) {
     return String(name == null ? '' : name).toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
+  // Strip a trailing extension whatever it is, so the token test sees the stem
+  // and a `.comp`-style extension cannot satisfy the pattern by itself.
+  function figmaFilenameStem(name) {
+    return String(name == null ? '' : name).replace(/\.[a-z0-9]{1,5}$/i, '');
+  }
+
+  // The ticket key appears somewhere, and is not the prefix of a LONGER
+  // number: WOW-1160 must not match an attachment for WOW-11605. Only the
+  // trailing side is guarded — the leading side is deliberately open, because
+  // "old-WOW-1160_comp.png" and "desktop_WOW-1160_comp.png" are exactly the
+  // shapes this was broadened to accept.
+  function figmaNameHasTicketKey(norm, key) {
+    if (!key) return false;
+    for (var i = norm.indexOf(key); i !== -1; i = norm.indexOf(key, i + 1)) {
+      var after = norm.charAt(i + key.length);
+      if (!(after >= '0' && after <= '9')) return true;
+    }
+    return false;
+  }
+
+  // The run-together spelling the old rule was built for — `wow1160comp.png`
+  // has no separator for the token test to find. Requires "comp" to END there
+  // or be followed by a digit, so `wow1160component` still does not qualify.
+  function figmaKeyRunsIntoComp(norm, key) {
+    if (!key) return false;
+    for (var i = norm.indexOf(key); i !== -1; i = norm.indexOf(key, i + 1)) {
+      var rest = norm.slice(i + key.length);
+      if (rest.indexOf('comp') !== 0) continue;
+      var after = rest.charAt(4);
+      if (!after || (after >= '0' && after <= '9')) return true;
+    }
+    return false;
+  }
+
+  // Returns { match, matches, candidates }. A SINGLE match is used. Zero or
+  // several return match:null with every image listed, for the caller to offer
+  // with none pre-selected — a wrong comp is worse than no comp, because it
+  // looks like it worked.
   function figmaMatchCompAttachment(attachments, ticketKey) {
     var list = Array.isArray(attachments) ? attachments : [];
     var images = [], matches = [];
@@ -132,10 +184,11 @@
         size: a.size == null ? null : a.size, content: a.content || null, id: a.id || null,
       };
       images.push(entry);
-      // Strip the extension before normalizing so `.png` can't accidentally
-      // satisfy part of the pattern.
-      var base = figmaNormalizeFilename(String(a.filename).replace(COMP_IMAGE_RE, ''));
-      if (wantKey && base.indexOf(wantKey) === 0 && base.slice(wantKey.length).indexOf('comp') === 0) matches.push(entry);
+
+      var stem = figmaFilenameStem(a.filename);
+      var norm = figmaNormalizeFilename(stem);
+      if (!figmaNameHasTicketKey(norm, wantKey)) continue;
+      if (COMP_TOKEN_RE.test(stem) || figmaKeyRunsIntoComp(norm, wantKey)) matches.push(entry);
     }
 
     return { match: matches.length === 1 ? matches[0] : null, matches: matches, candidates: images };
@@ -278,6 +331,7 @@
   g.figmaPickDesignUrl = figmaPickDesignUrl;
   g.figmaMatchCompAttachment = figmaMatchCompAttachment;
   g.figmaNormalizeFilename = figmaNormalizeFilename;
+  g.figmaNameHasTicketKey = figmaNameHasTicketKey;
   g.figmaParseUrl = figmaParseUrl;
   g.figmaIsDesignUrl = figmaIsDesignUrl;
   g.figmaNormalizeNodeId = figmaNormalizeNodeId;
