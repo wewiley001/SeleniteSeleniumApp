@@ -97,6 +97,21 @@
   .ab-delta { font-weight: 700; text-transform: capitalize; margin-right: 4px; }
   @media print {
     .no-print { display: none; }
+    /* Belt and braces with qa-report.js's beforeprint handler, for a print
+       path that bypasses it.
+
+       It must be ::details-content. Chrome hides a closed <details> at the UA
+       slot, NOT by setting display:none on the children — measured: with the
+       details closed, the child's computed display is already `block` and its
+       contentVisibility is `visible`, while checkVisibility() returns false.
+       So the obvious `details > *:not(summary) { display: block }` rule is a
+       no-op that looks like a fix. Verified in Chrome 151: ::details-content
+       reveals the content, display:block does not. */
+    details::details-content { content-visibility: visible !important; }
+    details > summary { list-style: none; font-weight: 600; }
+    /* A finding split across a page break is unreadable — its crop lands on
+       one page and its verdict on the next. */
+    .rpt-section, details { break-inside: avoid-page; }
     body { background: #fff; color: #000; padding: 0; }
     .rpt-wrap { max-width: none; }
     header.rpt-header, .rpt-section { border: 1px solid #ccc; background: #fff; }

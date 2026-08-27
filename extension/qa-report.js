@@ -12,6 +12,32 @@
   const debugNote = document.getElementById('qa-debug-note');
   printBtn?.addEventListener('click', () => window.print());
 
+  // A closed <details> prints CLOSED — its content is simply absent from the
+  // PDF. The Visual Diff section files every "expected" finding into one, so a
+  // report whose spec text is working (and where most differences therefore
+  // grade as expected) printed with the majority of its findings and all their
+  // crop images missing. Observed on a real ENOC-97 run: 6 of 7 findings
+  // invisible in the exported PDF.
+  //
+  // Collapsing is right on screen — expected differences are the noise a
+  // reviewer skims past. It is wrong on paper, where there is nothing to click
+  // and the reader cannot tell anything was omitted. So: open everything for
+  // the print, restore exactly what the reader had afterwards.
+  //
+  // Done in JS rather than CSS because a closed <details> hides its children
+  // through UA behaviour that `display: block` does not reliably override
+  // across print paths, and a half-working override would fail silently in the
+  // same way this bug did.
+  let reopened = [];
+  window.addEventListener('beforeprint', () => {
+    reopened = [...document.querySelectorAll('details:not([open])')];
+    reopened.forEach(d => { d.open = true; });
+  });
+  window.addEventListener('afterprint', () => {
+    reopened.forEach(d => { d.open = false; });
+    reopened = [];
+  });
+
   const id = new URLSearchParams(location.search).get('k');
   if (!id) {
     content.innerHTML = '<p class="rpt-muted">No report id in the URL.</p>';
