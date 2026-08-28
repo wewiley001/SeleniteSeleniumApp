@@ -373,6 +373,8 @@ ${findingLines || '(no non-trivial findings)'}
 
 ${specBlock}
 
+A finding whose type is "region-rollup" is a per-region SUMMARY of the element-level findings in that same region, not an independent change — judge it on whether the region's overall reshaping matches the spec, and do not count its elements a second time in overallSummary.
+
 Ignore findings that are clearly just dynamic page chrome unrelated to the experiment — carousel/slideshow position, ad content, timestamps, live counters, cookie-consent banners, and (if present) a small on-page QA-mode debug badge that shows the variant's own name or id. Those are not meaningful visual regressions — classify them "expected" with a note saying so, rather than omitting them.
 
 Write one overallSummary (2-4 sentences) describing what changed about this variant as a whole. Then for each finding id above, return {"findingId", "classification": "expected"|"unexpected"|"unclear", "severity": "low"|"medium"|"high" or null (null only when classification is "expected"), "note": one sentence explaining the finding}. Return only the JSON the schema requires — no prose, no markdown fences.`;
@@ -2537,32 +2539,16 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
     unchangedCount: all.filter(f => f.changeClass === 'unchanged').length,
   };
 
-  let reportable;
-  if (match.mode === 'redesign') {
-    // Below the match floor an element-by-element list is meaningless — most
-    // elements have no counterpart at all. Roll up per page region instead.
-    // NOT YET IMPLEMENTED, despite what this comment used to assert: the plan
-    // is for step 6 to attach both full-page screenshots here, which is the
-    // one place vision would genuinely earn its cost, but the report request
-    // still sends a single text block and no images. A rollup's entire model
-    // input is its engineNote string.
-    reportable = vdRollupByRegion(match, controlList, variantList).map(r => ({
-      changeClass: 'region-rollup', synthetic: true, region: r.region,
-      // Carried so the crop stage has something to crop at all.
-      controlRect: r.controlRect, variantRect: r.variantRect,
-      note: `${r.region}: ${r.controlCount} elements in Control, ${r.variantCount} in Variant, ${r.matchedCount} matched.`
-        + (r.samples.length ? ` Largest differences: ${r.samples.map(s => `${s.side} ${s.desc}`).join('; ')}.` : ''),
-    }));
-  } else {
-    reportable = vdGroupFindings(all);
-  }
-
-  const { kept, truncatedCount } = rankAndCapDiffFindings(reportable, { watchedRects: watchedRects || [] });
-  kept.sort((x, y) => {
-    const xr = (x.a && x.a.rect) || (x.b && x.b.rect) || x.controlRect || x.variantRect || (x.members && ((x.members[0].a || x.members[0].b || {}).rect));
-    const yr = (y.a && y.a.rect) || (y.b && y.b.rect) || y.controlRect || y.variantRect || (y.members && ((y.members[0].a || y.members[0].b || {}).rect));
-    return (xr ? xr.y : Infinity) - (yr ? yr.y : Infinity);
+  // Composition lives in vd-diff.js so it can be tested -- this function is an
+  // async handler holding decoded bitmaps, and the fork used to sit here with
+  // no coverage at all. See vdComposeReportable for why redesign mode now emits
+  // rollups AND the element-by-element list instead of only rollups.
+  const composed = vdComposeReportable({
+    mode: match.mode, match, controlList, variantList, all,
+    watchedRects: watchedRects || [],
   });
+  const kept = composed.findings;
+  const truncatedCount = composed.truncatedCount;
 
   const matchTierCounts = match.pairs.reduce((acc, p) => { acc[p.tier] = (acc[p.tier] || 0) + 1; return acc; }, {});
 

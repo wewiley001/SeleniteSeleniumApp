@@ -531,6 +531,160 @@ section('grouping, rollup, ranking');
   ok('  samples capped at five', rolled.every(function (r) { return r.samples.length <= 5; }));
 })();
 
+// ── redesign mode reports rollups AND the itemised list ────────────────────
+// vdComposeReportable was lifted out of diffVisualDiffVariant precisely so this
+// could be asserted: that function is an async handler holding decoded bitmaps,
+// so the composition had NO coverage while it lived there, which is why nothing
+// in this suite failed when the behaviour changed.
+//
+// A rebuilt page used to report 7 region counts and nothing else. On the real
+// ENOC-97 run that silence covered 106 added and 51 removed elements — every
+// one a SINGLE-SIDED statement that involves no pairing and so carries none of
+// the pairing risk the redesign floor exists to avoid.
+// spacing defaults to 50px, which is deliberately ABOVE VD_GROUP_GAP_PX (48) so
+// the general fixtures produce one finding per element and the counts below are
+// easy to reason about. The merge test passes a tighter spacing on purpose.
+function redesignFixture(nControl, nVariant, region, spacing) {
+  var step = spacing || 50;
+  var a = [], b = [];
+  for (var i = 0; i < nControl; i++) {
+    a.push(cand({ text: 'control only ' + i, y: i * step, region: region || 'main', path: '/old[' + i + ']' }));
+  }
+  for (var j = 0; j < nVariant; j++) {
+    b.push(cand({ text: 'variant only ' + j, y: j * step, region: region || 'main', path: '/new[' + j + ']' }));
+  }
+  return { a: a, b: b };
+}
+// vdComposeReportable is NEW, so "does this fail against the old file" has no
+// meaningful answer for its behaviour — the function simply is not there. What
+// must not happen is a bare ReferenceError at IIFE-execution time, which aborts
+// this file and takes the ~200 assertions below it down too. One clean failure
+// naming the missing export, then skip the section.
+var HAVE_COMPOSE = typeof vdComposeReportable === 'function';
+ok('vdComposeReportable is exported from vd-diff.js', HAVE_COMPOSE);
+
+function composeFor(a, b, over) {
+  var m = vdMatchCandidates(a, b);
+  var s = vdSuppressFindings(m.pairs);
+  var all = s.findings
+    .concat(m.removed.map(function (c) { return { changeClass: 'removed', a: c, b: null }; }))
+    .concat(m.added.map(function (c) { return { changeClass: 'added', a: null, b: c }; }));
+  return {
+    match: m,
+    composed: vdComposeReportable(Object.assign({
+      mode: m.mode, match: m, controlList: a, variantList: b, all: all,
+    }, over || {})),
+  };
+}
+
+(function redesignEmitsBothTiers() {
+  if (!HAVE_COMPOSE) return;
+  var f = redesignFixture(40, 40);
+  var r = composeFor(f.a, f.b);
+  eq('the fixture really is redesign mode', r.match.mode, 'redesign');
+  ok('rollups are present', r.composed.rollupCount > 0, r.composed.rollupCount);
+  ok('and so is the itemised list — this is the whole change',
+     r.composed.itemizedCount > 0, r.composed.itemizedCount);
+  ok('total exceeds the rollup count', r.composed.findings.length > r.composed.rollupCount,
+     { total: r.composed.findings.length, rollups: r.composed.rollupCount });
+  // Rollups first, then the itemised half; each in page order.
+  var kinds = r.composed.findings.map(function (x) { return x.changeClass === 'region-rollup' ? 'R' : 'i'; }).join('');
+  ok('rollups lead, itemised follow, no interleaving', /^R+i+$/.test(kinds), kinds);
+  function ascending(list) {
+    var ys = list.map(function (x) {
+      var rect = (x.a && x.a.rect) || (x.b && x.b.rect) || x.controlRect || x.variantRect ||
+                 (x.members && ((x.members[0].a || x.members[0].b || {}).rect));
+      return rect ? rect.y : Infinity;
+    });
+    for (var i = 1; i < ys.length; i++) if (ys[i] < ys[i - 1]) return false;
+    return true;
+  }
+  var rolls = r.composed.findings.filter(function (x) { return x.changeClass === 'region-rollup'; });
+  var items = r.composed.findings.filter(function (x) { return x.changeClass !== 'region-rollup'; });
+  ok('rollups are in page order', ascending(rolls));
+  ok('itemised findings are in page order', ascending(items));
+})();
+
+(function normalModeUnchanged() {
+  if (!HAVE_COMPOSE) return;
+  // The other half of the fork must be untouched: no rollups in normal mode.
+  var a = [], b = [];
+  for (var i = 0; i < 20; i++) {
+    a.push(cand({ text: 'Row ' + i, y: i * 50, region: 'main', path: '/body[1]/p[' + i + ']' }));
+    b.push(cand({ text: i === 7 ? 'Row seven rewritten' : 'Row ' + i, y: i * 50, region: 'main', path: '/body[1]/p[' + i + ']' }));
+  }
+  var r = composeFor(a, b);
+  eq('fixture is normal mode', r.match.mode, 'normal');
+  eq('normal mode emits no rollups', r.composed.rollupCount, 0);
+  ok('and still emits findings', r.composed.itemizedCount > 0, r.composed.itemizedCount);
+  ok('nothing is labelled region-rollup',
+     r.composed.findings.every(function (x) { return x.changeClass !== 'region-rollup'; }));
+})();
+
+(function rollupsAreExemptFromTheCap() {
+  if (!HAVE_COMPOSE) return;
+  // Rollups must not compete with the itemised half for slots, and they would
+  // LOSE that competition: 'region-rollup' has no VD_STATUS_TIER entry, so it
+  // falls to the tier-1 default while added/removed are tier 3 — capping them
+  // together drops the orientation and keeps the detail, backwards.
+  var f = redesignFixture(60, 60);
+  var r = composeFor(f.a, f.b, { maxTotal: 5 });
+  ok('the itemised half is capped', r.composed.itemizedCount <= 5, r.composed.itemizedCount);
+  ok('every rollup survives the cap anyway', r.composed.rollupCount > 0, r.composed.rollupCount);
+  eq('total is rollups plus the capped itemised half',
+     r.composed.findings.length, r.composed.rollupCount + r.composed.itemizedCount);
+  ok('and the remainder is disclosed', r.composed.truncatedCount > 0, r.composed.truncatedCount);
+})();
+
+(function adjacentAddedElementsMerge() {
+  if (!HAVE_COMPOSE) return;
+  // vdGroupFindings does the itemising, unchanged — this is what produced the
+  // Zapier report's "a group of 12 template links" entries rather than 12 rows.
+  // 40px spacing, under VD_GROUP_GAP_PX (48), so the run chains — vdGroupFindings
+  // re-anchors on each member it absorbs, so a tight run merges up to
+  // VD_GROUP_MAX_MEMBERS and then starts a new group.
+  var f = redesignFixture(1, 24, 'main', 40);
+  var r = composeFor(f.a, f.b);
+  var items = r.composed.findings.filter(function (x) { return x.changeClass !== 'region-rollup'; });
+  ok('24 added elements do not become 24 findings', items.length < 24, items.length);
+  ok('at least one is a merged group carrying memberCount',
+     items.some(function (x) { return x.memberCount > 1; }),
+     items.map(function (x) { return x.memberCount || 1; }));
+  ok('no group exceeds VD_GROUP_MAX_MEMBERS',
+     items.every(function (x) { return (x.memberCount || 1) <= VD_GROUP_MAX_MEMBERS; }),
+     items.map(function (x) { return x.memberCount || 1; }));
+  // And the complement: spacing ABOVE the gap must NOT merge, so the assertion
+  // above is testing the merge and not just a loose upper bound.
+  var wide = composeFor.apply(null, (function () { var w = redesignFixture(1, 24, 'main', 50); return [w.a, w.b]; })());
+  var wideItems = wide.composed.findings.filter(function (x) { return x.changeClass !== 'region-rollup'; });
+  ok('at 50px spacing nothing merges', wideItems.every(function (x) { return !x.memberCount; }),
+     wideItems.map(function (x) { return x.memberCount || 1; }));
+})();
+
+(function composeDoesNotTouchMatching() {
+  if (!HAVE_COMPOSE) return;
+  // The load-bearing guarantee. This change must alter what is REPORTED and
+  // nothing about what was MATCHED — the redesign floor also gates the fuzzy
+  // pass, so a leak into matching would start brute-forcing pairs on exactly
+  // the pages the gate protects.
+  var f = redesignFixture(40, 40);
+  var m = vdMatchCandidates(f.a, f.b);
+  var before = JSON.stringify({
+    mode: m.mode, pairs: m.pairs.length, removed: m.removed.length,
+    added: m.added.length, matchedFraction: m.matchedFraction,
+    tiers: m.pairs.map(function (p) { return p.tier; }).sort(),
+  });
+  vdComposeReportable({ mode: m.mode, match: m, controlList: f.a, variantList: f.b, all: [] });
+  var after = JSON.stringify({
+    mode: m.mode, pairs: m.pairs.length, removed: m.removed.length,
+    added: m.added.length, matchedFraction: m.matchedFraction,
+    tiers: m.pairs.map(function (p) { return p.tier; }).sort(),
+  });
+  eq('composing the report does not mutate the match result', after, before);
+  ok('no fuzzy pairing exists in redesign mode to begin with',
+     m.pairs.every(function (p) { return p.tier !== 'fuzzy'; }));
+})();
+
 (function ranking() {
   var watched = [{ x: 0, y: 5000, w: 200, h: 50 }];
   var many = [];

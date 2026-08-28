@@ -5109,6 +5109,11 @@ function rptAbVisualDiffSection(vd) {
   // added/removed/modified/unchanged. Derived here from status +
   // changeSignals so the vocabulary a reader sees stays familiar.
   const findingType = (f) => {
+    // A rollup used to fall through to 'other', which is why a redesign-mode
+    // report read "Other main —" for a whole-region summary. It now labels
+    // itself, which is what makes a two-tier report (regions for orientation,
+    // elements for detail) legible without any structural renderer change.
+    if (f.changeClass === 'region-rollup') return 'region';
     if (f.status === 'added' || f.status === 'removed') return f.status;
     if (f.status === 'style-changed') return 'style';
     const signals = f.changeSignals || [];

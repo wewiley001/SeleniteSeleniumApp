@@ -208,6 +208,54 @@ section('suppression disclosure');
   ok('and names the largest shift', h.indexOf('2108px') !== -1);
 })();
 
+// ── 4b. redesign mode's two tiers must be distinguishable ──────────────────
+section('region rollups vs itemised findings');
+
+// An element-level finding as vdFindingToWire emits one for an added/removed
+// element — the tier redesign mode used to withhold entirely.
+function element(status, region, label, opts) {
+  opts = opts || {};
+  var side = status === 'removed' ? 'controlBlock' : 'variantBlock';
+  var f = {
+    findingId: 'e' + (_fid++), changeClass: status, status: status,
+    classification: opts.grade || 'unclear', severity: opts.grade === 'expected' ? null : 'low',
+    region: region, changeSignals: [status], memberCount: opts.memberCount || null,
+    note: label + ' was ' + status,
+    controlBlock: null, variantBlock: null,
+  };
+  f[side] = { type: 'paragraph', label: label, text: label, rect: opts.rect || { x: 700, y: 900, w: 400, h: 40 } };
+  return f;
+}
+
+(function rollupLabelledRegionNotOther() {
+  // A rollup fell through findingType's chain to 'other', which is why a real
+  // redesign report read "Other main —" for a whole-region summary. With both
+  // tiers now in one report that label had to stop being a catch-all.
+  var h = render([rollup('main', 'unclear'), element('added', 'main', 'Trust Stats Bar')]);
+  var kinds = [];
+  var re = /class="ab-delta">([^<]*)</g, m;
+  while ((m = re.exec(h))) kinds.push(m[1]);
+  eq('two findings, two type labels', kinds.length, 2);
+  eq('the rollup is labelled region', kinds[0], 'region');
+  eq('the element keeps its own type', kinds[1], 'added');
+  ok('neither is the "other" catch-all', kinds.indexOf('other') === -1, kinds);
+})();
+
+(function bothTiersRender() {
+  // The regression this guards: redesign mode reporting rollups only.
+  var findings = [rollup('section', 'expected'), rollup('footer', 'expected')]
+    .concat([element('added', 'section', 'Testimonial 1', { grade: 'expected' }),
+             element('removed', 'main', '185K+ Businesses funded', { grade: 'expected' }),
+             element('added', 'section', 'Feature grid', { grade: 'expected', memberCount: 6 })]);
+  var h = render(findings);
+  eq('all five render', h.split('class="ab-line"').length - 1, 5);
+  var kinds = [];
+  var re = /class="ab-delta">([^<]*)</g, m;
+  while ((m = re.exec(h))) kinds.push(m[1]);
+  eq('rollups precede the itemised findings within a grade bucket',
+     kinds.join(','), 'region,region,added,removed,added');
+})();
+
 // ── 5. the debug export must carry the spec, not just its size ─────────────
 section('debug export records the spec text');
 

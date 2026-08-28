@@ -864,6 +864,76 @@
     return { kept: kept, truncatedCount: actionable.length - kept.length };
   }
 
+  // -- What the report will actually contain ------------------------------
+  // Lifted out of diffVisualDiffVariant so it can be tested. That function is
+  // an async message handler holding decoded bitmaps and capture state, so the
+  // composition below -- which is pure, findings in and findings out -- had no
+  // coverage at all while it lived there. Same move that put
+  // validateVisualDiffGeometry here.
+  //
+  // Redesign mode contributes region rollups for ORIENTATION. It does not
+  // replace the element-by-element list with them, which it used to.
+  //
+  // The original reasoning was "below the match floor an element-by-element
+  // list is meaningless -- most elements have no counterpart at all." That
+  // holds for PAIR claims (moved/resized/style-changed asserted over a
+  // coincidental pairing) and not for SINGLE-SIDED ones: "this paragraph
+  // exists only in the variant" involves no pairing and carries no pairing
+  // risk. On ENOC-97 that silence covered 157 such statements -- 106 added, 51
+  // removed -- while the ticket spec itemised nine new sections with exact
+  // copy that each of them could have been checked against.
+  //
+  // The pair claims are safe here too, for a reason specific to this mode:
+  // vdMatchCandidates skips the fuzzy pass entirely when mode is 'redesign'
+  // (the gate is the else-branch of the same test), so every pair reaching
+  // here came from an EXACT tier. A redesign-mode run's pairings are if
+  // anything more trustworthy than a normal run's.
+  function vdReportOrder(x, y) {
+    var xr = (x.a && x.a.rect) || (x.b && x.b.rect) || x.controlRect || x.variantRect ||
+             (x.members && ((x.members[0].a || x.members[0].b || {}).rect));
+    var yr = (y.a && y.a.rect) || (y.b && y.b.rect) || y.controlRect || y.variantRect ||
+             (y.members && ((y.members[0].a || y.members[0].b || {}).rect));
+    return (xr ? xr.y : Infinity) - (yr ? yr.y : Infinity);
+  }
+
+  function vdComposeReportable(opts) {
+    opts = opts || {};
+    var all = opts.all || [];
+    var rollups = [];
+    if (opts.mode === 'redesign' && opts.match) {
+      rollups = vdRollupByRegion(opts.match, opts.controlList || [], opts.variantList || [])
+        .map(function (r) {
+          return {
+            changeClass: 'region-rollup', synthetic: true, region: r.region,
+            // Carried so the crop stage has something to crop at all.
+            controlRect: r.controlRect, variantRect: r.variantRect,
+            note: r.region + ': ' + r.controlCount + ' elements in Control, ' +
+                  r.variantCount + ' in Variant, ' + r.matchedCount + ' matched.' +
+                  (r.samples.length
+                    ? ' Largest differences: ' + r.samples.map(function (sm) { return sm.side + ' ' + sm.desc; }).join('; ') + '.'
+                    : ''),
+          };
+        })
+        .sort(vdReportOrder);
+    }
+    // The cap applies to the itemised half ONLY. Rollups are bounded by the
+    // number of page regions (7 on ENOC-97, ~10 worst case) and must not
+    // compete for the slots -- and they would LOSE that competition:
+    // 'region-rollup' has no VD_STATUS_TIER entry, so it falls to the tier-1
+    // default and would be dropped first, taking the orientation with it and
+    // leaving only the detail.
+    var capped = rankAndCapDiffFindings(vdGroupFindings(all), {
+      watchedRects: opts.watchedRects || [],
+      maxTotal: opts.maxTotal == null ? VD_MAX_DIFF_FINDINGS : opts.maxTotal,
+    });
+    return {
+      findings: rollups.concat(capped.kept.sort(vdReportOrder)),
+      truncatedCount: capped.truncatedCount,
+      rollupCount: rollups.length,
+      itemizedCount: capped.kept.length,
+    };
+  }
+
   g.vdNormText = vdNormText;
   g.vdTextShape = vdTextShape;
   g.vdHash32 = vdHash32;
@@ -888,5 +958,7 @@
   g.vdRollupByRegion = vdRollupByRegion;
   g.validateVisualDiffGeometry = validateVisualDiffGeometry;
   g.rankAndCapDiffFindings = rankAndCapDiffFindings;
+  g.vdComposeReportable = vdComposeReportable;
+  g.vdReportOrder = vdReportOrder;
   g.VD_MAX_DIFF_FINDINGS = VD_MAX_DIFF_FINDINGS;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
