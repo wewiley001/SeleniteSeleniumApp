@@ -3657,7 +3657,15 @@ function vdControlDuplicateReason(base, c) {
   }
   const bf = vdNormalizeTargetUrl(base.finalUrl), cf = vdNormalizeTargetUrl(c.finalUrl);
   if (bf && cf && bf === cf) {
-    return { hard: false, reason: `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter may have been dropped on redirect. Forced-variant state can also survive as a session (Optimizely preview tokens do this), so the comparison was run anyway and judged on what actually rendered` };
+    // Superseded when the platform itself confirms the bucketing. This warning
+    // fired on 19 of 19 recorded ONDECK runs and was UNFALSIFIABLE every time —
+    // the diff proved the pages differed, so it was noise. Where
+    // vdVariantVerification can answer the question the warning only gestures
+    // at, the answer wins and the guess is dropped.
+    const ver = typeof vdVariantVerification === 'function' ? vdVariantVerification(c.expProbe) : null;
+    if (ver && ver.state === 'confirmed') return null;
+    return { hard: false, reason: `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter may have been dropped on redirect. Forced-variant state can also survive as a session (Optimizely preview tokens do this), so the comparison was run anyway and judged on what actually rendered`
+      + (ver && ver.reason ? `. The platform could not confirm it either: ${ver.reason}` : '') };
   }
   return null;
 }
@@ -5694,6 +5702,27 @@ function vdCollectProblems(sections) {
     const baseCap = (entry.data.captures || []).find(c => c.fullPage && !c.fullPage.error);
     for (const c of entry.data.captures || []) {
       if (c.skipped) add('warn', `capture/${c.label}`, `Not captured — ${c.reason || 'run stopped'}`);
+      // Which variation the platform actually served. Reported per capture
+      // because it is the precondition for every verdict downstream: a QA run
+      // that cannot say which page it photographed has nothing trustworthy to
+      // say about whether that page matches the spec. Replaces guessing from
+      // the final URL, which fired on 19 of 19 recorded ONDECK runs and could
+      // never be confirmed or dismissed.
+      const ver = c.variantVerified;
+      if (ver && ver.state === 'contradicted') {
+        add('error', `capture/${c.label}`,
+          `The page did not serve the variation this run asked for — ${ver.reason}.`
+          + ' The diff below is a real comparison of two real pages, but it is not a comparison of Control against this variant,'
+          + ' so no verdict from it applies to the experiment. Re-run once the forced-variant link is working.');
+      } else if (ver && ver.state === 'unknown' && !c.skipped) {
+        add('warn', `capture/${c.label}`,
+          `Could not confirm which variation this page served — ${ver.reason}.`
+          + ' Findings below still describe real differences, but nothing here attributes them to the intended variant.');
+      } else if (ver && ver.state === 'confirmed') {
+        add('info', `capture/${c.label}`,
+          `Variation confirmed by the platform: ${ver.variationName || ver.variationId}`
+          + `${ver.experimentName ? ` in "${ver.experimentName}"` : ''} — this page is the one the URL asked for.`);
+      }
       if (c.loadError) add('error', `capture/${c.label}`, `Page load failed — ${c.loadError}`);
       if (c.fullPage?.error) add('error', `capture/${c.label}`, `Full-page capture failed — ${c.fullPage.error}`);
       if (c.fullPage?.geometryPinFailed) {
@@ -5883,6 +5912,21 @@ function buildDebugLog(sections) {
       label: c.label, url: c.url, finalUrl: c.finalUrl, title: c.title,
       skipped: !!c.skipped, loadError: c.loadError || null,
       fullPage: c.fullPage || null,
+      // Recorded verbatim alongside the derived verdict, so a disagreement
+      // between them is diagnosable rather than a mystery.
+      expProbe: c.expProbe ? {
+        platform: c.expProbe.platform || null,
+        detected: c.expProbe.detected || null,
+        catalogComplete: !!c.expProbe.catalogComplete,
+        forced: c.expProbe.forced || null,
+        experiments: (c.expProbe.experiments || []).map(e => ({
+          id: e.id, name: e.name, active: e.active, bucketed: e.bucketed,
+          variationId: e.variationId, variationName: e.variationName, forced: e.forced, reason: e.reason || null,
+        })),
+        errors: c.expProbe.errors || [],
+      } : null,
+      variantVerified: typeof vdVariantVerification === 'function'
+        ? vdVariantVerification(c.expProbe) : null,
       jsErrors: c.errors || [],
       consoleLineCount: (c.console || []).length,
       selectors: c.selectors || [],

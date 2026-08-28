@@ -2888,6 +2888,10 @@ async function captureVariant(target, { settleMs, selectors, keepTabs, captureFo
     finalUrl: '', title: '', loadError: null,
     console: [], errors: [], selectors: [], tabId: null, screenshot: null,
     fullPage: null,   // { pageW, pageH, capturedH, truncated } | { error } | null
+    // The platform's own answer to "which variation is this page running?".
+    // See vdVariantVerification for why a QA run that cannot answer that has
+    // nothing trustworthy to say about anything downstream.
+    expProbe: null,
   };
   let tab = null;
   try {
@@ -2971,6 +2975,13 @@ async function captureVariant(target, { settleMs, selectors, keepTabs, captureFo
         vd.captures.set(target.label, cap.dataUrl);
         vd.domCandidates.set(target.label, cap.domCandidates || []);
         out.fullPage = cap.meta;
+        // Ask the experimentation platform which variation it actually served,
+        // on the settled page, in the same tab we just photographed. Until now
+        // this was only ever read by the Tracker panel's 1-second poll and the
+        // A/B run never consulted it — so all 19 recorded ONDECK runs carried an
+        // unfalsifiable "may not be the variant" warning instead of an answer.
+        // Best-effort: a probe failure must never cost us the capture.
+        try { out.expProbe = await execMain(tab.id, expProbeFn, []); } catch (_) {}
         if (captureForVision && cap.screenshot) out.screenshot = cap.screenshot;
       } catch (e) {
         out.fullPage = { error: e.message };

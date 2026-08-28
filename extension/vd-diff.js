@@ -864,6 +864,65 @@
     return { kept: kept, truncatedCount: actionable.length - kept.length };
   }
 
+  // -- Did we actually get the variant? --------------------------------------
+  // Across 19 recorded ONDECK runs, every single one carried "it loaded the same
+  // final URL as Control, so the forced-variant parameter may have been
+  // dropped" -- a warning that is UNFALSIFIABLE. It cannot be confirmed or
+  // dismissed, so it was noise on every run while the question it gestures at
+  // (did this page render the variation we asked for?) went unanswered.
+  //
+  // The answer was already available and simply never asked for. expProbeFn
+  // (background.js) reads the platform's own state -- Optimizely's
+  // getVariationMap()/getActiveExperimentIds() -- and reports, per experiment,
+  // whether the page bucketed and into which variation, alongside the
+  // variation the URL forced. This turns the heuristic into an assertion.
+  //
+  // Tri-state on purpose. "I checked and it is wrong" and "I could not check"
+  // are different results and must not collapse into one badge.
+  function vdVariantVerification(probe) {
+    var unknown = function (reason) { return { state: 'unknown', reason: reason }; };
+    if (!probe || probe.ok === false) return unknown('the experiment-platform probe did not run');
+    var det = probe.detected || {};
+    if (!det.optimizely && !det.convert && !det.convertScript) {
+      return unknown('no experimentation platform was detected on the page');
+    }
+    var forced = probe.forced || {};
+    var forcedId = forced.optimizely_x || forced.conv_eforce || null;
+    if (!forcedId) {
+      return unknown('the URL did not force a variation, so there is nothing to verify against');
+    }
+    var exps = probe.experiments || [];
+    var bucketed = exps.filter(function (e) { return e && e.bucketed && e.variationId; });
+    var hit = bucketed.filter(function (e) { return String(e.variationId) === String(forcedId); })[0];
+    if (hit) {
+      return {
+        state: 'confirmed', forcedId: String(forcedId),
+        variationId: String(hit.variationId), variationName: hit.variationName || null,
+        experimentId: hit.id || null, experimentName: hit.name || null,
+      };
+    }
+    if (bucketed.length) {
+      return {
+        state: 'contradicted', forcedId: String(forcedId),
+        variationId: String(bucketed[0].variationId), variationName: bucketed[0].variationName || null,
+        experimentId: bucketed[0].id || null, experimentName: bucketed[0].name || null,
+        reason: 'the URL forced variation ' + forcedId + ' but the page bucketed into ' + bucketed[0].variationId,
+      };
+    }
+    // Nothing bucketed at all. That IS a contradiction of a forced URL -- but
+    // only if the probe could see the whole catalogue. An incomplete catalogue
+    // means "I could not check", not "it is wrong", and calling it wrong would
+    // reproduce exactly the unfalsifiable-warning problem in the other
+    // direction.
+    if (!probe.catalogComplete) {
+      return unknown('the platform catalogue could not be read in full, so bucketing could not be confirmed either way');
+    }
+    return {
+      state: 'contradicted', forcedId: String(forcedId), variationId: null, variationName: null,
+      reason: 'the URL forced variation ' + forcedId + ' and the page did not bucket into any variation',
+    };
+  }
+
   // -- Requirements, checked deterministically ------------------------------
   // The most common CRO QA question is "did the specified copy ship, verbatim?"
   // and that is an exact string comparison, not a judgment. Measured: the
@@ -1085,6 +1144,7 @@
   g.validateVisualDiffGeometry = validateVisualDiffGeometry;
   g.rankAndCapDiffFindings = rankAndCapDiffFindings;
   g.vdComposeReportable = vdComposeReportable;
+  g.vdVariantVerification = vdVariantVerification;
   g.vdSpecRequirements = vdSpecRequirements;
   g.vdMatchRequirements = vdMatchRequirements;
   g.vdReportOrder = vdReportOrder;

@@ -317,6 +317,116 @@ function anchors(n) {
 })();
 
 // ── 4. reflow suppression — the cascade bug ─────────────────────────────────
+(function verificationReachesTheReport() {
+  // The precondition for every verdict downstream. A run that cannot say which
+  // page it photographed has nothing trustworthy to say about whether that page
+  // matches the spec — so the three states have to reach the reader as three
+  // different things, not collapse into one badge.
+  function probs(ver) {
+    return vdCollectProblems(abSections(
+      [capture('v0', { fullPage: null }), capture('v1', { fullPage: null, variantVerified: ver })],
+      [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.9, structuralStats: {} }]));
+  }
+  var bad = probs({ state: 'contradicted', forcedId: '474', variationId: '554',
+                    reason: 'the URL forced variation 474 but the page bucketed into 554' });
+  var hit = bad.filter(function (x) { return /did not serve the variation/.test(x.detail); });
+  eq('CONTRADICTED is an error, once', hit.length, 1);
+  eq('  at error severity', hit.length ? hit[0].severity : null, 'error');
+  ok('  and says the diff is real but does not apply to the experiment',
+     hit.length > 0 && /not a comparison of Control against this variant/.test(hit[0].detail));
+
+  var unk = probs({ state: 'unknown', reason: 'no experimentation platform was detected on the page' });
+  var uh = unk.filter(function (x) { return /Could not confirm which variation/.test(x.detail); });
+  eq('UNKNOWN is a warn, not an error', uh.length ? uh[0].severity : null, 'warn');
+  ok('  and does not claim the variant is wrong',
+     uh.length > 0 && !/did not serve/.test(uh[0].detail));
+
+  var good = probs({ state: 'confirmed', variationId: '4749145360039936',
+                     variationName: 'Two-step', experimentName: 'Form consolidation' });
+  var gh = good.filter(function (x) { return /Variation confirmed by the platform/.test(x.detail); });
+  eq('CONFIRMED is recorded as info', gh.length ? gh[0].severity : null, 'info');
+  ok('  naming the variation and experiment',
+     gh.length > 0 && /Two-step/.test(gh[0].detail) && /Form consolidation/.test(gh[0].detail));
+
+  // Absent verification (an older checkpoint, or a non-A/B run) must be silent
+  // rather than emitting a spurious warn.
+  var none = probs(null);
+  ok('no verification data emits nothing about variations',
+     !none.some(function (x) { return /variation/i.test(x.detail); }), none.map(function (x) { return x.detail.slice(0, 40); }));
+})();
+
+// ── did we actually get the variant? ───────────────────────────────────────
+section('variant verification');
+
+(function variantVerificationTriState() {
+  var HAVE = typeof vdVariantVerification === 'function';
+  ok('vdVariantVerification is exported', HAVE);
+  if (!HAVE) return;
+  // The shape expProbeFn returns.
+  function probe(o) {
+    o = o || {};
+    return {
+      ok: o.ok === undefined ? true : o.ok,
+      detected: o.detected || { optimizely: true, convert: false, convertScript: false },
+      catalogComplete: o.catalogComplete === undefined ? true : o.catalogComplete,
+      forced: o.forced || {},
+      experiments: o.experiments || [],
+    };
+  }
+  var exp = function (id, variationId, bucketed) {
+    return { id: id, name: 'Exp ' + id, known: true, active: true, bucketed: bucketed,
+             variationId: variationId, variationName: 'Var ' + variationId, variations: [] };
+  };
+
+  // The case that matters: ENOC-97's real forced ids.
+  var okRun = vdVariantVerification(probe({
+    forced: { optimizely_x: '4749145360039936' },
+    experiments: [exp('6291814800424960', '4749145360039936', true)],
+  }));
+  eq('bucketed into the forced variation is CONFIRMED', okRun.state, 'confirmed');
+  eq('  and names the variation', okRun.variationId, '4749145360039936');
+  eq('  and the experiment', okRun.experimentId, '6291814800424960');
+
+  var wrong = vdVariantVerification(probe({
+    forced: { optimizely_x: '4749145360039936' },
+    experiments: [exp('6291814800424960', '5542293380268032', true)],
+  }));
+  eq('bucketed into a DIFFERENT variation is CONTRADICTED', wrong.state, 'contradicted');
+  ok('  and says which', /4749145360039936/.test(wrong.reason) && /5542293380268032/.test(wrong.reason), wrong.reason);
+
+  eq('forced but nothing bucketed, catalogue complete, is CONTRADICTED',
+     vdVariantVerification(probe({
+       forced: { optimizely_x: '4749145360039936' },
+       experiments: [exp('6291814800424960', '4749145360039936', false)],
+     })).state, 'contradicted');
+
+  // "I could not check" must never be reported as "it is wrong" — that is the
+  // unfalsifiable-warning problem in the other direction.
+  eq('an incomplete catalogue is UNKNOWN, not contradicted',
+     vdVariantVerification(probe({
+       catalogComplete: false, forced: { optimizely_x: '4749145360039936' }, experiments: [],
+     })).state, 'unknown');
+  eq('no platform detected is UNKNOWN',
+     vdVariantVerification(probe({
+       detected: { optimizely: false, convert: false, convertScript: false },
+       forced: { optimizely_x: '474' },
+     })).state, 'unknown');
+  eq('nothing forced in the URL is UNKNOWN',
+     vdVariantVerification(probe({ forced: {}, experiments: [exp('1', '2', true)] })).state, 'unknown');
+  eq('a probe that failed is UNKNOWN', vdVariantVerification(probe({ ok: false })).state, 'unknown');
+  eq('no probe at all is UNKNOWN', vdVariantVerification(null).state, 'unknown');
+  ok('every unknown explains itself',
+     [vdVariantVerification(null), vdVariantVerification(probe({ forced: {} }))]
+       .every(function (x) { return typeof x.reason === 'string' && x.reason.length > 10; }));
+
+  // Convert, not just Optimizely.
+  eq('a Convert forced param is verified the same way',
+     vdVariantVerification(probe({
+       detected: { optimizely: false, convert: true, convertScript: true },
+       forced: { conv_eforce: '9001' }, experiments: [exp('c1', '9001', true)],
+     })).state, 'confirmed');
+})();
+
 // ── requirements, checked deterministically ────────────────────────────────
 section('spec requirements');
 
@@ -923,6 +1033,7 @@ function abSections(captures, perVariant) {
 function capture(label, o) {
   return { label: label, url: 'https://example.com', skipped: false, loadError: null,
            errors: o.errors || [], selectors: o.selectors || [],
+           variantVerified: o.variantVerified || null,
            fullPage: o.fullPage === undefined
              ? { pageW: 1470, pageH: 9000, capturedH: 8000, truncated: true, viewportH: 802, viewportW: 1470 }
              : o.fullPage };
