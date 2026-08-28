@@ -2486,7 +2486,7 @@ function vdFindingToWire(f, findingId) {
   };
 }
 
-async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW }) {
+async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW, specText }) {
   const match = vdMatchCandidates(controlList, variantList);
   const { findings: paired, segments, aggregate, shiftClusters } = vdSuppressFindings(match.pairs);
 
@@ -2552,7 +2552,17 @@ async function diffVisualDiffVariant({ controlList, variantList, baseDataUrl, cu
 
   const matchTierCounts = match.pairs.reduce((acc, p) => { acc[p.tier] = (acc[p.tier] || 0) + 1; return acc; }, {});
 
+  // Deterministic requirement coverage. Runs here rather than in popup.js
+  // because this is where the full candidate lists live — checking only the
+  // reported findings would understate coverage badly, since a requirement
+  // satisfied by an element the diff matched and suppressed is still satisfied.
+  // No network call, no model, byte-reproducible across runs.
+  const requirements = specText
+    ? vdMatchRequirements(vdSpecRequirements(specText), variantList, { controlList })
+    : null;
+
   return {
+    requirements,
     findings: kept.map((f, i) => vdFindingToWire(f, 'f' + i)),
     structuralStats, truncatedCount, pixelDiff, aggregate,
     mode: match.mode, matchedFraction: match.matchedFraction, matchTierCounts,
@@ -4913,7 +4923,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // keepalive heartbeat, and Stop is handled by the caller's own loop
     // between variants.
     (async () => {
-      const { winId, baselineLabel, variantLabel, watchedRects, basePageW, variantPageW } = msg.payload || {};
+      const { winId, baselineLabel, variantLabel, watchedRects, basePageW, variantPageW, specText } = msg.payload || {};
       const vd = vdState(winId);
       const baseDataUrl = vd.captures.get(baselineLabel);
       const curDataUrl = vd.captures.get(variantLabel);
@@ -4930,7 +4940,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       try {
-        sendResponse({ ok: true, ...(await diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW })) });
+        sendResponse({ ok: true, ...(await diffVisualDiffVariant({ controlList, variantList, baseDataUrl, curDataUrl, watchedRects, basePageW, variantPageW, specText })) });
       } catch (e) {
         sendResponse({ ok: false, error: e.message });
       }

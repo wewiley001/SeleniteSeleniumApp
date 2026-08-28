@@ -208,6 +208,94 @@ section('suppression disclosure');
   ok('and names the largest shift', h.indexOf('2108px') !== -1);
 })();
 
+// ── 4a. requirement coverage leads, and drives the badge ───────────────────
+section('requirement coverage in the report');
+
+function withReq(req, findings) {
+  return render(findings || [rollup('section', 'expected')], {
+    variant: { requirements: req },
+  });
+}
+// The shape vdMatchRequirements returns.
+function reqSet(items) {
+  var c = function (st) { return items.filter(function (x) { return x.status === st; }).length; };
+  return { total: items.length, verbatim: c('verbatim'), near: c('near'), absent: c('absent'), items: items };
+}
+function item(status, required, opts) {
+  opts = opts || {};
+  return {
+    required: required, norm: required.toLowerCase(), status: status,
+    score: opts.score == null ? (status === 'verbatim' ? 1 : 0.5) : opts.score,
+    fragment: !!opts.fragment, foundText: opts.foundText || null,
+    inControl: opts.inControl == null ? null : opts.inControl,
+  };
+}
+
+(function coverageLineLeadsTheVariant() {
+  // Run 1787947608728 put 3 actionable findings behind 64 rows graded
+  // 'expected'. This line answers "does it match the spec?" without reading
+  // any of them, and it does so reproducibly.
+  var h = withReq(reqSet([
+    item('verbatim', 'See My Funding Options'),
+    item('verbatim', 'Apply in minutes'),
+    item('near', 'Lump Sum Loan', { foundText: 'Lump-Sum Funding' }),
+    item('absent', 'Repayment terms up to 24 months', { inControl: false }),
+  ]));
+  ok('the coverage line is present', /Specified copy:/.test(h), h.slice(0, 200));
+  ok('  and reports verbatim over total', /2 of 4 found verbatim/.test(h), h.slice(0, 400));
+  ok('  and counts the unmet', /2 unmet/.test(h));
+  ok('altered copy shows both the spec and the page wording',
+     /Lump Sum Loan/.test(h) && /Lump-Sum Funding/.test(h));
+  ok('absent copy is named', /Not found on the page/.test(h));
+  // The line must sit ABOVE the model's prose, since it is the reliable half.
+  var iReq = h.indexOf('Specified copy:'), iSum = h.indexOf('A full landing-page rebuild.');
+  ok('coverage precedes the model summary', iReq !== -1 && iSum !== -1 && iReq < iSum,
+     { iReq: iReq, iSum: iSum });
+})();
+
+(function fragmentsDoNotCountAsUnmet() {
+  // A prefix relationship means the wording did not change — only how much of
+  // it one element carries. Three of five near-matches on the real ENOC-97 data
+  // were fragments, so counting them as defects would be a standing false alarm.
+  var h = withReq(reqSet([
+    item('verbatim', 'Present copy'),
+    item('near', 'Once you apply with OnDeck we will review your application',
+         { fragment: true, foundText: 'Once you apply with OnDeck we will' }),
+  ]));
+  ok('a fragment is reported as partially present', /1 partially present/.test(h), h.slice(0, 400));
+  ok('  and is NOT counted as unmet', !/unmet/.test(h), h.slice(0, 400));
+})();
+
+(function coverageDrivesTheBadge() {
+  // The whole point. Twelve runs produced four different classification vectors
+  // on identical input, so a badge resting on the model alone moves for no
+  // reason. A missing quoted requirement must badge regardless.
+  var allExpected = [rollup('section', 'expected'), rollup('footer', 'expected')];
+  var clean = withReq(reqSet([item('verbatim', 'All present')]), allExpected);
+  ok('all requirements met and nothing unexpected badges PASS', /PASS/.test(clean), clean.slice(0, 300));
+  var unmetRun = withReq(reqSet([
+    item('verbatim', 'All present'),
+    item('absent', 'Repayment terms up to 24 months'),
+  ]), allExpected);
+  ok('an absent requirement badges ISSUES FOUND even with every finding "expected"',
+     /ISSUES FOUND/.test(unmetRun), unmetRun.slice(0, 300));
+  var fragmentRun = withReq(reqSet([
+    item('verbatim', 'All present'),
+    item('near', 'A long specified sentence that continues', { fragment: true, foundText: 'A long specified sentence' }),
+  ]), allExpected);
+  ok('a fragment alone does NOT badge', /PASS/.test(fragmentRun), fragmentRun.slice(0, 300));
+})();
+
+(function noRequirementsIsSilent() {
+  // No spec, or a spec with no quoted copy, must not render an empty coverage
+  // line — and must leave the badge exactly as it was.
+  var none = render([rollup('section', 'expected')]);
+  ok('no requirements renders no coverage line', !/Specified copy:/.test(none));
+  var empty = withReq({ total: 0, verbatim: 0, near: 0, absent: 0, items: [] });
+  ok('a zero-total requirement set renders no coverage line', !/Specified copy:/.test(empty));
+  ok('  and still badges PASS', /PASS/.test(empty), empty.slice(0, 300));
+})();
+
 // ── 4b. redesign mode's two tiers must be distinguishable ──────────────────
 section('region rollups vs itemised findings');
 

@@ -3917,13 +3917,17 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
         // the decoded bitmap's width by this to recover the device pixel ratio
         // and read rects at the right coordinates. See vdImageScale.
         basePageW: base.fullPage?.pageW ?? null, variantPageW: c.fullPage?.pageW ?? null,
+        // gradedSpec, not ticketText: a spec belonging to another ticket must
+        // not produce a requirement checklist either. Same withholding the
+        // report call gets.
+        specText: gradedSpec || null,
       },
     });
     if (!diffRes?.ok) {
       perVariant.push({ label: c.label, error: diffRes?.error || 'Diff failed' });
       continue;
     }
-    const { structuralStats, truncatedCount, pixelDiff, aggregate, mode, matchedFraction, matchTierCounts } = diffRes;
+    const { structuralStats, truncatedCount, pixelDiff, aggregate, mode, matchedFraction, matchTierCounts, requirements } = diffRes;
     const diffDebug = diffRes.debug || null;
     const kept = diffRes.findings;
 
@@ -3954,7 +3958,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     if (kept.length === 0) {
       perVariant.push({
         label: c.label, sameUrlNote, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
-        noSpecText: !gradedSpec, structuralStats, truncatedFindingCount: truncatedCount,
+        noSpecText: !gradedSpec, requirements, structuralStats, truncatedFindingCount: truncatedCount,
         noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
         aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
         fullPageTruncated: !!c.fullPage.truncated,
@@ -3999,7 +4003,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
 
     perVariant.push({
       label: c.label, sameUrlNote, findings, overallSummary: reportRes.overallSummary,
-      noSpecText: !gradedSpec, structuralStats, truncatedFindingCount: truncatedCount,
+      noSpecText: !gradedSpec, requirements, structuralStats, truncatedFindingCount: truncatedCount,
       noVerdictCount: reportRes.noVerdictCount, duplicateIndexCount: reportRes.duplicateIndexCount,
       truncated: reportRes.truncated, pixelDiff: reportRes.pixelDiff,
       aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
@@ -5244,12 +5248,29 @@ function rptAbVisualDiffSection(vd) {
   // ONLY 'unclear' verdicts by construction, so treating 'unexpected' as the
   // only signal would report 0 issues for a variant that actually surfaced
   // real findings.
+  // Requirements that are demonstrably unmet: absent copy, plus copy that
+  // shipped with different wording. A `fragment` near-match is not a defect —
+  // the wording is unchanged, only how much of it one element carries — so it
+  // must not badge. This half is byte-reproducible across runs.
+  const unmetRequirements = (v) => {
+    const r = v.requirements;
+    if (!r || !r.items) return 0;
+    return r.absent + r.items.filter(x => x.status === 'near' && !x.fragment).length;
+  };
   const variantIssueCount = (v) => {
     if (v.skipped || v.error) return 0;
     const findings = v.findings || [];
     const unexpected = findings.filter(f => f.classification === 'unexpected').length;
     const unclear = findings.filter(f => f.classification === 'unclear').length;
-    return v.noSpecText ? unexpected + unclear : unexpected;
+    // The model half, unchanged in behaviour — it still catches semantic
+    // problems no string comparison can (on run 1787947608728 the removed TCPA
+    // consent disclaimer was one of these, graded 'unclear').
+    const model = v.noSpecText ? unexpected + unclear : unexpected;
+    // The deterministic half. Measured across twelve runs the model produced
+    // four different classification vectors on identical input, so a badge
+    // resting on it alone moves for no reason. A missing quoted requirement
+    // now badges regardless of what the model said about it.
+    return unmetRequirements(v) + model;
   };
   const shared = vd.sharedFindings || [];
   // Shared changes were lifted out of every variant, so they must be counted
@@ -5291,7 +5312,27 @@ function rptAbVisualDiffSection(vd) {
     const ungraded = findings.filter(f => !GRADED[f.classification]);
     const s = v.structuralStats || {};
 
-    const summaryHtml = v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '';
+    // Requirement coverage leads the variant, above the model's prose, because
+    // it is the one part of this report that answers "does it match the spec?"
+    // reproducibly. Run 1787947608728 put 3 actionable findings behind 64 rows
+    // graded 'expected'; this is the line that answers the question without
+    // reading any of them.
+    const req = v.requirements;
+    const unmet = req && req.items
+      ? req.items.filter(x => x.status === 'absent' || (x.status === 'near' && !x.fragment))
+      : [];
+    const fragments = req && req.items ? req.items.filter(x => x.status === 'near' && x.fragment).length : 0;
+    const reqHtml = !req || !req.total ? '' : `
+      <div class="ab-cline${unmet.length ? ' ab-warn' : ''}"><b>Specified copy:</b> ${req.verbatim} of ${req.total} found verbatim${
+        unmet.length ? ` · <b>${unmet.length} unmet</b>` : ''}${
+        fragments ? ` · ${fragments} partially present` : ''}. Checked by exact string comparison against every element, not by the model.</div>
+      ${unmet.map(x => `<div class="ab-cline">${
+        x.status === 'near'
+          ? `Spec says ${q(JSON.stringify(x.required))} — page has ${q(JSON.stringify(x.foundText))}.`
+          : `Not found on the page: ${q(JSON.stringify(x.required))}.${x.inControl ? ' Still present in Control, so the old copy did not change.' : ''}`
+      }</div>`).join('')}`;
+
+    const summaryHtml = reqHtml + (v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '');
 
     // MANDATORY, not cosmetic. Every entry here is a filter that removed a
     // real difference from the findings above, and an invisible filter is
@@ -5752,6 +5793,17 @@ function vdCollectProblems(sections) {
             add('error', at, `The two screenshots came back at different pixel scales — Control ${sc.controlImage?.w}px wide for a ${sc.pageW?.control}px page (${rawC != null ? rawC.toFixed(2) : '?'}x), Variant ${sc.variantImage?.w}px for ${sc.pageW?.variant}px (${rawV != null ? rawV.toFixed(2) : '?'}x). Nothing that reads pixels can be trusted across that gap: the whole-page pixel percentage is withheld for this variant, and any crop or per-block pixel check is comparing regions at different magnifications. Re-run before reading anything into the pixel figures.`);
           }
         }
+        // Unmet requirements are a deterministic result, so unlike the model's
+        // verdicts this line means the same thing on every run of the same page.
+        const rq = v.requirements;
+        if (rq && rq.total) {
+          const bad = (rq.items || []).filter(x => x.status === 'absent' || (x.status === 'near' && !x.fragment));
+          if (bad.length) {
+            add('warn', at, `${bad.length} of ${rq.total} specified copy strings are not on the page as written`
+              + ` (${rq.absent} absent, ${bad.length - rq.absent} shipped with different wording).`
+              + ' This is an exact string comparison, not a model judgment — it will read the same on every run.');
+          }
+        }
         const fuzzy = d.matchTierCounts?.fuzzy || 0;
         if (fuzzy) add('warn', at, `${fuzzy} element(s) were paired by approximate similarity rather than an exact key — those pairings may be wrong.`);
         // The signature of broken reflow suppression: an amount that keeps
@@ -5854,6 +5906,9 @@ function buildDebugLog(sections) {
         suppressionAggregate: v.aggregate || null,
         reportedFindingCount: (v.findings || []).length,
         truncatedFindingCount: v.truncatedFindingCount || 0,
+        // Deterministic and byte-reproducible, so two logs of the same page can
+        // be compared on it directly — unlike the model's classifications.
+        requirements: v.requirements || null,
         // The rendered report shows each finding's prose; this shows the
         // geometry and the identity tier behind it, which is what makes a
         // wrong finding traceable to the pass that produced it.
