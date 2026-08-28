@@ -2568,6 +2568,13 @@ function abDefaultState() {
     // checkboxes; recordHeatmap stays in the state (and the code behind it
     // still works) but has no UI and is never switched on.
     visualDiff: true, visualDiffCrops: true, agenticTesting: true, summaryOfChanges: '',
+    // Which TICKET the spec above was auto-filled from. `summarySource` says
+    // 'ticket' but not WHICH ticket, and the box persists across ticket
+    // switches, so without this a spec from another experiment is
+    // indistinguishable from the right one. Measured: run 1787945015802
+    // graded 61 of 67 findings "unexpected" on ENOC-97 against a Zapier
+    // contact-sales form spec. null for hand-typed text, which has no ticket.
+    summaryTicketKey: null,
     figmaUrl: '',
     // Off by default, deliberately. This writes the text every finding is
     // graded against, and it writes it by reading an image — so it is opt-in
@@ -2613,6 +2620,8 @@ async function initAbCompare() {
     // Which source wrote the spec is invisible once the text is in the box,
     // and the whole report is graded against it — so record it.
     abState.summarySource = e.target.value.trim() ? 'manual' : null;
+    // Typed text belongs to no ticket, so it can never be judged stale.
+    abState.summaryTicketKey = null;
     persistAbState();
   });
   document.getElementById('ab-figma-url')?.addEventListener('input', e => {
@@ -3007,6 +3016,7 @@ async function autofillAbSummaryFromFigma() {
 
   abState.summaryOfChanges = summary;
   abState.summarySource = source;
+  abState.summaryTicketKey = (ctx && ctx.ticketKey) || null;
   persistAbState();
   const el = document.getElementById('ab-summary-of-changes');
   if (el) el.value = summary;
@@ -3116,13 +3126,25 @@ async function abFigmaCheck() {
 }
 
 async function autofillAbSummaryFromTicket() {
-  if (!abState || (abState.summaryOfChanges || '').trim()) return;
+  if (!abState) return;
+  // ctx is resolved BEFORE the bail now, because whether an existing value is
+  // stale depends on which ticket it came from.
   const ctx = await getActiveContext().catch(() => null);
   if (!ctx?.reviewed) return;
+  const existing = (abState.summaryOfChanges || '').trim();
+  // Hand-typed text is never clobbered. That guard is absolute and predates
+  // this — it is the reason the box survives a ticket switch at all.
+  if (existing && abState.summarySource === 'manual') return;
+  // An auto-filled spec that already belongs to THIS ticket is current.
+  if (existing && abState.summaryTicketKey && abState.summaryTicketKey === ctx.ticketKey) return;
+  // Anything else auto-filled is stale — either from a different ticket, or
+  // from before summaryTicketKey existed (legacy persisted state, no key
+  // recorded). Re-filling from the ACTIVE ticket is correct in both cases.
   const summary = buildSummaryFromTicketVariants(ctx);
   if (!summary) return;
   abState.summaryOfChanges = summary;
   abState.summarySource = 'ticket';
+  abState.summaryTicketKey = ctx.ticketKey || null;
   persistAbState();
   const el = document.getElementById('ab-summary-of-changes');
   if (el) el.value = summary;
@@ -3719,6 +3741,33 @@ function vdExtractSharedFindings(perVariant) {
   return shared;
 }
 
+// Whether the stored spec was auto-filled from a DIFFERENT ticket than the one
+// this run is against. Pure, and top-level rather than inline in the pipeline,
+// so it can be sliced into the test suite -- the two other decision points
+// buried in async handlers this session (the reporting fork, the pixel check's
+// scale) both turned out to have no coverage at all where they sat.
+//
+// Silent in three cases, each of which would be a nuisance if it fired:
+//   'manual'        the user typed it, possibly for a page with no ticket
+//   no specKey      state persisted before provenance existed
+//   no activeKey    no ticket is active, so there is nothing to disagree with
+// The one place the rule lives. Two callers need it from different shapes --
+// the pipeline from live abState + ctx, vdCollectProblems from the already
+// serialised designReference -- and two copies of a four-clause predicate drift.
+function vdSpecTicketMismatch(source, specKey, activeKey, hasText) {
+  if (!hasText) return false;
+  if (source === 'manual') return false;
+  return !!(specKey && activeKey && specKey !== activeKey);
+}
+
+function vdSpecIsStale(state, ctx) {
+  return vdSpecTicketMismatch(
+    state && state.summarySource,
+    (state && state.summaryTicketKey) || null,
+    (ctx && ctx.ticketKey) || null,
+    !!((state && state.summaryOfChanges) || '').trim());
+}
+
 async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus } = {}) {
   if (!abState.visualDiff) return null;
   const bail = (reason) => ({ skipped: true, reason });
@@ -3730,6 +3779,28 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
   // it in from the ticket's variants (see its own comment) before this ever
   // runs, so there's nothing ticket-specific left to resolve here.
   const ticketText = (abState.summaryOfChanges || '').trim();
+
+  // A spec auto-filled from a DIFFERENT ticket is worse than no spec. The
+  // report prompt's "absence means unclear, never unexpected" softening is
+  // gated on a figma-* source, so with source 'ticket' every element the wrong
+  // spec omits grades "unexpected" rather than "unclear". Measured on run
+  // 1787945015802: 61 of 67 findings called defects on ENOC-97 against a
+  // Zapier contact-sales form spec, including elements the REAL spec names
+  // verbatim. The three region rollups flipped expected -> unexpected with
+  // byte-identical engineNote, which is what proves the fault is the spec and
+  // not the grader.
+  //
+  // No new coercion logic: blanking the grader's input trips the existing
+  // noSpec path in background.js, which forces every finding to 'unclear' with
+  // null severity, and noSpecText already drives the renderer's "described but
+  // not judged" line. `ctx` here is the SAME object buildDesignReferenceDebug
+  // records, so the log and this decision cannot disagree — re-fetching it
+  // could straddle a ticket switch mid-run.
+  const specStale = vdSpecIsStale(abState, ctx);
+  // The debug export deliberately keeps recording the real, wrong text and its
+  // provenance (buildDesignReferenceDebug) — only the grader is denied it.
+  // Blanking it there too would re-hide the next occurrence.
+  const gradedSpec = specStale ? '' : ticketText;
 
   // Resolve which capture is Control — ticket-resolved when ctx is present,
   // falling back to the first capture otherwise (see resolveAbBaseline's own
@@ -3883,7 +3954,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     if (kept.length === 0) {
       perVariant.push({
         label: c.label, sameUrlNote, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
-        noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
+        noSpecText: !gradedSpec, structuralStats, truncatedFindingCount: truncatedCount,
         noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
         aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
         fullPageTruncated: !!c.fullPage.truncated,
@@ -3896,8 +3967,10 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       action: 'reportVisualDiffFindings',
       payload: {
         winId: WIN_ID, runId, baselineLabel: base.label, variantLabel: c.label,
-        findings: kept, stats: structuralStats, ticketVariantText: ticketText || null,
-        specSource: abState.summarySource || null, pixelDiff,
+        findings: kept, stats: structuralStats, ticketVariantText: gradedSpec || null,
+        // null when withheld: nothing downstream should reason about the
+        // source of a spec whose text was not supplied.
+        specSource: specStale ? null : (abState.summarySource || null), pixelDiff,
       },
     });
     if (!reportRes?.ok) {
@@ -3926,7 +3999,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
 
     perVariant.push({
       label: c.label, sameUrlNote, findings, overallSummary: reportRes.overallSummary,
-      noSpecText: !ticketText, structuralStats, truncatedFindingCount: truncatedCount,
+      noSpecText: !gradedSpec, structuralStats, truncatedFindingCount: truncatedCount,
       noVerdictCount: reportRes.noVerdictCount, duplicateIndexCount: reportRes.duplicateIndexCount,
       truncated: reportRes.truncated, pixelDiff: reportRes.pixelDiff,
       aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
@@ -5463,6 +5536,10 @@ function buildDesignReferenceDebug(ctx, state, hasFigmaPat) {
       present: !!summary,
       length: summary.length,
       source: summary ? (state?.summarySource || 'unknown') : null,
+      // WHICH ticket auto-filled it. `source: 'ticket'` was true and useless —
+      // it never said which one, and the box persists across ticket switches.
+      // null for hand-typed text and for state persisted before this existed.
+      ticketKey: summary ? (state?.summaryTicketKey || null) : null,
       // The text itself, not just its length. Every expected/unexpected
       // verdict in the report is relative to this string, and both model
       // calls quote it back as justification — the agentic note and the
@@ -5514,7 +5591,28 @@ function vdCollectProblems(sections) {
                   ? `Ticket ${tc.ticketKey} parsed ${tc.variantCount} variant(s) but none carry a description, so the auto-fill had nothing to write. Check the ticket's Test Specifications section, or type a summary by hand.`
                   : 'The ticket has variant descriptions, so the auto-fill should have run — it only fills an EMPTY box, so a stale empty value may have been persisted.'));
     } else {
-      add('info', 'summary-of-changes', `Spec text came from: ${dr.summaryOfChanges.source} (${dr.summaryOfChanges.length} chars). Every expected/unexpected verdict below is relative to it.`);
+      // A spec auto-filled from one ticket and used against another. This has
+      // to be an error, not a warning: run 1787945015802 graded 61 of 67
+      // findings "unexpected" on ENOC-97 against a Zapier contact-sales form
+      // spec, and without this line the only clue was that the verdicts looked
+      // wrong. Deliberately silent in three cases — 'manual' (typed on
+      // purpose, possibly for a page with no ticket at all), no recorded
+      // specKey (state persisted before provenance existed; would fire once
+      // for every existing session), and no active ticket.
+      const specKey = dr.summaryOfChanges.ticketKey;
+      const activeKey = tc && tc.ticketKey;
+      // Same predicate the pipeline gated on, so the error and the withholding
+      // can never disagree. hasText is true: this is the spec-present branch.
+      const stale = vdSpecTicketMismatch(dr.summaryOfChanges.source, specKey, activeKey, true);
+      if (stale) {
+        add('error', 'summary-of-changes',
+          `The spec text was auto-filled from ticket ${specKey}, but this run is against ${activeKey}. `
+          + 'Every expected/unexpected verdict would have been relative to a different experiment, so grading was WITHHELD — '
+          + 'every finding below is "unclear" and no severity was assigned. The wrong spec text is still recorded in this log '
+          + `(${dr.summaryOfChanges.length} chars) so it can be identified. Re-run with ${activeKey} active; the auto-fill now refreshes a spec left over from another ticket.`);
+      } else {
+        add('info', 'summary-of-changes', `Spec text came from: ${dr.summaryOfChanges.source} (${dr.summaryOfChanges.length} chars)${specKey ? `, ticket ${specKey}` : ''}. Every expected/unexpected verdict below is relative to it.`);
+      }
     }
 
     if (tc && tc.variantCount && !tc.controlVariantId) {
@@ -5776,6 +5874,11 @@ function buildDebugLog(sections) {
           // seven findings four different ways needed to distinguish
           // "unseeded sampling" from "the prompt string actually changed".
           engineNote: f.engineNote || null,
+          // The model's OWN sentence for this finding. engineNote is what it
+          // was GIVEN; this is what it concluded. Without it, 61 "unexpected"
+          // verdicts had to be diagnosed by inferring from the spec instead of
+          // reading the reasoning. Same gap engineNote had.
+          note: f.note || null,
         })),
         diagnostics: v.diffDebug || null,
       })),

@@ -275,6 +275,28 @@ eval(slicePopup('function buildDesignReferenceDebug(ctx, state, hasFigmaPat) {',
   ok('present is still true', d.summaryOfChanges.present === true);
 })();
 
+(function specProvenanceRecorded() {
+  // `source: 'ticket'` was true and useless — it never said WHICH ticket, and
+  // the Summary of Changes box persists across ticket switches. Run
+  // 1787945015802 graded 61 of 67 findings "unexpected" on ENOC-97 against a
+  // Zapier contact-sales form spec because of exactly that gap.
+  var d = buildDesignReferenceDebug(null, {
+    summaryOfChanges: 'Rebuild the hero.', summarySource: 'ticket', summaryTicketKey: 'ENOC-97',
+  }, false);
+  eq('the auto-filling ticket is recorded', d.summaryOfChanges.ticketKey, 'ENOC-97');
+  var typed = buildDesignReferenceDebug(null, {
+    summaryOfChanges: 'Typed by hand.', summarySource: 'manual', summaryTicketKey: null,
+  }, false);
+  eq('hand-typed text records no ticket', typed.summaryOfChanges.ticketKey, null);
+  var legacy = buildDesignReferenceDebug(null, {
+    summaryOfChanges: 'From before provenance existed.', summarySource: 'ticket',
+  }, false);
+  eq('state persisted before this existed records null, not undefined',
+     legacy.summaryOfChanges.ticketKey, null);
+  var none = buildDesignReferenceDebug(null, { summaryOfChanges: '   ' }, false);
+  eq('no spec records no ticket', none.summaryOfChanges.ticketKey, null);
+})();
+
 (function noSpecRecordsNull() {
   var d = buildDesignReferenceDebug(null, { summaryOfChanges: '   ' }, false);
   eq('an empty spec records null rather than an empty string', d.summaryOfChanges.text, null);

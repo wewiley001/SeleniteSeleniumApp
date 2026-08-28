@@ -48,6 +48,9 @@ eval(_pu.slice(_pu.indexOf('function vdFindingIdentity(f)'),
                 _pu.indexOf('async function runVisualDiffPipeline')));
 eval(_pu.slice(_pu.indexOf('function vdNormalizeTargetUrl(u)'),
                 _pu.indexOf('function vdFindingIdentity(f)')));
+// The gate that decides whether grading is withheld for a run.
+eval(_pu.slice(_pu.indexOf('function vdSpecTicketMismatch('),
+                _pu.indexOf('\nasync function runVisualDiffPipeline')));
 
 var _bg = readFile('../background.js');
 eval(_bg.slice(_bg.indexOf('const VD_DEBUG_SAMPLE_CAP'),
@@ -1105,6 +1108,115 @@ function capture(label, o) {
 })();
 
 // ── 8b. full-page coverage past the screenshot limit ───────────────────────
+(function staleGateItself() {
+  // vdSpecIsStale decides whether grading happens at all, so its four clauses
+  // are asserted directly rather than only through the problems line.
+  var HAVE = typeof vdSpecIsStale === 'function';
+  ok('vdSpecIsStale is defined', HAVE);
+  if (!HAVE) return;
+  var t = function (soc, src, key, active) {
+    return vdSpecIsStale({ summaryOfChanges: soc, summarySource: src, summaryTicketKey: key },
+                         active == null ? null : { ticketKey: active });
+  };
+  eq('the real failure: ticket spec from ZAP-441 used against ENOC-97',
+     t('v1: Two-Step Form Progression', 'ticket', 'ZAP-441', 'ENOC-97'), true);
+  eq('same ticket is not stale', t('x', 'ticket', 'ENOC-97', 'ENOC-97'), false);
+  eq('hand-typed is never stale', t('x', 'manual', 'ZAP-441', 'ENOC-97'), false);
+  eq('no recorded key (legacy state) is not stale', t('x', 'ticket', null, 'ENOC-97'), false);
+  eq('no active ticket is not stale', t('x', 'ticket', 'ZAP-441', null), false);
+  eq('an empty spec is not stale', t('   ', 'ticket', 'ZAP-441', 'ENOC-97'), false);
+  eq('a figma-sourced spec from another ticket IS stale',
+     t('x', 'figma-boards', 'ZAP-441', 'ENOC-97'), true);
+  eq('missing state does not throw', vdSpecIsStale(null, { ticketKey: 'ENOC-97' }), false);
+  eq('missing ctx does not throw',
+     vdSpecIsStale({ summaryOfChanges: 'x', summarySource: 'ticket', summaryTicketKey: 'ZAP-441' }, null), false);
+  // vdCollectProblems reaches the same rule from the serialised shape. Assert
+  // the shared primitive directly so the two callers cannot diverge silently.
+  ok('the shared primitive is what both callers use', typeof vdSpecTicketMismatch === 'function');
+  eq('primitive: mismatch with text', vdSpecTicketMismatch('ticket', 'ZAP-441', 'ENOC-97', true), true);
+  eq('primitive: mismatch without text', vdSpecTicketMismatch('ticket', 'ZAP-441', 'ENOC-97', false), false);
+  eq('primitive: manual', vdSpecTicketMismatch('manual', 'ZAP-441', 'ENOC-97', true), false);
+  eq('primitive: same key', vdSpecTicketMismatch('ticket', 'ENOC-97', 'ENOC-97', true), false);
+})();
+
+(function staleSpecIsAnError() {
+  // THE regression. A spec auto-filled from one ticket and used against
+  // another must be an error, not a warning: the report prompt's "absence
+  // means unclear, never unexpected" softening is gated on a figma-* source,
+  // so with source 'ticket' every element the wrong spec omits grades
+  // "unexpected". On run 1787945015802 that was 61 of 67 findings called
+  // defects, and the only clue was that the verdicts looked wrong.
+  function probs(soc, activeKey) {
+    var base = abSections([capture('v0', { fullPage: null }), capture('v1', { fullPage: null })],
+      [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.9, structuralStats: {} }]);
+    base.designReference = {
+      summaryOfChanges: soc,
+      ticketContext: activeKey == null ? null : {
+        ticketKey: activeKey, reviewed: true, variantCount: 2, variantsWithDescription: 2,
+        controlVariantId: 'v0', variantIds: ['v0', 'v1'],
+        previewLinkCount: 2, previewLinkIds: ['v0', 'v1'],
+      },
+      figma: { urlUsed: null, urlFromTicket: null, nodeId: null, tokenConfigured: false,
+               comp: null, compCandidateCount: 0 },
+    };
+    return vdCollectProblems(base);
+  }
+  function staleHits(list) {
+    return list.filter(function (x) { return /was auto-filled from ticket/.test(x.detail); });
+  }
+  // The real failure: a 1808-char Zapier form spec used against ENOC-97.
+  var mism = probs({ present: true, length: 1808, source: 'ticket',
+                     text: 'v1: Two-Step Form Progression', ticketKey: 'ZAP-441' }, 'ENOC-97');
+  var hit = staleHits(mism);
+  eq('a cross-ticket spec is reported exactly once', hit.length, 1);
+  eq('  at error severity, not warn', hit.length ? hit[0].severity : null, 'error');
+  ok('  and names BOTH tickets',
+     hit.length > 0 && /ZAP-441/.test(hit[0].detail) && /ENOC-97/.test(hit[0].detail),
+     hit.length ? hit[0].detail : null);
+  ok('  and says grading was withheld',
+     hit.length > 0 && /WITHHELD/.test(hit[0].detail), hit.length ? hit[0].detail : null);
+
+  var okRun = probs({ present: true, length: 11716, source: 'ticket', text: 'x', ticketKey: 'ENOC-97' }, 'ENOC-97');
+  eq('a spec from the active ticket raises nothing', staleHits(okRun).length, 0);
+  ok('  and still reports where the spec came from',
+     okRun.some(function (x) { return /Spec text came from: ticket/.test(x.detail); }), okRun);
+
+  // Three deliberate silences. Each would be a nuisance if it fired.
+  eq('hand-typed text is never called stale, even against another ticket',
+     staleHits(probs({ present: true, length: 40, source: 'manual', text: 'x', ticketKey: 'ZAP-441' }, 'ENOC-97')).length, 0);
+  eq('legacy state with no recorded ticket is not called stale',
+     staleHits(probs({ present: true, length: 40, source: 'ticket', text: 'x', ticketKey: null }, 'ENOC-97')).length, 0);
+  eq('no active ticket is not called stale',
+     staleHits(probs({ present: true, length: 40, source: 'ticket', text: 'x', ticketKey: 'ZAP-441' }, null)).length, 0);
+  ok('every shape returns a list rather than throwing', Array.isArray(mism) && Array.isArray(okRun));
+})();
+
+(function modelNoteIsExported() {
+  // engineNote is what the model was GIVEN; `note` is what it concluded.
+  // Without it, 61 "unexpected" verdicts had to be diagnosed by inferring from
+  // the spec instead of reading the reasoning. Same gap engineNote had.
+  var log = buildDebugLog(abSections([capture('v0', { fullPage: null })], [{
+    label: 'v1', diffMode: 'redesign', matchedFraction: 0.24, structuralStats: {},
+    findings: [{
+      findingId: 'f0', changeClass: 'added', status: 'added', region: 'section',
+      classification: 'unexpected', severity: 'medium',
+      note: 'The hero subhead is not mentioned anywhere in the spec.',
+      variantBlock: { type: 'paragraph', label: 'Apply in minutes', text: 'Apply in minutes',
+                      rect: { x: 700, y: 385, w: 611, h: 60 } },
+    }],
+  }]));
+  var f = log.visualDiff.perVariant[0].findings[0];
+  eq("the model's own note survives the export", f.note,
+     'The hero subhead is not mentioned anywhere in the spec.');
+  eq('  alongside its grade', f.classification, 'unexpected');
+  var log2 = buildDebugLog(abSections([capture('v0', { fullPage: null })], [{
+    label: 'v1', diffMode: 'normal', matchedFraction: 0.99, structuralStats: {},
+    findings: [{ findingId: 'f0', changeClass: 'added', status: 'added' }],
+  }]));
+  eq('a finding with no note exports null, not undefined',
+     log2.visualDiff.perVariant[0].findings[0].note, null);
+})();
+
 (function scaleMismatchIsReported() {
   // ENOC-97, two runs 64 seconds apart: the variant bitmap came back at device
   // scale 2 and the control at 1, and `problems` was BYTE-IDENTICAL to the run
