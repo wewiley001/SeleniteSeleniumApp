@@ -1,4 +1,19 @@
 # .github/workflows/run-tests.yml
+#
+# Runs the extension's four JavaScriptCore suites. This replaced a step that
+# invoked `pytest tests/ -v` against a `tests/` directory that does not exist in
+# this repo — so CI had been green-by-vacuity while ~500 assertions were only
+# ever run by hand. Every one of them protects the Visual Diff engine.
+#
+# macOS runner because `jsc` ships with the OS; there is no dependency to
+# install. The suites are plain scripts with no framework: each prints
+# `=== N passed, M failed ===` and throws on any failure, so a non-zero exit is
+# the whole contract.
+#
+# They must run from extension/tests — each one reads ../popup.js,
+# ../background.js and ../vd-diff.js by relative path, and slices functions out
+# of them by marker string rather than copying, so a rename breaks the suite
+# loudly instead of leaving it to test a stale duplicate.
 
 name: Run QA Tests
 
@@ -10,24 +25,34 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
-      # 1. Check out your code onto the runner
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Install Python
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'  # caches dependencies for speed
+      - name: Locate jsc
+        run: |
+          JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
+          test -x "$JSC" || { echo "jsc not found at $JSC"; exit 1; }
+          echo "JSC=$JSC" >> "$GITHUB_ENV"
+          "$JSC" -e 'print("jsc OK")'
 
-      # 3. Install your test dependencies
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # 4. Run your tests
-      - name: Run tests
-        run: pytest tests/ -v
+      # Each suite runs even if an earlier one fails, so one regression does not
+      # mask the others — the step fails at the end if any of them did.
+      - name: Run extension test suites
+        working-directory: extension/tests
+        run: |
+          set -o pipefail
+          rc=0
+          for t in jira-extract figma vd-diff qa-report; do
+            echo "::group::$t"
+            if "$JSC" "$t.test.js"; then
+              echo "$t OK"
+            else
+              echo "::error title=$t.test.js::suite failed"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc

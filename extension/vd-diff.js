@@ -864,6 +864,132 @@
     return { kept: kept, truncatedCount: actionable.length - kept.length };
   }
 
+  // -- Requirements, checked deterministically ------------------------------
+  // The most common CRO QA question is "did the specified copy ship, verbatim?"
+  // and that is an exact string comparison, not a judgment. Measured: the
+  // ENOC-97 ticket spec carries 64 quoted requirement strings
+  // (`Card 1 eyebrow: "Lump Sum Loan"`). Answering those in code moves the bulk
+  // of "does it match the requirements" out of the model -- which produced four
+  // different classification vectors across twelve runs on identical input and
+  // has no temperature knob on claude-opus-5 -- and into a byte-reproducible
+  // check. What is left for the model is the part that genuinely needs
+  // judgment: behaviour ("hover state exactly like similar CTAs in v0").
+  var VD_REQ_MIN_CHARS = 3;
+  var VD_REQ_MAX_CHARS = 600;
+  // A near-match threshold of 0.5 is not arbitrary: the real defect this exists
+  // to catch is "Lump Sum Loan" shipping as "Lump-Sum Funding", whose token
+  // sets are {lump,sum,loan} and {lump,sum,funding} -- Jaccard exactly 0.5. Any
+  // stricter and the one measured instance is missed.
+  var VD_REQ_NEAR_MIN_SIM = 0.5;
+  // Jaccard over one or two tokens is noise, so short strings go straight to
+  // absent rather than reporting a spurious near-match.
+  var VD_REQ_NEAR_MIN_TOKENS = 2;
+
+  // Every quoted run in the spec. Straight and curly quotes are treated as
+  // interchangeable delimiters on purpose: real specs mix them, and ENOC-97's
+  // own FAQ block opens a quote curly and closes it straight.
+  function vdSpecRequirements(specText) {
+    var text = String(specText || '');
+    var re = new RegExp('["“”]([^"“”\\n]{' + VD_REQ_MIN_CHARS + ',' + VD_REQ_MAX_CHARS + '})["“”]', 'g');
+    var seen = new Set(), out = [], m;
+    while ((m = re.exec(text))) {
+      var raw = m[1].trim();
+      // A leading parenthetical annotates rather than specifies -- the
+      // requirement in `"(Lock icon) Your information is encrypted and secure."`
+      // is the sentence, not the icon note.
+      raw = raw.replace(/^\([^)]{1,40}\)\s*/, '').trim();
+      if (raw.length < VD_REQ_MIN_CHARS) continue;
+      var norm = vdNormText(raw);
+      if (!norm) continue;               // punctuation-only annotation
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      out.push({ required: raw, norm: norm });
+    }
+    return out;
+  }
+
+  // Checked against EVERY candidate, not just the ones that became findings --
+  // a requirement satisfied by an element the diff matched and suppressed is
+  // still satisfied.
+  //
+  // Containment, not equality, is the primary test: a spec quotes a headline
+  // while the candidate that carries it may be a wrapper holding the headline
+  // and its subhead. Jaccard handles the near case well for the same reason it
+  // is safe here -- a huge wrapper containing the required tokens plus hundreds
+  // of others scores LOW, because the union is huge, so wrappers cannot fake a
+  // near-match.
+  function vdMatchRequirements(required, variantList, opts) {
+    opts = opts || {};
+    var nearMinSim = opts.nearMinSim == null ? VD_REQ_NEAR_MIN_SIM : opts.nearMinSim;
+    var pool = (variantList || []).filter(function (c) { return c && c.textNorm; });
+    var controlPool = (opts.controlList || []).filter(function (c) { return c && c.textNorm; });
+    var exact = new Set(pool.map(function (c) { return c.textNorm; }));
+
+    function containedIn(list, norm) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].textNorm.indexOf(norm) !== -1) return list[i];
+      }
+      return null;
+    }
+
+    var items = (required || []).map(function (r) {
+      var hit = exact.has(r.norm) ? null : containedIn(pool, r.norm);
+      if (exact.has(r.norm) || hit) {
+        var found = hit || pool.filter(function (c) { return c.textNorm === r.norm; })[0];
+        return {
+          required: r.required, norm: r.norm, status: 'verbatim', score: 1,
+          fragment: false, foundText: (found && found.text) || r.required,
+          inControl: null,
+        };
+      }
+      // Not present. Is an altered version of it present?
+      var tokens = vdNormalizeTokens(r.norm);
+      var best = null, bestScore = 0;
+      if (tokens.size >= VD_REQ_NEAR_MIN_TOKENS) {
+        for (var i = 0; i < pool.length; i++) {
+          var sc = vdTokenSimilarity(r.norm, pool[i].textNorm);
+          if (sc > bestScore) { bestScore = sc; best = pool[i]; }
+        }
+      }
+      // Present in the control but not the variant separates "the spec asked
+      // for new copy and the old copy is still there" from "never shipped".
+      var inControl = !!(controlPool.length &&
+        (containedIn(controlPool, r.norm) || controlPool.some(function (c) { return c.textNorm === r.norm; })));
+      if (best && bestScore >= nearMinSim) {
+        // "The page has the first half of this sentence" and "the page says
+        // something different" are both near-matches and read very differently
+        // to a reviewer. A prefix relationship in either direction means the
+        // wording did not change -- only how much of it is present, or which
+        // element carries it -- so mark it rather than implying a copy defect.
+        var bn = best.textNorm;
+        var fragment = bn.length !== r.norm.length &&
+          (r.norm.indexOf(bn) === 0 || bn.indexOf(r.norm) === 0);
+        return {
+          required: r.required, norm: r.norm, status: 'near', score: bestScore,
+          fragment: fragment, foundText: best.text || null,
+          inControl: controlPool.length ? inControl : null,
+        };
+      }
+      return {
+        required: r.required, norm: r.norm, status: 'absent', score: bestScore,
+        fragment: false, foundText: null, inControl: controlPool.length ? inControl : null,
+      };
+    });
+
+    // Attention-first, matching how the report orders findings: what is wrong
+    // before what is right.
+    var RANK = { absent: 0, near: 1, verbatim: 2 };
+    items.sort(function (a, b) {
+      if (RANK[a.status] !== RANK[b.status]) return RANK[a.status] - RANK[b.status];
+      return b.score - a.score;
+    });
+    var count = function (st) { return items.filter(function (x) { return x.status === st; }).length; };
+    return {
+      total: items.length, verbatim: count('verbatim'), near: count('near'), absent: count('absent'),
+      items: items,
+    };
+  }
+
   // -- What the report will actually contain ------------------------------
   // Lifted out of diffVisualDiffVariant so it can be tested. That function is
   // an async message handler holding decoded bitmaps and capture state, so the
@@ -959,6 +1085,8 @@
   g.validateVisualDiffGeometry = validateVisualDiffGeometry;
   g.rankAndCapDiffFindings = rankAndCapDiffFindings;
   g.vdComposeReportable = vdComposeReportable;
+  g.vdSpecRequirements = vdSpecRequirements;
+  g.vdMatchRequirements = vdMatchRequirements;
   g.vdReportOrder = vdReportOrder;
   g.VD_MAX_DIFF_FINDINGS = VD_MAX_DIFF_FINDINGS;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

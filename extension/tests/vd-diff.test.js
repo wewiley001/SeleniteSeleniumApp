@@ -317,6 +317,141 @@ function anchors(n) {
 })();
 
 // ── 4. reflow suppression — the cascade bug ─────────────────────────────────
+// ── requirements, checked deterministically ────────────────────────────────
+section('spec requirements');
+
+// The point of these two functions: the most common CRO QA question is "did the
+// specified copy ship, verbatim?" and that is a string comparison, not a
+// judgment. The model produced FOUR different classification vectors across
+// twelve runs on identical input and has no temperature knob on claude-opus-5,
+// so every requirement answerable in code is one taken off it.
+//
+// Candidates here carry UNTRUNCATED textNorm, which is what production looks
+// like: background.js truncates `text` to 300 chars but computes textNorm from
+// the full string. The debug log's 160-char variantText is a log artifact and
+// must not be mistaken for the candidate shape.
+function reqCand(text) {
+  return { candidateId: 'rc' + (_id++), text: text, textNorm: vdNormText(text) };
+}
+
+(function requirementExtraction() {
+  var HAVE = typeof vdSpecRequirements === 'function';
+  ok('vdSpecRequirements is exported', HAVE);
+  if (!HAVE) return;
+  var LQ = '“', RQ = '”';
+  var spec = [
+    'Card 1 eyebrow: "Lump Sum Loan"',
+    'Card 1 amount: "$5K – $400K"',
+    'CTA button: ' + LQ + 'See My Funding Options' + RQ,
+    // Real specs mix quote styles, and ENOC-97's own FAQ opens curly and closes
+    // straight. Both delimiters are interchangeable on purpose.
+    'Q3: ' + LQ + 'Typically, we only require basic information."',
+    'Disclaimer: "(Lock icon) Your information is encrypted and secure."',
+    'Repeat: "Lump Sum Loan"',
+    'Too short: "ab"',
+    'Annotation only: "(x)"',
+  ].join('\n');
+  var req = vdSpecRequirements(spec);
+  var got = req.map(function (r) { return r.required; });
+  ok('straight quotes extracted', got.indexOf('Lump Sum Loan') !== -1, got);
+  ok('curly quotes extracted', got.indexOf('See My Funding Options') !== -1, got);
+  ok('mixed curly-open/straight-close extracted',
+     got.some(function (x) { return /^Typically, we only require/.test(x); }), got);
+  ok('a leading parenthetical annotation is stripped, the sentence kept',
+     got.indexOf('Your information is encrypted and secure.') !== -1, got);
+  eq('duplicates collapse', got.filter(function (x) { return x === 'Lump Sum Loan'; }).length, 1);
+  ok('a 2-char string is not a requirement', got.indexOf('ab') === -1, got);
+  ok('a parenthetical-only string is not a requirement',
+     !got.some(function (x) { return /^\(?x\)?$/.test(x); }), got);
+  ok('every requirement carries its normalised form',
+     req.every(function (r) { return r.norm && r.norm === vdNormText(r.required); }));
+})();
+
+(function requirementMatching() {
+  var HAVE = typeof vdMatchRequirements === 'function';
+  ok('vdMatchRequirements is exported', HAVE);
+  if (!HAVE) return;
+  var req = vdSpecRequirements([
+    'A: "See My Funding Options"',
+    'B: "Lump Sum Loan"',
+    'C: "Repayment terms up to 24 months"',
+    'D: "Build Business Credit"',
+    'E: "Apply in minutes with no hard credit pull."',
+  ].join('\n'));
+  var variant = [
+    reqCand('See My Funding Options'),
+    // THE measured defect: spec says "Lump Sum Loan", page ships this.
+    reqCand('Lump-Sum Funding'),
+    // A wrapper carrying the required copy plus its neighbour. Containment,
+    // not equality, is why this counts as present.
+    reqCand('Apply in minutes with no hard credit pull. Term loans up to $400K.'),
+  ];
+  var control = [reqCand('Build Business Credit')];
+  var r = vdMatchRequirements(req, variant, { controlList: control });
+  var by = {};
+  r.items.forEach(function (x) { by[x.required] = x; });
+
+  eq('exact element match is verbatim', by['See My Funding Options'].status, 'verbatim');
+  eq('copy inside a larger wrapper is still verbatim',
+     by['Apply in minutes with no hard credit pull.'].status, 'verbatim');
+
+  // The defect, and the reason the near threshold is 0.5 and not higher:
+  // {lump,sum,loan} vs {lump,sum,funding} is Jaccard exactly 0.5.
+  eq('altered copy is a near-match, not absent', by['Lump Sum Loan'].status, 'near');
+  eq('  and reports what the page actually says', by['Lump Sum Loan'].foundText, 'Lump-Sum Funding');
+  ok('  at a similarity of exactly 0.5', Math.abs(by['Lump Sum Loan'].score - 0.5) < 1e-9,
+     by['Lump Sum Loan'].score);
+  eq('  flagged as altered wording, not a fragment', by['Lump Sum Loan'].fragment, false);
+
+  eq('copy nowhere on the variant is absent', by['Repayment terms up to 24 months'].status, 'absent');
+  eq('copy still only in the control is absent', by['Build Business Credit'].status, 'absent');
+  eq('  and says so, which separates "not shipped" from "old copy still there"',
+     by['Build Business Credit'].inControl, true);
+  eq('  while an absence missing from both sides does not claim otherwise',
+     by['Repayment terms up to 24 months'].inControl, false);
+
+  eq('counts add up', r.verbatim + r.near + r.absent, r.total);
+  eq('  total matches the requirement count', r.total, req.length);
+  // Attention-first ordering, same principle the findings list uses.
+  var order = r.items.map(function (x) { return x.status; });
+  eq('absent sorts before near sorts before verbatim',
+     order.join(',').replace(/absent/g, 'a').replace(/near/g, 'n').replace(/verbatim/g, 'v'),
+     'a,a,n,v,v');
+})();
+
+(function fragmentIsNotAlteredCopy() {
+  // "The page has the first half of this sentence" and "the page says something
+  // different" are both near-matches and read completely differently to a
+  // reviewer. Three of five near-matches on the real ENOC-97 data were prefix
+  // relationships, so this distinction is not hypothetical.
+  if (typeof vdMatchRequirements !== 'function') return;
+  var req = vdSpecRequirements('X: "Once you apply with OnDeck, we will quickly review your application and respond."');
+  var r = vdMatchRequirements(req, [reqCand('Once you apply with OnDeck, we will quickly review your')], {});
+  eq('a leading fragment is a near-match', r.items[0].status, 'near');
+  eq('  marked as a fragment, not altered wording', r.items[0].fragment, true);
+})();
+
+(function shortStringsSkipNearMatching() {
+  // Jaccard over one token is noise. A one-token requirement that is not
+  // present goes straight to absent rather than reporting a spurious near.
+  if (typeof vdMatchRequirements !== 'function') return;
+  var req = vdSpecRequirements('CTA: "Submit"');
+  var r = vdMatchRequirements(req, [reqCand('Send'), reqCand('Submitting your application')], {});
+  ok('a one-token requirement is absent or verbatim, never a coin-flip near',
+     r.items[0].status !== 'near', r.items[0]);
+})();
+
+(function emptyInputsAreSafe() {
+  if (typeof vdMatchRequirements !== 'function') return;
+  eq('no spec text yields no requirements', vdSpecRequirements('').length, 0);
+  eq('null spec text yields no requirements', vdSpecRequirements(null).length, 0);
+  var r = vdMatchRequirements([], [], {});
+  eq('no requirements yields a zero total', r.total, 0);
+  var r2 = vdMatchRequirements(vdSpecRequirements('A: "Anything at all"'), [], {});
+  eq('no candidates makes every requirement absent', r2.absent, 1);
+  ok('and does not throw on a missing controlList', Array.isArray(r2.items));
+})();
+
 section('reflow clustering');
 
 // A single pure-reflow band: every pair content-identical (so it feeds the
