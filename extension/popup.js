@@ -3785,9 +3785,27 @@ function vdCaptureVerification(cap) {
         + ' — reload the extension so the service worker picks up the current build, then re-run',
     };
   }
-  return typeof vdVariantVerification === 'function'
-    ? vdVariantVerification(cap.expProbe)
-    : { state: 'unknown', reason: 'vd-diff.js is not loaded in this context' };
+  if (typeof vdVariantVerification !== 'function') {
+    return { state: 'unknown', reason: 'vd-diff.js is not loaded in this context' };
+  }
+  return vdVariantVerification(cap.expProbe, vdForcedVariationId(cap.url));
+}
+
+// The variation the CONFIGURED url asked for. Must come from cap.url and never
+// cap.finalUrl: a site that redirects strips the parameter, and the probe only
+// ever sees the final url. On run 1788192904924 both captures had it stripped
+// and the platform had still bucketed into exactly the requested variation, so
+// reading it from the probe alone threw away the answer.
+function vdForcedVariationId(configuredUrl) {
+  if (!configuredUrl) return null;
+  try {
+    const q = new URL(configuredUrl, location.href).searchParams;
+    return q.get('optimizely_x') || q.get('_conv_eforce') || null;
+  } catch (_) {
+    // A malformed target url must not cost us the verification path.
+    const m = /[?&](?:optimizely_x|_conv_eforce)=([^&#]+)/.exec(String(configuredUrl));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
 }
 
 function vdSpecTicketMismatch(source, specKey, activeKey, hasText) {

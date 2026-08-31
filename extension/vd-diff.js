@@ -879,7 +879,20 @@
   //
   // Tri-state on purpose. "I checked and it is wrong" and "I could not check"
   // are different results and must not collapse into one badge.
-  function vdVariantVerification(probe) {
+  // forcedIdOverride is the variation the CONFIGURED url asked for, and it is
+  // not optional in practice. The probe reads location.search at probe time,
+  // which is the FINAL url -- and a site that redirects strips the parameter.
+  // Measured on run 1788192904924: both captures were configured with
+  // optimizely_x set, both final urls had it stripped to ?cro_mode=qa, and the
+  // platform had nonetheless bucketed into exactly the requested variations
+  // (5542293380268032 and 4749145360039936). Reading `forced` from the probe
+  // alone reported UNKNOWN on a run where the answer was sitting in the data.
+  //
+  // This is also the case the old same-final-URL warning could only hedge about
+  // -- "forced-variant state can also survive as a session (Optimizely preview
+  // tokens do this)". With the configured id in hand that hedge becomes a
+  // positive answer.
+  function vdVariantVerification(probe, forcedIdOverride) {
     var unknown = function (reason) { return { state: 'unknown', reason: reason }; };
     if (!probe || probe.ok === false) return unknown('the experiment-platform probe did not run');
     var det = probe.detected || {};
@@ -887,9 +900,9 @@
       return unknown('no experimentation platform was detected on the page');
     }
     var forced = probe.forced || {};
-    var forcedId = forced.optimizely_x || forced.conv_eforce || null;
+    var forcedId = forcedIdOverride || forced.optimizely_x || forced.conv_eforce || null;
     if (!forcedId) {
-      return unknown('the URL did not force a variation, so there is nothing to verify against');
+      return unknown('the configured URL did not force a variation, so there is nothing to verify against');
     }
     var exps = probe.experiments || [];
     var bucketed = exps.filter(function (e) { return e && e.bucketed && e.variationId; });

@@ -48,8 +48,9 @@ eval(_pu.slice(_pu.indexOf('function vdFindingIdentity(f)'),
                 _pu.indexOf('async function runVisualDiffPipeline')));
 eval(_pu.slice(_pu.indexOf('function vdNormalizeTargetUrl(u)'),
                 _pu.indexOf('function vdFindingIdentity(f)')));
-// The gate that decides whether grading is withheld for a run.
-eval(_pu.slice(_pu.indexOf('function vdSpecTicketMismatch('),
+// The gate that decides whether grading is withheld for a run, and the
+// configured-URL parse that variant verification depends on.
+eval(_pu.slice(_pu.indexOf('function vdCaptureVerification(cap)'),
                 _pu.indexOf('\nasync function runVisualDiffPipeline')));
 
 var _bg = readFile('../background.js');
@@ -317,6 +318,24 @@ function anchors(n) {
 })();
 
 // ── 4. reflow suppression — the cascade bug ─────────────────────────────────
+(function forcedIdComesFromTheConfiguredUrl() {
+  // Must read cap.url, never cap.finalUrl — the whole point is that a redirect
+  // strips the parameter before the probe can see it.
+  var HAVE = typeof vdForcedVariationId === 'function';
+  ok('vdForcedVariationId is defined', HAVE);
+  if (!HAVE) return;
+  eq('the real ENOC-97 target url',
+     vdForcedVariationId('http://ondeck.com/soc/b?optimizely_x=4749145360039936&optimizely_token=abc&cro_mode=qa'),
+     '4749145360039936');
+  eq('a Convert forced param', vdForcedVariationId('https://x.test/p?_conv_eforce=9001'), '9001');
+  eq('the post-redirect url has nothing to give', vdForcedVariationId('https://www.ondeck.com/soc/b?cro_mode=qa'), null);
+  eq('no url at all', vdForcedVariationId(null), null);
+  eq('no query string', vdForcedVariationId('https://x.test/p'), null);
+  // A malformed target must not cost us the verification path.
+  eq('a malformed url still yields the param via fallback',
+     vdForcedVariationId('ondeck.com/soc/b?optimizely_x=555'), '555');
+})();
+
 (function verificationReachesTheReport() {
   // The precondition for every verdict downstream. A run that cannot say which
   // page it photographed has nothing trustworthy to say about whether that page
@@ -326,14 +345,16 @@ function anchors(n) {
   // test is the real one.
   function probeFor(state) {
     if (state === 'confirmed') {
+      // forced deliberately null: the redirect stripped it, which is the real
+      // shape. The configured url on the capture is what supplies it.
       return { ok: true, detected: { optimizely: true }, catalogComplete: true,
-               forced: { optimizely_x: '4749145360039936' },
+               forced: { optimizely_x: null, cro_mode: 'qa' },
                experiments: [{ id: '6291814800424960', name: 'Form consolidation', active: true,
                                bucketed: true, variationId: '4749145360039936', variationName: 'Two-step' }] };
     }
     if (state === 'contradicted') {
       return { ok: true, detected: { optimizely: true }, catalogComplete: true,
-               forced: { optimizely_x: '474' },
+               forced: { optimizely_x: null },
                experiments: [{ id: 'e1', name: 'E', active: true, bucketed: true, variationId: '554', variationName: 'Other' }] };
     }
     return { ok: true, detected: { optimizely: false, convert: false, convertScript: false },
@@ -343,6 +364,9 @@ function anchors(n) {
     var v1 = probe === undefined
       ? capture('v1', { fullPage: null })                    // no expProbe key at all
       : capture('v1', { fullPage: null, expProbe: probe });
+    // capture() sets a bare url; verification needs the forced id on it, the way
+    // a real target does.
+    v1.url = 'https://example.com/p?optimizely_x=4749145360039936';
     return vdCollectProblems(abSections(
       [capture('v0', { fullPage: null, expProbe: probeFor('confirmed') }), v1],
       [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.9, structuralStats: {} }]));
@@ -448,6 +472,28 @@ section('variant verification');
   ok('every unknown explains itself',
      [vdVariantVerification(null), vdVariantVerification(probe({ forced: {} }))]
        .every(function (x) { return typeof x.reason === 'string' && x.reason.length > 10; }));
+
+  // THE measured gap. Run 1788192904924: both captures configured with
+  // optimizely_x, both final urls stripped to ?cro_mode=qa by a redirect, and
+  // the platform had bucketed into exactly the requested variations anyway.
+  // Reading `forced` from the probe alone reported UNKNOWN on a run where the
+  // answer was in the data.
+  var stripped = probe({
+    forced: { optimizely_x: null, cro_mode: 'qa' },     // as the probe sees it post-redirect
+    experiments: [exp('5112630724001792', '4749145360039936', true)],
+  });
+  eq('a stripped param with no override is UNKNOWN',
+     vdVariantVerification(stripped).state, 'unknown');
+  var withOverride = vdVariantVerification(stripped, '4749145360039936');
+  eq('  but CONFIRMED once the configured URL supplies the forced id', withOverride.state, 'confirmed');
+  eq('  naming the variation the platform actually served', withOverride.variationId, '4749145360039936');
+  eq('an override that does NOT match what was served is still contradicted',
+     vdVariantVerification(stripped, '5542293380268032').state, 'contradicted');
+  eq('the override takes priority over the probe\'s own reading',
+     vdVariantVerification(probe({
+       forced: { optimizely_x: '111' },
+       experiments: [exp('e', '222', true)],
+     }), '222').state, 'confirmed');
 
   // Convert, not just Optimizely.
   eq('a Convert forced param is verified the same way',
