@@ -3662,8 +3662,8 @@ function vdControlDuplicateReason(base, c) {
     // the diff proved the pages differed, so it was noise. Where
     // vdVariantVerification can answer the question the warning only gestures
     // at, the answer wins and the guess is dropped.
-    const ver = typeof vdVariantVerification === 'function' ? vdVariantVerification(c.expProbe) : null;
-    if (ver && ver.state === 'confirmed') return null;
+    const ver = vdCaptureVerification(c);
+    if (ver.state === 'confirmed') return null;
     return { hard: false, reason: `it loaded the same final URL as Control ("${base.label}") — ${c.finalUrl} — so the forced-variant parameter may have been dropped on redirect. Forced-variant state can also survive as a session (Optimizely preview tokens do this), so the comparison was run anyway and judged on what actually rendered`
       + (ver && ver.reason ? `. The platform could not confirm it either: ${ver.reason}` : '') };
   }
@@ -3762,6 +3762,34 @@ function vdExtractSharedFindings(perVariant) {
 // The one place the rule lives. Two callers need it from different shapes --
 // the pipeline from live abState + ctx, vdCollectProblems from the already
 // serialised designReference -- and two copies of a four-clause predicate drift.
+// One place. This verdict is read by the problems list, by the same-URL check
+// and by the debug projection, and computing it three times from three shapes is
+// exactly how the problems list ended up reading a field that only ever existed
+// in the log — dead code that passed its own test because the test fixture set
+// the field the projection adds rather than the field the worker returns.
+//
+// The `unsupported` state exists because of a measured failure. popup.js
+// reloads every time the panel opens; the background service worker only
+// reloads when the extension does, so the two halves routinely run DIFFERENT
+// builds. Run 1788191807035 had a current popup.js against a worker predating
+// the probe, and the result was "the experiment-platform probe did not run" —
+// indistinguishable from a real probe failure, and the wrong thing to act on.
+// Key presence is what separates them: the current worker always emits
+// `expProbe` (null or otherwise); an older one has no such field at all.
+function vdCaptureVerification(cap) {
+  if (!cap) return { state: 'unknown', reason: 'there is no capture record to check' };
+  if (!('expProbe' in cap)) {
+    return {
+      state: 'unsupported',
+      reason: 'this capture came from an older background build that does not probe the experiment platform'
+        + ' — reload the extension so the service worker picks up the current build, then re-run',
+    };
+  }
+  return typeof vdVariantVerification === 'function'
+    ? vdVariantVerification(cap.expProbe)
+    : { state: 'unknown', reason: 'vd-diff.js is not loaded in this context' };
+}
+
 function vdSpecTicketMismatch(source, specKey, activeKey, hasText) {
   if (!hasText) return false;
   if (source === 'manual') return false;
@@ -3936,6 +3964,11 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
       continue;
     }
     const { structuralStats, truncatedCount, pixelDiff, aggregate, mode, matchedFraction, matchTierCounts, requirements } = diffRes;
+    // Same split-build hazard as the probe, same detection: the current worker
+    // always returns the `requirements` key (null when there is no spec), an
+    // older one returns no such key. Without this the coverage line simply does
+    // not appear and reads as "this spec has no quoted copy".
+    const requirementsUnsupported = !!(gradedSpec && !('requirements' in diffRes));
     const diffDebug = diffRes.debug || null;
     const kept = diffRes.findings;
 
@@ -3966,7 +3999,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     if (kept.length === 0) {
       perVariant.push({
         label: c.label, sameUrlNote, findings: [], overallSummary: 'Differences were detected but none ranked high enough to report.',
-        noSpecText: !gradedSpec, requirements, structuralStats, truncatedFindingCount: truncatedCount,
+        noSpecText: !gradedSpec, requirements, requirementsUnsupported, structuralStats, truncatedFindingCount: truncatedCount,
         noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
         aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
         fullPageTruncated: !!c.fullPage.truncated,
@@ -4011,7 +4044,7 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
 
     perVariant.push({
       label: c.label, sameUrlNote, findings, overallSummary: reportRes.overallSummary,
-      noSpecText: !gradedSpec, requirements, structuralStats, truncatedFindingCount: truncatedCount,
+      noSpecText: !gradedSpec, requirements, requirementsUnsupported, structuralStats, truncatedFindingCount: truncatedCount,
       noVerdictCount: reportRes.noVerdictCount, duplicateIndexCount: reportRes.duplicateIndexCount,
       truncated: reportRes.truncated, pixelDiff: reportRes.pixelDiff,
       aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
@@ -5708,8 +5741,10 @@ function vdCollectProblems(sections) {
       // say about whether that page matches the spec. Replaces guessing from
       // the final URL, which fired on 19 of 19 recorded ONDECK runs and could
       // never be confirmed or dismissed.
-      const ver = c.variantVerified;
-      if (ver && ver.state === 'contradicted') {
+      const ver = vdCaptureVerification(c);
+      if (ver.state === 'unsupported') {
+        add('warn', `capture/${c.label}`, `Variation could not be checked — ${ver.reason}.`);
+      } else if (ver && ver.state === 'contradicted') {
         add('error', `capture/${c.label}`,
           `The page did not serve the variation this run asked for — ${ver.reason}.`
           + ' The diff below is a real comparison of two real pages, but it is not a comparison of Control against this variant,'
@@ -5824,6 +5859,10 @@ function vdCollectProblems(sections) {
         }
         // Unmet requirements are a deterministic result, so unlike the model's
         // verdicts this line means the same thing on every run of the same page.
+        if (v.requirementsUnsupported) {
+          add('warn', at, 'Requirement coverage was not checked — this variant was diffed by an older background build.'
+            + ' Reload the extension so the service worker picks up the current build, then re-run.');
+        }
         const rq = v.requirements;
         if (rq && rq.total) {
           const bad = (rq.items || []).filter(x => x.status === 'absent' || (x.status === 'near' && !x.fragment));
@@ -5925,8 +5964,7 @@ function buildDebugLog(sections) {
         })),
         errors: c.expProbe.errors || [],
       } : null,
-      variantVerified: typeof vdVariantVerification === 'function'
-        ? vdVariantVerification(c.expProbe) : null,
+      variantVerified: vdCaptureVerification(c),
       jsErrors: c.errors || [],
       consoleLineCount: (c.console || []).length,
       selectors: c.selectors || [],

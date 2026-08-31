@@ -322,37 +322,67 @@ function anchors(n) {
   // page it photographed has nothing trustworthy to say about whether that page
   // matches the spec — so the three states have to reach the reader as three
   // different things, not collapse into one badge.
-  function probs(ver) {
+  // Built from a probe, the way the worker returns it, so the derivation under
+  // test is the real one.
+  function probeFor(state) {
+    if (state === 'confirmed') {
+      return { ok: true, detected: { optimizely: true }, catalogComplete: true,
+               forced: { optimizely_x: '4749145360039936' },
+               experiments: [{ id: '6291814800424960', name: 'Form consolidation', active: true,
+                               bucketed: true, variationId: '4749145360039936', variationName: 'Two-step' }] };
+    }
+    if (state === 'contradicted') {
+      return { ok: true, detected: { optimizely: true }, catalogComplete: true,
+               forced: { optimizely_x: '474' },
+               experiments: [{ id: 'e1', name: 'E', active: true, bucketed: true, variationId: '554', variationName: 'Other' }] };
+    }
+    return { ok: true, detected: { optimizely: false, convert: false, convertScript: false },
+             catalogComplete: true, forced: {}, experiments: [] };
+  }
+  function probs(probe) {
+    var v1 = probe === undefined
+      ? capture('v1', { fullPage: null })                    // no expProbe key at all
+      : capture('v1', { fullPage: null, expProbe: probe });
     return vdCollectProblems(abSections(
-      [capture('v0', { fullPage: null }), capture('v1', { fullPage: null, variantVerified: ver })],
+      [capture('v0', { fullPage: null, expProbe: probeFor('confirmed') }), v1],
       [{ label: 'v1', diffMode: 'normal', matchedFraction: 0.9, structuralStats: {} }]));
   }
-  var bad = probs({ state: 'contradicted', forcedId: '474', variationId: '554',
-                    reason: 'the URL forced variation 474 but the page bucketed into 554' });
+  var bad = probs(probeFor('contradicted'));
   var hit = bad.filter(function (x) { return /did not serve the variation/.test(x.detail); });
   eq('CONTRADICTED is an error, once', hit.length, 1);
   eq('  at error severity', hit.length ? hit[0].severity : null, 'error');
   ok('  and says the diff is real but does not apply to the experiment',
      hit.length > 0 && /not a comparison of Control against this variant/.test(hit[0].detail));
 
-  var unk = probs({ state: 'unknown', reason: 'no experimentation platform was detected on the page' });
+  var unk = probs(probeFor('unknown'));
   var uh = unk.filter(function (x) { return /Could not confirm which variation/.test(x.detail); });
   eq('UNKNOWN is a warn, not an error', uh.length ? uh[0].severity : null, 'warn');
   ok('  and does not claim the variant is wrong',
      uh.length > 0 && !/did not serve/.test(uh[0].detail));
 
-  var good = probs({ state: 'confirmed', variationId: '4749145360039936',
-                     variationName: 'Two-step', experimentName: 'Form consolidation' });
+  var good = probs(probeFor('confirmed'));
   var gh = good.filter(function (x) { return /Variation confirmed by the platform/.test(x.detail); });
   eq('CONFIRMED is recorded as info', gh.length ? gh[0].severity : null, 'info');
   ok('  naming the variation and experiment',
      gh.length > 0 && /Two-step/.test(gh[0].detail) && /Form consolidation/.test(gh[0].detail));
 
-  // Absent verification (an older checkpoint, or a non-A/B run) must be silent
-  // rather than emitting a spurious warn.
-  var none = probs(null);
-  ok('no verification data emits nothing about variations',
-     !none.some(function (x) { return /variation/i.test(x.detail); }), none.map(function (x) { return x.detail.slice(0, 40); }));
+  // THE measured failure: a current popup.js against a worker that predates the
+  // probe. `expProbe` is absent as a KEY, and that must read as "this build
+  // cannot check" rather than "the probe ran and found nothing" — run
+  // 1788191807035 reported the latter and it was the wrong thing to act on.
+  var old = probs(undefined);
+  var oh = old.filter(function (x) { return /older background build/.test(x.detail); });
+  eq('a capture from an older worker build says so, once', oh.length, 1);
+  ok('  and tells you to reload the extension',
+     oh.length > 0 && /[Rr]eload the extension/.test(oh[0].detail), oh.length ? oh[0].detail : null);
+  ok('  and does NOT claim the probe ran and failed',
+     oh.length > 0 && !/probe did not run/.test(oh[0].detail));
+  // A probe present but null (the platform genuinely absent) is a different
+  // message from an absent key.
+  var nullProbe = probs(null);
+  ok('a null probe is reported as unconfirmed, not as a stale build',
+     !nullProbe.some(function (x) { return /older background build/.test(x.detail); }),
+     nullProbe.map(function (x) { return x.detail.slice(0, 50); }));
 })();
 
 // ── did we actually get the variant? ───────────────────────────────────────
@@ -1033,7 +1063,11 @@ function abSections(captures, perVariant) {
 function capture(label, o) {
   return { label: label, url: 'https://example.com', skipped: false, loadError: null,
            errors: o.errors || [], selectors: o.selectors || [],
-           variantVerified: o.variantVerified || null,
+           // expProbe, NOT variantVerified: the raw worker record carries the
+           // probe and popup.js derives the verdict. A fixture that sets the
+           // derived field tests nothing — it is why the per-capture
+           // diagnostics shipped as dead code and still passed.
+           ...('expProbe' in o ? { expProbe: o.expProbe } : {}),
            fullPage: o.fullPage === undefined
              ? { pageW: 1470, pageH: 9000, capturedH: 8000, truncated: true, viewportH: 802, viewportW: 1470 }
              : o.fullPage };
