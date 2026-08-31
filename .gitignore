@@ -1,0 +1,8 @@
+# macOS Finder metadata. Present in the working tree since before this repo had
+# a .gitignore, never committed — this keeps `git status` readable so a real
+# untracked file is not lost among them.
+.DS_Store
+
+# Python bytecode, from the out-of-scope backend.
+__pycache__/
+*.pyc
