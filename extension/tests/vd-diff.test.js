@@ -1465,6 +1465,27 @@ function capture(label, o) {
   eq('primitive: same key', vdSpecTicketMismatch('ticket', 'ENOC-97', 'ENOC-97', true), false);
 })();
 
+(function gradingFailureIsAnError() {
+  // The diff survived, the grading did not. That has to read as "produced but
+  // not judged", never as a clean run and never as a total failure.
+  var base = abSections([capture('v0', { fullPage: null }), capture('v1', { fullPage: null })],
+    [{ label: 'v1', diffMode: 'redesign', matchedFraction: 0.24, structuralStats: {},
+       gradingFailed: 'Failed to fetch',
+       requirements: { total: 70, verbatim: 65, near: 1, absent: 4, items: [] } }]);
+  var p = vdCollectProblems(base);
+  var hit = p.filter(function (x) { return /never graded/.test(x.detail); });
+  eq('a failed model call is reported once', hit.length, 1);
+  eq('  at error severity', hit.length ? hit[0].severity : null, 'error');
+  ok('  naming the underlying failure', hit.length > 0 && /Failed to fetch/.test(hit[0].detail));
+  ok('  and stating that the deterministic half survived',
+     hit.length > 0 && /requirement coverage/.test(hit[0].detail), hit.length ? hit[0].detail : null);
+  // A successful run must not emit it.
+  var okRun = vdCollectProblems(abSections([capture('v0', { fullPage: null })],
+    [{ label: 'v1', diffMode: 'redesign', matchedFraction: 0.24, structuralStats: {} }]));
+  eq('a graded run says nothing about grading failure',
+     okRun.filter(function (x) { return /never graded/.test(x.detail); }).length, 0);
+})();
+
 (function staleSpecIsAnError() {
   // THE regression. A spec auto-filled from one ticket and used against
   // another must be an error, not a warning: the report prompt's "absence

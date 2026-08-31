@@ -208,6 +208,35 @@ section('suppression disclosure');
   ok('and names the largest shift', h.indexOf('2108px') !== -1);
 })();
 
+// ── a failed model call must not discard the diff ──────────────────────────
+section('grading failure degrades, it does not erase');
+
+(function gradingFailureKeepsEverythingDeterministic() {
+  // Run 1788193353815: the deterministic diff completed and 70 requirements were
+  // checked, then one "Failed to fetch" reaching api.anthropic.com discarded the
+  // whole variant and the report showed nothing. The deterministic half needs no
+  // network — losing the grader should cost the grades and nothing else.
+  var findings = [rollup('section', 'expected'), rollup('footer', 'expected')]
+    .map(function (f) { f.classification = null; f.severity = null; return f; });
+  var h = render(findings, { variant: {
+    gradingFailed: 'Failed to fetch',
+    requirements: { total: 70, verbatim: 65, near: 1, absent: 4, items: [
+      { required: 'Lump Sum Loan', norm: 'lump sum loan', status: 'near', score: 0.5,
+        fragment: false, foundText: 'Lump-Sum Funding', inControl: null },
+    ] },
+  } });
+  ok('the failure is stated plainly', /Not graded\./.test(h), h.slice(0, 400));
+  ok('  naming the underlying error', /Failed to fetch/.test(h));
+  ok('  and saying what DID survive', /specified-copy check all completed/.test(h));
+  // The valuable half is still there.
+  ok('requirement coverage still renders', /65 of 70 found verbatim/.test(h), h.slice(0, 700));
+  ok('the unmet item still renders', /Lump-Sum Funding/.test(h));
+  eq('both findings still render', h.split('class="ab-line"').length - 1, 2);
+  // Ungraded, not cleared — the 5ed70e5 bucket.
+  ok('findings are labelled unjudged rather than passed', /unjudged, not cleared/.test(h));
+  ok('  and carry no grade chip', !/letter-spacing:\.03em/.test(h), h.slice(0, 700));
+})();
+
 // ── 4a. requirement coverage leads, and drives the badge ───────────────────
 section('requirement coverage in the report');
 

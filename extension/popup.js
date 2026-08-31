@@ -4038,7 +4038,26 @@ async function runVisualDiffPipeline(captures, { ctx, resumeCheckpoint, onStatus
     });
     if (!reportRes?.ok) {
       if (reportRes?.stoppedAbort) { stopped = true; perVariant.push({ label: c.label, skipped: true, reason: 'Stopped' }); break; }
-      perVariant.push({ label: c.label, error: reportRes?.error || 'Analysis failed' });
+      // The deterministic half of this variant is DONE, and needed no network
+      // to do it: matching, suppression, grouping, the pixel backstop, and —
+      // since 208390a — the requirement coverage, which is now the single most
+      // reliable output in the report. Discarding all of that because ONE model
+      // call failed is backwards.
+      //
+      // Measured: run 1788193353815 lost a complete diff and 70 checked
+      // requirements to a "Failed to fetch" reaching api.anthropic.com, and
+      // reported nothing at all. Degrade to UNGRADED instead — findings with no
+      // classification land in the renderer's "unjudged, not cleared" bucket
+      // (5ed70e5), which is exactly what they are.
+      perVariant.push({
+        label: c.label, sameUrlNote, findings: kept, overallSummary: null,
+        gradingFailed: reportRes?.error || 'Analysis failed',
+        noSpecText: !gradedSpec, requirements, requirementsUnsupported,
+        structuralStats, truncatedFindingCount: truncatedCount,
+        noVerdictCount: 0, duplicateIndexCount: 0, truncated: false, pixelDiff,
+        aggregate, diffMode: mode, matchedFraction, matchTierCounts, diffDebug,
+        fullPageTruncated: !!c.fullPage.truncated,
+      });
       continue;
     }
 
@@ -5381,6 +5400,9 @@ function rptAbVisualDiffSection(vd) {
       ? req.items.filter(x => x.status === 'absent' || (x.status === 'near' && !x.fragment))
       : [];
     const fragments = req && req.items ? req.items.filter(x => x.status === 'near' && x.fragment).length : 0;
+    const gradeFailHtml = v.gradingFailed ? `
+      <div class="ab-cline ab-warn"><b>Not graded.</b> The model call failed (${q(v.gradingFailed)}), so nothing below is judged
+      expected vs unexpected. The diff itself, the reflow suppression and the specified-copy check all completed without it.</div>` : '';
     const reqHtml = !req || !req.total ? '' : `
       <div class="ab-cline${unmet.length ? ' ab-warn' : ''}"><b>Specified copy:</b> ${req.verbatim} of ${req.total} found verbatim${
         unmet.length ? ` · <b>${unmet.length} unmet</b>` : ''}${
@@ -5391,7 +5413,7 @@ function rptAbVisualDiffSection(vd) {
           : `Not found on the page: ${q(JSON.stringify(x.required))}.${x.inControl ? ' Still present in Control, so the old copy did not change.' : ''}`
       }</div>`).join('')}`;
 
-    const summaryHtml = reqHtml + (v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '');
+    const summaryHtml = gradeFailHtml + reqHtml + (v.overallSummary ? `<p>${q(v.overallSummary)}</p>` : '');
 
     // MANDATORY, not cosmetic. Every entry here is a filter that removed a
     // real difference from the findings above, and an invisible filter is
@@ -5839,6 +5861,18 @@ function vdCollectProblems(sections) {
       if (v.truncated) add('error', at, 'The model\'s response was cut off — some findings are incomplete.');
       if (v.truncatedFindingCount) add('warn', at, `${v.truncatedFindingCount} finding(s) exceeded the cap and were never analyzed.`);
       if (v.noVerdictCount) add('warn', at, `${v.noVerdictCount} finding(s) came back without a verdict.`);
+      // Neither of these is about the debug blob, so neither may be gated on it
+      // — they were, and both went silent whenever diffDebug was absent.
+      if (v.gradingFailed) {
+        add('error', at, `The findings below were produced but never graded — the model call failed: ${v.gradingFailed}.`
+          + ' Everything deterministic survived: the element-by-element diff, the reflow suppression and the requirement coverage'
+          + ' all ran without a network call. What is missing is only the expected-vs-unexpected judgment, so every finding'
+          + ' below is marked unjudged rather than cleared.');
+      }
+      if (v.requirementsUnsupported) {
+        add('warn', at, 'Requirement coverage was not checked — this variant was diffed by an older background build.'
+          + ' Reload the extension so the service worker picks up the current build, then re-run.');
+      }
       if (v.duplicateIndexCount) add('warn', at, `The model returned inconsistent finding references for ${v.duplicateIndexCount} item(s).`);
       if (v.diffMode === 'redesign') {
         // A geometry mismatch produces a low match rate all by itself, so
@@ -5877,10 +5911,6 @@ function vdCollectProblems(sections) {
         }
         // Unmet requirements are a deterministic result, so unlike the model's
         // verdicts this line means the same thing on every run of the same page.
-        if (v.requirementsUnsupported) {
-          add('warn', at, 'Requirement coverage was not checked — this variant was diffed by an older background build.'
-            + ' Reload the extension so the service worker picks up the current build, then re-run.');
-        }
         const rq = v.requirements;
         if (rq && rq.total) {
           const bad = (rq.items || []).filter(x => x.status === 'absent' || (x.status === 'near' && !x.fragment));
